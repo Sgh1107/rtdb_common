@@ -12,9 +12,18 @@ namespace layout {
 /// "RTDBCMN1" 的内存表示（小端机器上 ASCII 倒序）。
 inline constexpr uint64_t kShmMagic = 0x52544442434D4E31ULL;
 
-/// 头部保留区大小：SuperBlock 之后预留的空隙，保证后续 MetaSection
-/// 起始对齐到页边界时不必搬移头部结构。
+/// 共享内存头部保留区大小：SuperBlock 所在区域。
 inline constexpr uint64_t kHeaderReservedBytes = 4096;
+
+// ---- 固定元数据分区（由本文件统一约定，不进 SuperBlock 字段）----
+/// 分配器控制块偏移/大小。
+inline constexpr uint64_t kAllocCtlOffset = 4096;
+inline constexpr uint64_t kAllocCtlBytes = 512;
+/// 根互斥锁状态字偏移/大小。
+inline constexpr uint64_t kRootMutexOffset = 4608;
+inline constexpr uint64_t kRootMutexBytes = 64;
+/// 可分配数据区的起始偏移（页对齐）。
+inline constexpr uint64_t kDataStartOffset = 8192;
 
 /// 共享内存超级块（docs/02 §3）。
 ///

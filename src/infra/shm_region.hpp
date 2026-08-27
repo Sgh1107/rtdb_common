@@ -4,6 +4,8 @@
 #include <memory>
 
 #include "platform/platform.hpp"
+#include "infra/slab_allocator.hpp"
+#include "infra/shm_mutex.hpp"
 #include "rtdb/options.hpp"
 #include "rtdb/result.hpp"
 #include "infra/layout.hpp"
@@ -38,6 +40,15 @@ class ShmRegion {
   void* base_address() const noexcept { return base_; }
   uint64_t size_bytes() const noexcept;
 
+  /// 实际映射字节数（可能大于请求值：Windows 对齐/历史扩容遗留）。
+  uint64_t mapped_bytes() const noexcept { return file_->size(); }
+
+  /// 仅非 Reader 角色挂载。生命周期与本区一致，宿主进程内复用。
+  infra::SlabShmAllocator* allocator() const noexcept {
+    return alloc_.get();
+  }
+  infra::ShmRootMutex* root_mutex() const noexcept { return mutex_.get(); }
+
   int64_t LoadCommittedSeq() const noexcept;
   void StoreCommittedSeq(int64_t v) noexcept;
   Err Flush() noexcept;  ///< 头部区间回写文件
@@ -48,6 +59,8 @@ class ShmRegion {
   std::unique_ptr<platform::SharedMemoryFile> file_;
   void* base_ = nullptr;
   layout::shm_SuperBlock* super_block_ = nullptr;
+  std::unique_ptr<infra::SlabShmAllocator> alloc_;
+  std::unique_ptr<infra::ShmRootMutex> mutex_;
 };
 
 namespace layout {

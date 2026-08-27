@@ -11,6 +11,11 @@
 
 namespace rtdb {
 
+namespace infra {
+class SlabShmAllocator;
+class ShmRootMutex;
+}  // namespace infra
+
 #if defined(_MSC_VER)
 #pragma warning(push)
 // C4251: PImpl 成员不需要 DLL 接口 —— 所有成员函数均在 DLL 内实现，
@@ -51,6 +56,17 @@ class RTDB_API Engine {
   /// 本映像被打开过的累计次数（每次成功 Open 递增一次）。
   /// 用作跨进程活性/持久化的最小可见证据。
   int64_t SessionCount() const noexcept;
+
+  // ------------------ 写侧全局锁与内存管理（M0 直通句柄）------------------
+  /// 获取根互斥锁（保护分配器 freelist 与未来目录树的全局变更；
+  /// 可恢复持有者崩溃后的残留死锁）。timeout_ms==0 表示纯尝试。
+  Err LockRoot(uint32_t timeout_ms) noexcept;
+  void UnlockRoot() noexcept;
+
+  /// 共享内存 slab 分配器句柄。调用方负责持锁；Reader 恒为 nullptr。
+  infra::SlabShmAllocator* RawAllocator() const noexcept;
+  /// 根互斥锁对象本体（供高级用法），Reader 恒为 nullptr。
+  infra::ShmRootMutex* RawRootMutex() const noexcept;
 
  private:
   struct Impl;

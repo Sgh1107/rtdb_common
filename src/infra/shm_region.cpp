@@ -119,7 +119,25 @@ Result<std::unique_ptr<ShmRegion>> ShmRegion::Open(
     if (!IsOk(verr)) return Result<std::unique_ptr<ShmRegion>>::Fail(verr);
   }
 
-  AsAtomicI64(&sb->session_count)->fetch_add(1);
+  // 会话计数只允许写侧角色推进（只读映射不可写）。
+  if (p.role != Role::Reader) {
+    AsAtomicI64(&sb->session_count)->fetch_add(1);
+  }
+
+  // 挂载分配器 + 根互斥锁（Reader 只读映射不参与写侧元数据）。
+  if (p.role != Role::Reader) {
+    auto alloc_res = infra::SlabShmAllocator::Attach(
+        region->base_, region->mapped_bytes(), header_all_zero);
+    if (!alloc_res.IsOk())
+      return Result<std::unique_ptr<ShmRegion>>::Fail(alloc_res.Error());
+    region->alloc_ = alloc_res.TakeValue();
+
+    auto* ms = reinterpret_cast<infra::shm_RootMutexState*>(
+        static_cast<char*>(region->base_) + kRootMutexOffset);
+    if (header_all_zero) infra::ShmRootMutex::InitState(ms);
+    region->mutex_.reset(new infra::ShmRootMutex(ms));
+  }
+
   region->Flush();
   return Result<std::unique_ptr<ShmRegion>>::Ok(std::move(region));
 }
