@@ -1,0 +1,37 @@
+# rtdb_common clang-tidy 配置（docs/05 §1-D3 工程设施约定）
+# 原则：以正确性/并发类检查为主；对共享内存领域结构性必需的写法
+# （reinterpret_cast、偏移指针运算、C 数组键缓冲、魔法协议常量）
+# 显式豁免，避免配置变成无人维护的噪音源。
+---
+Checks: >
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  concurrency-*,
+  misc-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  cppcoreguidelines-init-variables,
+  cppcoreguidelines-narrowing-conversions,
+  cppcoreguidelines-slicing,
+  cppcoreguidelines-special-member-functions,
+  -bugprone-easily-swappable-parameters,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -cppcoreguidelines-avoid-c-arrays,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -misc-include-cleaner,
+  -misc-non-private-member-variables-in-classes,
+  -modernize-avoid-c-arrays,
+  -modernize-use-trailing-return-type,
+  -readability-function-cognitive-complexity,
+  -readability-identifier-length,
+  -readability-magic-numbers,
+
+# 只报告项目自身代码，豁免 FetchContent 拉入的第三方源码
+HeaderFilterRegex: '(include|rtdb_common/include|rtdb_common/src)/.*\.(hpp|h)$'
+FormatStyle: file

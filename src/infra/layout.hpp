@@ -36,48 +36,46 @@ inline constexpr uint64_t kDataStartOffset = 8192;
 ///    要求平台为无锁 64 位原子——x86_64/ARM64 均满足）；
 ///  - 新建时全部清零后填充。
 struct shm_SuperBlock {
-  // ==================== 稳定字段（参与 CRC）====================
-  uint64_t magic;             ///< 固定 kShmMagic
-  uint32_t format_version;    ///< kShmFormatVersion
-  uint32_t header_size;       ///< sizeof(shm_SuperBlock)，防结构膨胀错读
-  uint32_t pointer_width;     ///< sizeof(void*)，拦截跨字宽误挂载
-  uint32_t layout_crc;        ///< 稳定字段区 CRC（计算时自身按 0 计）
-  int64_t created_unix_ns;    ///< 映像创建时间（Unix 纳秒）
-  uint64_t max_size_bytes;    ///< 映像总容量
+    // ==================== 稳定字段（参与 CRC）====================
+    uint64_t magic;           ///< 固定 kShmMagic
+    uint32_t format_version;  ///< kShmFormatVersion
+    uint32_t header_size;     ///< sizeof(shm_SuperBlock)，防结构膨胀错读
+    uint32_t pointer_width;   ///< sizeof(void*)，拦截跨字宽误挂载
+    uint32_t layout_crc;      ///< 稳定字段区 CRC（计算时自身按 0 计）
+    int64_t created_unix_ns;  ///< 映像创建时间（Unix 纳秒）
+    uint64_t max_size_bytes;  ///< 映像总容量
 
-  // ==================== 运行时字段（不参与 CRC）====================
-  /// 已提交变更的全局最大序列号（int64 单调递增，M1 WAL 接管推进权）。
-  uint64_t committed_seq;
-  /// 主写者心跳（steady 纳秒时间戳；0 表示当前无活跃写者）。
-  uint64_t writer_heartbeat_ns;
-  /// 成功 Open 的累计次数（会话计数器，活性观测用）。
-  int64_t session_count;
-  /// Role::XXX 位标志持久化记录。
-  uint32_t role_flags;
-  uint32_t fsync_policy;
+    // ==================== 运行时字段（不参与 CRC）====================
+    /// 已提交变更的全局最大序列号（int64 单调递增，M1 WAL 接管推进权）。
+    uint64_t committed_seq;
+    /// 主写者心跳（steady 纳秒时间戳；0 表示当前无活跃写者）。
+    uint64_t writer_heartbeat_ns;
+    /// 成功 Open 的累计次数（会话计数器，活性观测用）。
+    int64_t session_count;
+    /// Role::XXX 位标志持久化记录。
+    uint32_t role_flags;
+    uint32_t fsync_policy;
 
-  char reserved[4096 - 6 * 8 - 6 * 4];  ///< 补齐至整 4096 字节
+    char reserved[4096 - 6 * 8 - 6 * 4];  ///< 补齐至整 4096 字节
 };
 
 static_assert(sizeof(shm_SuperBlock) == kHeaderReservedBytes,
               "shm_SuperBlock 必须恰好占满头部保留区");
-static_assert(std::is_standard_layout<shm_SuperBlock>::value,
-              "shm_SuperBlock 必须是标准布局");
+static_assert(std::is_standard_layout<shm_SuperBlock>::value, "shm_SuperBlock 必须是标准布局");
 
 // ---- 64 位运行时字段的原子访问 helper ----
-static_assert(sizeof(std::atomic<int64_t>) == sizeof(int64_t),
-              "需要无锁 64 位原子支持");
+static_assert(sizeof(std::atomic<int64_t>) == sizeof(int64_t), "需要无锁 64 位原子支持");
 
 inline std::atomic<int64_t>* AsAtomicI64(int64_t* p) noexcept {
-  return reinterpret_cast<std::atomic<int64_t>*>(p);
+    return reinterpret_cast<std::atomic<int64_t>*>(p);
 }
 inline std::atomic<uint64_t>* AsAtomicU64(uint64_t* p) noexcept {
-  return reinterpret_cast<std::atomic<uint64_t>*>(p);
+    return reinterpret_cast<std::atomic<uint64_t>*>(p);
 }
 
 /// SuperBlock 所在地址即映射基址偏移 0。
 inline shm_SuperBlock* SuperBlockAt(void* base) noexcept {
-  return static_cast<shm_SuperBlock*>(base);
+    return static_cast<shm_SuperBlock*>(base);
 }
 
 }  // namespace layout

@@ -1,0 +1,23 @@
+---
+# rtdb_common 统一代码格式（docs/05 §1-D3 工程设施约定）
+# 基线：Google 风格；项目定制：4 空格缩进、100 列限宽、指针左贴。
+---
+Language: Cpp
+BasedOnStyle: Google
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+AccessModifierOffset: -4
+PointerAlignment: Left
+DerivePointerAlignment: false
+
+# 头文件保持作者既有分组与顺序，避免工具重排引入评审噪音
+SortIncludes: Never
+IncludeBlocks: Preserve
+
+# 短函数/lambda/控制结构沿用 Google 折叠规则，最小化本次排版扰动
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AlignEscapedNewlines: Left

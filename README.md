@@ -21,19 +21,27 @@
 4. [API 设计规范](docs/04_API设计规范.md) —— 原生 API / C ABI / 网络协议草案
 5. [交付清单与里程碑](docs/05_交付清单与里程碑计划.md) —— 全量交付物 + 分期计划 + 验收标准
 6. [测试与质量保障](docs/06_测试与质量保障.md)
+7. [M0 里程碑交付说明](docs/07_M0里程碑交付说明.md) —— M0 做了什么、编译运行与测试的预期结果
 
-## 当前进展（M0 第一增量，2026-08）
+## 当前进展（M0 地基收尾，2026-08）
 
-平台抽象层与基础设施骨架已落地并构建验证通过（Windows/MSVC x64）：
+platform/infra 全部组件、SharedBTree、Slab 分配器均已落地，单测套件就绪；
+Windows/MSVC x64 构建验证通过，Linux/POSIX 验证由 CI 承担（待首跑）：
 
 | 组件 | 位置 | 状态 |
 |---|---|---|
 | 公共头（version/result/err/options） | `include/rtdb/` | ✅ |
 | SharedMemoryFile 平台抽象 | `src/platform/platform.hpp` | ✅ |
 | Win32 实现（文件映射） | `src/platform/win32/` | ✅ 已验证 |
-| POSIX 实现（mmap） | `src/platform/posix/` | 代码就绪待 Linux 构建 |
+| POSIX 实现（mmap + /proc 活性检测） | `src/platform/posix/` | 代码就绪，CI 首跑验证 |
 | SuperBlock + 布局 CRC 自校验 | `src/infra/layout.hpp`、`shm_region.*` | ✅ |
+| Slab 共享内存分配器（32B~64KB 12 级） | `src/infra/slab_allocator.*` | ✅ |
+| 根互斥锁（跨进程 + 死亡恢复） | `src/infra/shm_mutex.*` | ✅ |
+| 共享内存 B+ 树（插入/点查/游标/惰性删除/分裂） | `src/infra/shared_btree.hpp` | ✅ |
 | Engine 门面（打开/校验/全局状态字） | `include/rtdb/engine.hpp` | ✅ 最小可用 |
+| 单元测试（25 用例，含两进程死亡恢复演示） | `tests/unit/` | ✅ 待 CI 首跑拿绿色证据 |
+| CI（Win/Linux 双矩阵构建 + ctest） | `.github/workflows/ci.yml` | ✅ 配置就绪 |
+| clang-format / clang-tidy | `.clang-format`、`.clang-tidy` | ✅（全仓已按 4 空格风格统一） |
 
 **快速构建（Windows）**
 ```powershell

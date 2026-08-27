@@ -15,25 +15,25 @@ namespace rtdb {
 ///   4xx  服务端/网络协议
 ///   5xx  权限
 enum class Err : int16_t {
-  kOk = 0,
-  // ---- 1xx 基础设施 ----
-  kInvalidArgument = 101,
-  kNotFound = 102,
-  kAlreadyExists = 103,
-  kIoError = 104,
-  kUnsupported = 105,
-  kOutOfMemory = 106,
-  kTimeout = 107,
-  // ---- 2xx 存储/布局 ----
-  kBadSuperBlock = 201,
-  kVersionMismatch = 202,
-  kIncompatibleLayout = 203,
-  kReadOnlyHandle = 204,
-  // ---- 4xx 服务端 ----
-  kNotImplemented = 400,
-  kNetworkError = 401,
-  // ---- 兜底 ----
-  kInternal = 999,
+    kOk = 0,
+    // ---- 1xx 基础设施 ----
+    kInvalidArgument = 101,
+    kNotFound = 102,
+    kAlreadyExists = 103,
+    kIoError = 104,
+    kUnsupported = 105,
+    kOutOfMemory = 106,
+    kTimeout = 107,
+    // ---- 2xx 存储/布局 ----
+    kBadSuperBlock = 201,
+    kVersionMismatch = 202,
+    kIncompatibleLayout = 203,
+    kReadOnlyHandle = 204,
+    // ---- 4xx 服务端 ----
+    kNotImplemented = 400,
+    kNetworkError = 401,
+    // ---- 兜底 ----
+    kInternal = 999,
 };
 
 inline bool IsOk(Err e) noexcept { return e == Err::kOk; }

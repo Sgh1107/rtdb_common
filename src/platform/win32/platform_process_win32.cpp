@@ -18,10 +18,10 @@ namespace platform {
 namespace {
 
 uint64_t FileTimeToNs(const FILETIME& ft) noexcept {
-  ULARGE_INTEGER ul{};
-  ul.LowPart = ft.dwLowDateTime;
-  ul.HighPart = ft.dwHighDateTime;
-  return static_cast<uint64_t>(ul.QuadPart) * 100ull;  // 100ns -> 1ns
+    ULARGE_INTEGER ul{};
+    ul.LowPart = ft.dwLowDateTime;
+    ul.HighPart = ft.dwHighDateTime;
+    return static_cast<uint64_t>(ul.QuadPart) * 100ull;  // 100ns -> 1ns
 }
 
 }  // namespace
@@ -29,27 +29,25 @@ uint64_t FileTimeToNs(const FILETIME& ft) noexcept {
 uint32_t CurrentProcessId() { return static_cast<uint32_t>(GetCurrentProcessId()); }
 
 uint64_t CurrentProcessStartTimeNs() {
-  FILETIME create{}, exit{}, kernel{}, user{};
-  if (!GetProcessTimes(GetCurrentProcess(), &create, &exit, &kernel, &user))
-    return 0;
-  return FileTimeToNs(create);
+    FILETIME create{}, exit{}, kernel{}, user{};
+    if (!GetProcessTimes(GetCurrentProcess(), &create, &exit, &kernel, &user)) return 0;
+    return FileTimeToNs(create);
 }
 
 bool IsSameLiveProcess(uint32_t pid, uint64_t start_time_ns) {
-  HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-  if (h == nullptr) return false;
-  FILETIME create{}, exit{}, kernel{}, user{};
-  const bool matched =
-      GetProcessTimes(h, &create, &exit, &kernel, &user) &&
-      FileTimeToNs(create) == start_time_ns;
-  CloseHandle(h);
-  return matched;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (h == nullptr) return false;
+    FILETIME create{}, exit{}, kernel{}, user{};
+    const bool matched =
+        GetProcessTimes(h, &create, &exit, &kernel, &user) && FileTimeToNs(create) == start_time_ns;
+    CloseHandle(h);
+    return matched;
 }
 
 std::string HostExecutablePath() {
-  char buf[MAX_PATH]{};
-  const DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
-  return std::string(buf, n > 0 ? n : 0);
+    char buf[MAX_PATH]{};
+    const DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    return std::string(buf, n > 0 ? n : 0);
 }
 
 }  // namespace platform

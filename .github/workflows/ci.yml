@@ -1,0 +1,44 @@
+# rtdb_common CI（M0 里程碑"CI 就绪"出口项）
+# 双平台矩阵构建 + 单测。测试入口统一从 build/ 目录执行 ctest
+# （历史教训：在源码根目录执行会得到零用例的空跑记录，见 README 提醒）。
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest   # MSVC x64：Win32 平台层验证
+          - os: ubuntu-latest    # GCC/Clang：POSIX 平台层验证（ftruncate/mmap、/proc 活性检测）
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          ${{ runner.os == 'Windows' && '-G "Visual Studio 17 2022" -A x64' || '' }}
+          ${{ runner.os == 'Linux' && '-DCMAKE_BUILD_TYPE=Release' || '' }}
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Unit tests (from build dir!)
+        working-directory: build
+        run: ctest -C Release --output-on-failure
+
+      - name: Upload test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-log-${{ matrix.os }}
+          path: build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore

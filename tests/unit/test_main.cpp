@@ -15,22 +15,22 @@
 namespace {
 
 int RunCrashLockChild(const std::string& file_path) {
-  rtdb::Options opts;
-  opts.instance_name = "crash_child";
-  opts.file_path = file_path;
-  opts.initial_size_bytes = 1024 * 1024;
-  auto res = rtdb::Engine::Open(opts);
-  if (!res.IsOk()) return 3;
-  auto eng = res.TakeValue();
-  if (!IsOk(eng->LockRoot(5000))) return 4;  // 必须拿到才算占位成功
-  std::quick_exit(9);  // 携锁死亡
+    rtdb::Options opts;
+    opts.instance_name = "crash_child";
+    opts.file_path = file_path;
+    opts.initial_size_bytes = 1024 * 1024;
+    auto res = rtdb::Engine::Open(opts);
+    if (!res.IsOk()) return 3;
+    auto eng = res.TakeValue();
+    if (!IsOk(eng->LockRoot(5000))) return 4;  // 必须拿到才算占位成功
+    std::quick_exit(9);                        // 携锁死亡
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc >= 3 && std::string(argv[1]) == rtdb_test::kCrashLockFlag)
-    return RunCrashLockChild(argv[2]);
-  ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
+    if (argc >= 3 && std::string(argv[1]) == rtdb_test::kCrashLockFlag)
+        return RunCrashLockChild(argv[2]);
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
 }
