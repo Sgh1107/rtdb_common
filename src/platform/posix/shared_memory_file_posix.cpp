@@ -39,7 +39,10 @@ public:
     uint64_t size() const noexcept override { return size_; }
 
     Err flush(const void* addr, size_t len) noexcept override {
-        if (msync(addr, len, MS_SYNC) != 0) return ErrnoToErr(errno);
+        // POSIX msync 原型第一参数为 void*（历史遗留，未随 const 修订更新）。
+        // 本接口不通过该指针写入任何内容，仅请求内核回写映射区间，
+        // const_cast 属安全惯用法（Windows 的 FlushViewOfFile 亦接受 const）。
+        if (msync(const_cast<void*>(addr), len, MS_SYNC) != 0) return ErrnoToErr(errno);
         return Err::kOk;
     }
 

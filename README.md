@@ -45,7 +45,7 @@ Windows/MSVC x64 构建验证通过，Linux/POSIX 验证由 CI 承担（待首�
 
 **快速构建（Windows）**
 ```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake -S . -B build -A x64   # 不固定生成器版本，自动探测本机最新 VS（兼容 VS 2022/2026）
 cmake --build build --config Release
 cd build; ctest -C Release --output-on-failure   # M0 冒烟测试
 ```

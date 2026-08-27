@@ -1,6 +1,11 @@
 # rtdb_common CI（M0 里程碑"CI 就绪"出口项）
 # 双平台矩阵构建 + 单测。测试入口统一从 build/ 目录执行 ctest
 # （历史教训：在源码根目录执行会得到零用例的空跑记录，见 README 提醒）。
+#
+# 注意：Windows 不固定 VS 生成器版本 —— GitHub 已将 windows-latest 镜像
+# 默认切换到 VS 2026（runner-images #14016），固定 "Visual Studio 17 2022"
+# 会报 could not find any instance of Visual Studio。由 CMake 自动探测
+# 镜像上最新安装的 VS 版本，跨镜像迁移更稳健。
 name: ci
 
 on:
@@ -16,17 +21,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest   # MSVC x64：Win32 平台层验证
-          - os: ubuntu-latest    # GCC/Clang：POSIX 平台层验证（ftruncate/mmap、/proc 活性检测）
+          - os: windows-latest   # MSVC（自动探测最新版）：Win32 平台层验证
+          - os: ubuntu-latest    # GCC：POSIX 平台层验证（ftruncate/mmap、/proc 活性检测）
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure
-        run: >
-          cmake -S . -B build
-          ${{ runner.os == 'Windows' && '-G "Visual Studio 17 2022" -A x64' || '' }}
-          ${{ runner.os == 'Linux' && '-DCMAKE_BUILD_TYPE=Release' || '' }}
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: cmake -S . -B build -A x64
+
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build --config Release
