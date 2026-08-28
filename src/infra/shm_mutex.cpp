@@ -14,6 +14,8 @@
 namespace rtdb {
 namespace infra {
 
+using layout::AsAtomicU64;  // 64 位字段的原子访问
+
 void ShmRootMutex::InitState(shm_RootMutexState* s) noexcept { std::memset(s, 0, sizeof(*s)); }
 
 ShmRootMutex::ShmRootMutex(shm_RootMutexState* s) noexcept
@@ -22,25 +24,31 @@ ShmRootMutex::ShmRootMutex(shm_RootMutexState* s) noexcept
       my_start_(platform::CurrentProcessStartTimeNs()) {}
 
 bool ShmRootMutex::TryOnceLocked() noexcept {
-    // 快路径：CAS 0 -> 1。
+    // 快路径：CAS 0 -> 1。属主身份必须"先 start 后 pid"发布（见下）。
     uint32_t expected = 0;
     if (MutexAtomic(&s_->locked)->compare_exchange_strong(expected, 1)) {
-        s_->owner_pid = my_pid_;
-        s_->owner_start_ns = my_start_;
+        AsAtomicU64(&s_->owner_start_ns)->store(my_start_, std::memory_order_relaxed);
+        MutexAtomic(&s_->owner_pid)->store(my_pid_, std::memory_order_release);
         return true;
     }
     if (timeout_no_recover_) return false;  // TryLock 路径不做死亡恢复
 
     // 慢路径：锁被占 —— 判定持有者是否已死，死了则抢锁恢复。
-    const uint32_t dead_pid = s_->owner_pid;
-    const uint64_t dead_start = s_->owner_start_ns;
-    if (dead_pid == 0 || platform::IsSameLiveProcess(dead_pid, dead_start))
-        return false;  // 活着或字段尚未写全，让外层退避后重试
+    // 发布协议：pid 是发布完成的标志（acquire 读取）。pid==0 或
+    // start==0 均视为"发布中/未知"，绝不据此判定死亡——否则会在
+    // 新持有者尚未写全身份的窗口内发生假死偷锁，造成临界区重叠。
+    const uint32_t dead_pid = MutexAtomic(&s_->owner_pid)->load(std::memory_order_acquire);
+    if (dead_pid == 0) return false;
+    const uint64_t dead_start = AsAtomicU64(&s_->owner_start_ns)->load(std::memory_order_relaxed);
+    if (dead_start == 0) return false;
+    if (platform::IsSameLiveProcess(dead_pid, dead_start)) return false;  // 活着
 
     // CAS 抢占 owner 身份：多恢复者竞争时只有一人成功。
     expected = dead_pid;
-    if (MutexAtomic(&s_->owner_pid)->compare_exchange_strong(expected, my_pid_)) {
-        s_->owner_start_ns = my_start_;  // 接管完成
+    if (MutexAtomic(&s_->owner_pid)->compare_exchange_strong(expected, my_pid_,
+                                                             std::memory_order_acq_rel,
+                                                             std::memory_order_acquire)) {
+        AsAtomicU64(&s_->owner_start_ns)->store(my_start_, std::memory_order_relaxed);
         return true;
     }
     return false;  // 别的恢复者抢先了，下一轮再评估

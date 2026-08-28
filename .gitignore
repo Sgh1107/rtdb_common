@@ -1,8 +1,15 @@
 # CMake / 构建产物
 build/
+ci-build/
 out/
+out_demo/
+Testing/
 *.user
+build_out.txt
+rebuild.txt
+ci_*.txt
 
 # 实时库运行时映像（勿提交实例数据）
 *.rtdb
-*.txt
+windows-latest/
+ubuntu-latest/

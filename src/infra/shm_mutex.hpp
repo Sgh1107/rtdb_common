@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include "infra/layout.hpp"
 #include "rtdb/api_macro.hpp"
 #include "rtdb/err.hpp"
 #include "rtdb/result.hpp"

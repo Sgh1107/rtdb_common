@@ -113,3 +113,16 @@ if(RTDB_BUILD_EXAMPLES)
   endif()
   set_target_properties(embed_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 endif()
+
+# ---------------------------------------------------------------
+# 本地诊断可执行（默认不构建；-DRTDB_BUILD_DIAG=ON 启用）
+# ---------------------------------------------------------------
+option(RTDB_BUILD_DIAG "Build local diagnostic repro" OFF)
+if(RTDB_BUILD_DIAG)
+  add_executable(dbg_repro examples/dbg_repro/main.cpp)
+  target_link_libraries(dbg_repro PRIVATE rtdbcore)
+  target_include_directories(dbg_repro PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  if(MSVC)
+    target_compile_options(dbg_repro PRIVATE /W4 /permissive- /utf-8)
+  endif()
+endif()

@@ -159,8 +159,6 @@ public:
         while (true) {
             NodeHeader* n = MutHeader(cur);
             if (++guard > 64) {  // 防御：树高理论 ≤ ~12（255叉），越界必是 bug
-                std::printf("[btree] DESCENT GUARD TRIP cur=%llu cnt=%u lvl=%u\n",
-                            static_cast<unsigned long long>(cur), n->count, n->level);
                 return Err::kInternal;
             }
             if (n->leaf != 0) {
@@ -418,7 +416,9 @@ private:
             ch->count = static_cast<uint16_t>(mid);
         }
 
-        ShiftEntriesRight(parent, idx + 1, ph->count - idx - 1);
+        // 父节点写入：新实体落在实体号 idx+1（= 物理槽 idx，内部节点
+        // 实体#e ⇔ 槽 e-1）；原实体 idx+1..count 需整体右移一格。
+        ShiftEntriesRight(parent, idx, ph->count - idx);
         SetChildEntry(parent, idx + 1, sep, right);
         ph->count++;
         return Err::kOk;
@@ -466,8 +466,8 @@ Err SharedBTree<K, P>::Validate(uint64_t* visited_nodes) const noexcept {
         uint64_t off;
         int level;
     };
-    constexpr int kMaxDepth = 32;
-    Frame stack[kMaxDepth];
+    constexpr int kMaxStack = 8192;  // 待访栈上界=节点总数上界（勿用树高！）
+    Frame stack[kMaxStack];
     int sp = 0;
     stack[sp++] = {slot_->root_off, static_cast<int>(Node(slot_->root_off)->level)};
 
@@ -480,7 +480,7 @@ Err SharedBTree<K, P>::Validate(uint64_t* visited_nodes) const noexcept {
         const Frame f = stack[--sp];
         const NodeHeader* n = Node(f.off);
         if (visited_nodes != nullptr) (*visited_nodes)++;
-        if (static_cast<int>(n->level) != f.level || f.level < 0 || f.level >= kMaxDepth)
+        if (static_cast<int>(n->level) != f.level || f.level < 0)
             return Err::kIncompatibleLayout;
         const int cap = n->leaf != 0 ? kCapLeaf : kCapInt;
         if (n->count > cap) return Err::kIncompatibleLayout;
@@ -507,7 +507,7 @@ Err SharedBTree<K, P>::Validate(uint64_t* visited_nodes) const noexcept {
         if (f.level == 0) return Err::kIncompatibleLayout;
         // 进入内部子树：链期望挂起，待该子树首叶恢复校验。
         expecting_chain = false;
-        if (sp + static_cast<int>(n->count) + 1 > kMaxDepth) return Err::kIncompatibleLayout;
+        if (sp + static_cast<int>(n->count) + 1 > kMaxStack) return Err::kIncompatibleLayout;
         for (int i = static_cast<int>(n->count); i >= 0; --i)
             stack[sp++] = {ChildAt(f.off, i), f.level - 1};
     }

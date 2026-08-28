@@ -5,6 +5,7 @@
 /// 析构/解锁路径，等价 kill -9 的持有态残留），供父进程验证恢复。
 
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 #include <gtest/gtest.h>

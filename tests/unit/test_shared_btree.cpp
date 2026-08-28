@@ -280,7 +280,9 @@ TEST(SharedBTreeInt, StressSplitsAndValidation) {
     }
     uint64_t visited = 0;
     EXPECT_EQ(tree.Validate(&visited), rtdb::Err::kOk);
-    EXPECT_GT(visited, static_cast<uint64_t>(N / 4));  // 节点数远超单叶
+    // visited 统计节点数：满叶容量 255 ⇒ 节点数应在 (N/255, N) 区间。
+    EXPECT_GT(visited, static_cast<uint64_t>(N / 255));
+    EXPECT_LT(visited, static_cast<uint64_t>(N));
 
     std::mt19937_64 spot(7);
     uint64_t out = 0;
