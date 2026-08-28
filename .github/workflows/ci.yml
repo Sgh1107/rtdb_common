@@ -6,6 +6,10 @@
 # 默认切换到 VS 2026（runner-images #14016），固定 "Visual Studio 17 2022"
 # 会报 could not find any instance of Visual Studio。由 CMake 自动探测
 # 镜像上最新安装的 VS 版本，跨镜像迁移更稳健。
+#
+# 辅助 job（docs/05 D2 / docs/06 §4）：
+#   sanitize —— Linux ASan+UBSan 插桩构建与单测（UBSan 出错即中止）；
+#   coverage —— Linux 覆盖率度量（gcovr，仅统计 src/ 内核代码）。
 name: ci
 
 on:
@@ -48,4 +52,69 @@ jobs:
         with:
           name: ctest-log-${{ matrix.os }}
           path: build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+  sanitize:
+    # ASan（含 LeakSanitizer）+ UBSan：共享内存 offset 寻址类代码是
+    # 内存问题高发区，M0 起每次提交都跑一遍（docs/05 D2 / docs/06 §1）。
+    name: sanitize-linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (ASan + UBSan)
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Unit tests (ASan + UBSan instrumented)
+        working-directory: build
+        env:
+          ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: ctest --output-on-failure
+
+      - name: Upload sanitizer log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitizer-log
+          path: build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+  coverage:
+    # 覆盖率度量：仅统计 src/ 内核代码（排除 _deps/googletest 与 tests/），
+    # 结果作为 docs/06 §4 "infra/engine ≥85%" 验收口径的证据。
+    name: coverage-linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gcovr
+        run: pipx install gcovr
+
+      - name: Configure (--coverage)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS=--coverage
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Unit tests
+        working-directory: build
+        run: ctest --output-on-failure
+
+      - name: Coverage summary
+        run: gcovr --root . --filter 'src/' --exclude '_deps' --print-summary
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
           if-no-files-found: ignore
