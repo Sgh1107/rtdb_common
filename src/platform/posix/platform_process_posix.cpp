@@ -38,10 +38,12 @@ bool ReadProcStartJiffies(pid_t pid, unsigned long long* out) {
     const char* p = std::strrchr(buf, ')');
     if (p == nullptr) return false;
     // ')' 后跳过空格进入 state 字段；starttime 是 state 后第 19 个字段。
+    // 注意：被抑制的转换(%*) 不需要长度修饰符（%*llu 属 GNU 扩展会触发
+    // -Wformat 警告），直接用 %*d/%*u 即可——丢弃字段无须宽度保真。
     unsigned long long start_jiffies = 0;
     if (std::sscanf(p + 2,
-                    "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %*llu %*llu "
-                    "%*lld %*lld %*d %*d %*d %*d %llu",
+                    "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %*u %*u "
+                    "%*d %*d %*d %*d %*d %*d %llu",
                     &start_jiffies) != 1)
         return false;
     *out = start_jiffies;

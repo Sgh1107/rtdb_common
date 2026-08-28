@@ -33,7 +33,9 @@ protected:
         m_ = std::make_unique<infra::ShmRootMutex>(State());
     }
 
-    auto* State() { return reinterpret_cast<infra::shm_RootMutexState*>(buf_); }
+    infra::shm_RootMutexState* State() {
+        return reinterpret_cast<infra::shm_RootMutexState*>(buf_);
+    }
 
     alignas(16) unsigned char buf_[64]{};
     std::unique_ptr<infra::ShmRootMutex> m_;
