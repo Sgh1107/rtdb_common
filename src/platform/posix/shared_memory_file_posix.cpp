@@ -48,6 +48,9 @@ public:
 
     static Result<std::unique_ptr<SharedMemoryFile>> Open(const ShmParams& p) {
         int flags = O_CLOEXEC;
+        // 访问模式位必须显式给出：缺省(0)会被内核当作 O_RDONLY，
+        // 导致后续 ftruncate 直接 EINVAL——这是 Linux CI 首败的根因。
+        flags |= p.readonly ? O_RDONLY : O_RDWR;
         flags |= (p.mode == OpenMode::CreateNew)      ? (O_CREAT | O_EXCL)
                  : (p.mode == OpenMode::OpenOrCreate) ? O_CREAT
                                                       : 0;

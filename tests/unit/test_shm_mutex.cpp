@@ -138,7 +138,8 @@ TEST(ShmMutexDeathRecovery, RecoversAfterHolderHardKill) {
 
     // 新会话挂载后必须能在短时间内恢复残锁（若不恢复将 kTimeout）。
     auto res = rtdb::Engine::Open(opts);
-    ASSERT_TRUE(res.IsOk()) << "子进程异常退出后映像不可用";
+    ASSERT_TRUE(res.IsOk()) << "reopen after crash: "
+                            << rtdb::ErrorMessage(res.Error());
     auto eng = res.TakeValue();
     auto* mutex = eng->RawRootMutex();
     ASSERT_NE(mutex, nullptr);

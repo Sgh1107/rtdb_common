@@ -46,20 +46,21 @@ TEST_F(EngineLifecycleTest, CreatePersistReopen) {
     const auto opts = MakeOpts("m0");
     {
         auto res = rtdb::Engine::Open(opts);
-        ASSERT_TRUE(res.IsOk());
+        ASSERT_TRUE(res.IsOk()) << "create: " << rtdb::ErrorMessage(res.Error());
         auto eng = res.TakeValue();
         EXPECT_GE(eng->SessionCount(), 1);
         EXPECT_EQ(eng->CommittedSeq(), 0);  // 初始化值
     }
     auto res2 = rtdb::Engine::Open(opts);
-    ASSERT_TRUE(res2.IsOk());
+    ASSERT_TRUE(res2.IsOk()) << "reopen: " << rtdb::ErrorMessage(res2.Error());
     EXPECT_EQ(res2.Value()->SessionCount(), 2);  // 会话计数跨进程累计
 }
 
 TEST_F(EngineLifecycleTest, CorruptMagicRejected) {
     const auto opts = MakeOpts("bad");
     {
-        ASSERT_TRUE(rtdb::Engine::Open(opts).IsOk());
+        auto res = rtdb::Engine::Open(opts);
+        ASSERT_TRUE(res.IsOk()) << "create: " << rtdb::ErrorMessage(res.Error());
     }
     {
         std::fstream f(kTmpFile, std::ios::binary | std::ios::in | std::ios::out);
@@ -90,12 +91,13 @@ TEST_F(EngineLifecycleTest, UndersizedImageRejected) {
 TEST_F(EngineLifecycleTest, ReaderRoleHasNoWriteSideHandles) {
     const auto opts = MakeOpts("rw_first");
     {
-        ASSERT_TRUE(rtdb::Engine::Open(opts).IsOk());
+        auto res = rtdb::Engine::Open(opts);
+        ASSERT_TRUE(res.IsOk()) << "create: " << rtdb::ErrorMessage(res.Error());
     }
     rtdb::Options ro = MakeOpts("rw_first");
     ro.role = rtdb::Role::Reader;
     auto res = rtdb::Engine::Open(ro);
-    ASSERT_TRUE(res.IsOk());
+    ASSERT_TRUE(res.IsOk()) << "reader: " << rtdb::ErrorMessage(res.Error());
     EXPECT_EQ(res.Value()->RawAllocator(), nullptr);
     EXPECT_EQ(res.Value()->RawRootMutex(), nullptr);
     EXPECT_EQ(res.Value()->LockRoot(0), rtdb::Err::kUnsupported);
