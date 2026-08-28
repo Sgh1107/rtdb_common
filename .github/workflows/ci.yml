@@ -109,7 +109,9 @@ jobs:
         run: ctest --output-on-failure
 
       - name: Coverage summary
-        run: gcovr --root . --filter 'src/' --exclude '_deps' --print-summary
+        run: >
+          gcovr --root . --filter 'src/' --exclude '_deps' --print-summary
+          --gcov-ignore-parse-errors=negative_hits.warn_once_per_file
 
       - name: Upload coverage report
         if: always()
