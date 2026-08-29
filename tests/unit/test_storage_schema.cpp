@@ -57,9 +57,8 @@ TEST(StorageSchema, PlanRowLayoutMixedColumnOffsets) {
     // i64, f64, utf8var, i32, bool —— 依次自然对齐：
     //   i64@0(8)  f64@8(8)  var@16(8 槽)  i32@24(4)  bool@28(1) → 尾部对齐 32
     const std::vector<ColDefHost> cols = {
-        {"a_int64", DataType::kInt64}, {"b_f64", DataType::kFloat64},
-        {"c_str", DataType::kUtf8Var}, {"d_i32", DataType::kInt32},
-        {"e_flag", DataType::kBool},
+        {"a_int64", DataType::kInt64}, {"b_f64", DataType::kFloat64}, {"c_str", DataType::kUtf8Var},
+        {"d_i32", DataType::kInt32},   {"e_flag", DataType::kBool},
     };
     std::vector<uint32_t> off(cols.size());
     const RowLayoutPlan plan = PlanRowLayout(cols.data(), cols.size(), 100, off.data());

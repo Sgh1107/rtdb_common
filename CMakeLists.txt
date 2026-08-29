@@ -21,6 +21,7 @@ add_library(rtdbcore SHARED
   src/infra/shm_region.cpp
   src/infra/slab_allocator.cpp
   src/infra/shm_mutex.cpp
+  src/storage/var_pool.cpp
 )
 if(WIN32)
   target_sources(rtdbcore PRIVATE
@@ -86,6 +87,7 @@ if(RTDB_BUILD_TESTS)
     tests/unit/test_shared_btree.cpp
     tests/unit/test_shm_mutex.cpp
     tests/unit/test_storage_schema.cpp
+    tests/unit/test_var_pool.cpp
   )
   target_link_libraries(rtdb_unit_tests PRIVATE rtdbcore GTest::gtest_main)
   target_include_directories(rtdb_unit_tests
