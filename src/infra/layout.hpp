@@ -44,10 +44,28 @@ struct shm_SuperBlock {
     uint32_t layout_crc;      ///< 稳定字段区 CRC（计算时自身按 0 计）
     int64_t created_unix_ns;  ///< 映像创建时间（Unix 纳秒）
     uint64_t max_size_bytes;  ///< 映像总容量
+    // ---- M1 布局规划字段（docs/08 §3-W1；创建时定格，运行期只读）----
+    /// WalRing 环形区起始偏移；0 = 尚未布局（M1-W4 圈定并写入）。
+    uint64_t wal_ring_off;
+    /// WalRing 环形区容量字节数（含环头）；0 = 尚未布局。
+    uint64_t wal_ring_bytes;
+    /// 目录描述符数组区起始偏移；0 = 尚未布局（M1-W2 圈定）。
+    uint64_t catalog_desc_off;
+    /// 表数量上限（默认 65535，docs/03 §4.1）。
+    uint64_t max_tables;
+    /// 每表列数上限（默认 128）。
+    uint64_t max_cols_per_table;
+    /// 每表索引数上限（默认 16）。
+    uint64_t max_indexes_per_table;
 
     // ==================== 运行时字段（不参与 CRC）====================
     /// 已提交变更的全局最大序列号（int64 单调递增，M1 WAL 接管推进权）。
     uint64_t committed_seq;
+    /// 重放下界：已随快照/强刷落盘并具备重放起点的最大 seq（M1-W4 起）。
+    uint64_t checkpoint_seq;
+    /// 后台节流 flush 已推进到的 seq（per_second 档账本；always 档跟随
+    /// committed_seq；断电丢失窗口 = (flushed_seq, committed_seq]）。
+    uint64_t flushed_seq;
     /// 主写者心跳（steady 纳秒时间戳；0 表示当前无活跃写者）。
     uint64_t writer_heartbeat_ns;
     /// 成功 Open 的累计次数（会话计数器，活性观测用）。
@@ -56,7 +74,7 @@ struct shm_SuperBlock {
     uint32_t role_flags;
     uint32_t fsync_policy;
 
-    char reserved[4096 - 6 * 8 - 6 * 4];  ///< 补齐至整 4096 字节
+    char reserved[4096 - 14 * 8 - 6 * 4];  ///< 补齐至整 4096 字节
 };
 
 static_assert(sizeof(shm_SuperBlock) == kHeaderReservedBytes,

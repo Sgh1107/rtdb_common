@@ -30,6 +30,21 @@ const char* ErrorMessage(Err e) noexcept {
             return "incompatible shm layout (pointer width / layout crc)";
         case Err::kReadOnlyHandle:
             return "handle is read-only";
+        case Err::kCorruption:
+            return "persistent structure corrupted";
+        // ---- 3xx ----
+        case Err::kPoisoned:
+            return "engine poisoned (unrecoverable wal state, writes rejected)";
+        case Err::kTableExists:
+            return "table already exists";
+        case Err::kTableNotFound:
+            return "table not found";
+        case Err::kSchemaMismatch:
+            return "schema layout version mismatch";
+        case Err::kBatchAborted:
+            return "atomic batch aborted (no commit record)";
+        case Err::kLimitExceeded:
+            return "configured limit exceeded (tables / columns / indexes)";
         // ---- 4xx ----
         case Err::kNotImplemented:
             return "not implemented yet";

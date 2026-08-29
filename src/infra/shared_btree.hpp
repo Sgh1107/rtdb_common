@@ -480,8 +480,7 @@ Err SharedBTree<K, P>::Validate(uint64_t* visited_nodes) const noexcept {
         const Frame f = stack[--sp];
         const NodeHeader* n = Node(f.off);
         if (visited_nodes != nullptr) (*visited_nodes)++;
-        if (static_cast<int>(n->level) != f.level || f.level < 0)
-            return Err::kIncompatibleLayout;
+        if (static_cast<int>(n->level) != f.level || f.level < 0) return Err::kIncompatibleLayout;
         const int cap = n->leaf != 0 ? kCapLeaf : kCapInt;
         if (n->count > cap) return Err::kIncompatibleLayout;
 

@@ -85,6 +85,7 @@ if(RTDB_BUILD_TESTS)
     tests/unit/test_slab_allocator.cpp
     tests/unit/test_shared_btree.cpp
     tests/unit/test_shm_mutex.cpp
+    tests/unit/test_storage_schema.cpp
   )
   target_link_libraries(rtdb_unit_tests PRIVATE rtdbcore GTest::gtest_main)
   target_include_directories(rtdb_unit_tests

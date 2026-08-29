@@ -45,9 +45,9 @@ bool ShmRootMutex::TryOnceLocked() noexcept {
 
     // CAS 抢占 owner 身份：多恢复者竞争时只有一人成功。
     expected = dead_pid;
-    if (MutexAtomic(&s_->owner_pid)->compare_exchange_strong(expected, my_pid_,
-                                                             std::memory_order_acq_rel,
-                                                             std::memory_order_acquire)) {
+    if (MutexAtomic(&s_->owner_pid)
+            ->compare_exchange_strong(expected, my_pid_, std::memory_order_acq_rel,
+                                      std::memory_order_acquire)) {
         AsAtomicU64(&s_->owner_start_ns)->store(my_start_, std::memory_order_relaxed);
         return true;
     }

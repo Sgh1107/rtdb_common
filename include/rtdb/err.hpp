@@ -29,6 +29,20 @@ enum class Err : int16_t {
     kVersionMismatch = 202,
     kIncompatibleLayout = 203,
     kReadOnlyHandle = 204,
+    kCorruption = 205,
+    // ---- 3xx 引擎层（M1 起启用，docs/08 §4）----
+    /// 实例毒化：WAL 环写失败/校验失败后拒写保读（docs/08 §2-D2）。
+    kPoisoned = 301,
+    /// 建表重名（Catalog 目录事务拒绝）。
+    kTableExists = 302,
+    /// OpenTable/DropTable 目标表不存在。
+    kTableNotFound = 303,
+    /// schema 不匹配：句柄绑定的布局版本与当前表定义不一致等。
+    kSchemaMismatch = 304,
+    /// 原子批量被整体作废（未落 COMMIT，恢复时整批丢弃）。
+    kBatchAborted = 305,
+    /// 超出 SuperBlock 配置上限（表数/列数/索引数）。
+    kLimitExceeded = 306,
     // ---- 4xx 服务端 ----
     kNotImplemented = 400,
     kNetworkError = 401,

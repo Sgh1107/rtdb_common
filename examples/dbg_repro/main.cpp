@@ -37,8 +37,7 @@ void DumpHeader(const char* tag, const Region& r, uint64_t off) {
 
 int main() {
     Region region;
-    auto alloc_res =
-        infra::SlabShmAllocator::Attach(region.mem, Region::kBytes, true);
+    auto alloc_res = infra::SlabShmAllocator::Attach(region.mem, Region::kBytes, true);
     if (!alloc_res.IsOk()) {
         std::printf("attach fail\n");
         return 1;
@@ -61,8 +60,7 @@ int main() {
     DumpHeader("after-ins2", region, slot.root_off);
 
     uint64_t out = 0;
-    std::printf("find500=%d find424=%d size=%llu\n",
-                static_cast<int>(tree.Find(k1, &out)),
+    std::printf("find500=%d find424=%d size=%llu\n", static_cast<int>(tree.Find(k1, &out)),
                 static_cast<int>(tree.Find(k2, &out)),
                 static_cast<unsigned long long>(tree.Size()));
 
@@ -91,16 +89,14 @@ int main() {
         infra::EncodeOrderedInt64(k, kk);
         const rtdb::Err e = tree.Insert(kk, static_cast<uint64_t>(k));
         if (e != rtdb::Err::kOk) {
-            std::printf("FAIL at step=%d key=%d err=%d root=%llu\n", step, k,
-                        static_cast<int>(e),
+            std::printf("FAIL at step=%d key=%d err=%d root=%llu\n", step, k, static_cast<int>(e),
                         static_cast<unsigned long long>(slot.root_off));
             return 2;
         }
         if ((step % 500) == 499) {
             uint64_t vis = 0;
             const rtdb::Err vr = tree.Validate(&vis);
-            std::printf("validate@%d => %d visited=%llu\n", step + 1,
-                        static_cast<int>(vr),
+            std::printf("validate@%d => %d visited=%llu\n", step + 1, static_cast<int>(vr),
                         static_cast<unsigned long long>(vis));
             if (vr != rtdb::Err::kOk) {
                 // 细化：叶链有序性检查
@@ -125,11 +121,10 @@ int main() {
                     if (cnt > 0) {
                         const unsigned char* first = b + 16;
                         const unsigned char* last = b + 16 + (cnt - 1) * 16;
-                        if (have &&
-                            std::memcmp(prev_last, first, 8) >= 0) {
+                        if (have && std::memcmp(prev_last, first, 8) >= 0) {
                             std::printf("CROSS-LEAF ORDER BREAK at leaf=%d\n", leafno);
-                            std::printf("  prev_last=%02x%02x first=%02x%02x\n",
-                                        prev_last[0], prev_last[7], first[0], first[7]);
+                            std::printf("  prev_last=%02x%02x first=%02x%02x\n", prev_last[0],
+                                        prev_last[7], first[0], first[7]);
                             break;
                         }
                         std::memcpy(prev_last, last, 8);
@@ -156,63 +151,51 @@ int main() {
                 std::printf("root pairs: cnt=%u asc-violating-slot=%d\n", rc, bad);
                 for (unsigned s = 0; s < rc && s < 10; ++s) {
                     const unsigned char* p = rb + 24 + s * 16;
-                    std::printf("  pair[%u] key=%02x %02x %02x %02x %02x %02x %02x %02x child=%llu\n",
-                                s, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
-                                static_cast<unsigned long long>(
-                                    *reinterpret_cast<const uint64_t*>(p + 8)));
+                    std::printf(
+                        "  pair[%u] key=%02x %02x %02x %02x %02x %02x %02x %02x child=%llu\n", s,
+                        p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+                        static_cast<unsigned long long>(*reinterpret_cast<const uint64_t*>(p + 8)));
                 }
                 return 6;
             }
         }
         // 零孩哨兵：全树 DFS，任何内部节点的孩子指针不得为 0。
         {
-            std::function<void(uint64_t, int)> walk =
-                [&](uint64_t off, int depth) {
-                    if (off == 0 || depth > 8) {
-                        std::printf("BAD-NODE off=%llu depth=%d step=%d\n",
-                                    static_cast<unsigned long long>(off),
-                                    depth, step);
-                        std::exit(5);
-                    }
-                    const unsigned char* b =
-                        reinterpret_cast<const unsigned char*>(region.mem + off);
-                    const unsigned cnt = b[0] | (b[1] << 8);
-                    if ((b[2] & 0xFF) != 0) return;  // leaf
-                    const uint64_t c0 =
-                        *reinterpret_cast<const uint64_t*>(b + 16);
-                    if (c0 == 0) {
-                        std::printf(
-                            "ZERO-child0 node=%llu step=%d key=%d cnt=%u\n",
-                            static_cast<unsigned long long>(off), step, k,
-                            cnt);
-                        for (unsigned s = 0; s < cnt; ++s) {
-                            const unsigned char* p = b + 24 + s * 16;
-                            std::printf("  pair[%u] key=%02x%02x child=%llu\n",
-                                        s, p[0], p[1],
-                                        static_cast<unsigned long long>(
-                                            *reinterpret_cast<const uint64_t*>(
-                                                p + 8)));
-                        }
-                        std::exit(5);
-                    }
-                    walk(c0, depth + 1);
+            std::function<void(uint64_t, int)> walk = [&](uint64_t off, int depth) {
+                if (off == 0 || depth > 8) {
+                    std::printf("BAD-NODE off=%llu depth=%d step=%d\n",
+                                static_cast<unsigned long long>(off), depth, step);
+                    std::exit(5);
+                }
+                const unsigned char* b = reinterpret_cast<const unsigned char*>(region.mem + off);
+                const unsigned cnt = b[0] | (b[1] << 8);
+                if ((b[2] & 0xFF) != 0) return;  // leaf
+                const uint64_t c0 = *reinterpret_cast<const uint64_t*>(b + 16);
+                if (c0 == 0) {
+                    std::printf("ZERO-child0 node=%llu step=%d key=%d cnt=%u\n",
+                                static_cast<unsigned long long>(off), step, k, cnt);
                     for (unsigned s = 0; s < cnt; ++s) {
-                        const uint64_t ch = *reinterpret_cast<const uint64_t*>(
-                            b + 24 + s * 16 + 8);
-                        if (ch == 0) {
-                            std::printf(
-                                "ZERO-pair[%u] node=%llu step=%d key=%d cnt=%u\n",
-                                s, static_cast<unsigned long long>(off), step,
-                                k, cnt);
-                            std::exit(5);
-                        }
-                        walk(ch, depth + 1);
+                        const unsigned char* p = b + 24 + s * 16;
+                        std::printf("  pair[%u] key=%02x%02x child=%llu\n", s, p[0], p[1],
+                                    static_cast<unsigned long long>(
+                                        *reinterpret_cast<const uint64_t*>(p + 8)));
                     }
-                };
+                    std::exit(5);
+                }
+                walk(c0, depth + 1);
+                for (unsigned s = 0; s < cnt; ++s) {
+                    const uint64_t ch = *reinterpret_cast<const uint64_t*>(b + 24 + s * 16 + 8);
+                    if (ch == 0) {
+                        std::printf("ZERO-pair[%u] node=%llu step=%d key=%d cnt=%u\n", s,
+                                    static_cast<unsigned long long>(off), step, k, cnt);
+                        std::exit(5);
+                    }
+                    walk(ch, depth + 1);
+                }
+            };
             walk(slot.root_off, 0);
         }
     }
-    std::printf("ALL 600 INSERTS OK size=%llu\n",
-                static_cast<unsigned long long>(tree.Size()));
+    std::printf("ALL 600 INSERTS OK size=%llu\n", static_cast<unsigned long long>(tree.Size()));
     return 0;
 }

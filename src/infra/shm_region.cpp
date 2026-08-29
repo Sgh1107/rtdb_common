@@ -20,9 +20,11 @@ namespace layout {
 
 namespace {
 
-/// 稳定字段区：从结构体起始到 max_size_bytes 结束（含），运行时字段
-/// 与 layout_crc 自身不参与 CRC。
-constexpr size_t kStableFieldsBytes = offsetof(shm_SuperBlock, max_size_bytes) + sizeof(uint64_t);
+/// 稳定字段区：从结构体起始到 max_indexes_per_table 结束（含；M1-W1 起
+/// 稳定段末尾锚点，覆盖 WalRing/目录/上限规划字段），运行时字段与
+/// layout_crc 自身不参与 CRC。
+constexpr size_t kStableFieldsBytes =
+    offsetof(shm_SuperBlock, max_indexes_per_table) + sizeof(uint64_t);
 
 }  // namespace
 
@@ -43,7 +45,17 @@ void InitSuperBlock(shm_SuperBlock* sb, uint64_t total_bytes, uint32_t role_flag
     sb->pointer_width = static_cast<uint32_t>(sizeof(void*));
     sb->created_unix_ns = created_unix_ns;
     sb->max_size_bytes = total_bytes;
+    // M1 布局规划字段：WalRing/目录区在后续周次圈定后写入（0=未布局），
+    // 上限取 docs/03 §4.1 默认值。
+    sb->wal_ring_off = 0;
+    sb->wal_ring_bytes = 0;
+    sb->catalog_desc_off = 0;
+    sb->max_tables = 65535;
+    sb->max_cols_per_table = 128;
+    sb->max_indexes_per_table = 16;
     sb->committed_seq = 0;
+    sb->checkpoint_seq = 0;
+    sb->flushed_seq = 0;
     sb->writer_heartbeat_ns = 0;
     sb->session_count = 0;
     sb->role_flags = role_flags;
