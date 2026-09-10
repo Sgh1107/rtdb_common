@@ -125,7 +125,13 @@ TEST_F(CatalogDirectTest, CreateOpenDropRoundtrip) {
     EXPECT_EQ(catalog_->OpenTable("meters").Error(), Err::kTableNotFound);
     EXPECT_EQ(catalog_->DropTable("meters"), Err::kTableNotFound);
     EXPECT_EQ(catalog_->table_count(), 0u);
-    EXPECT_EQ(catalog_->FindById(1).Error(), Err::kOk) << "墓碑描述符仍可按 id 审计";
+    // 墓碑描述符仍可按 id 定位（物理目录完整），但状态须为墓碑态。
+    // 注意：不得对成功的 Result 调用 Error()/Value() 以外的越权访问——
+    // 二者带 assert(!IsOk())/assert(IsOk())，Debug 构建会直接中止。
+    const auto tomb_desc = catalog_->FindById(1);
+    ASSERT_TRUE(tomb_desc.IsOk()) << rtdb::ErrorMessage(tomb_desc.Error());
+    EXPECT_EQ(catalog_->Descriptor(tomb_desc.Value())->state,
+              static_cast<uint32_t>(rtdb::storage::TableState::kTombstone));
     EXPECT_EQ(catalog_->Validate(&active), Err::kOk);
     EXPECT_EQ(active, 0u);
 }

@@ -384,4 +384,113 @@ TEST_F(TableStoreDirectTest, UnsupportedPrimaryKeyRejectedAtCreate) {
     EXPECT_EQ(active, 0u);
 }
 
+// ---------------------------------------------------------------------------
+// f32 定长列与宽定长列（len > 8 的字节块）双向往返
+// ---------------------------------------------------------------------------
+TEST_F(TableStoreDirectTest, Float32AndWideFixedColumnRoundtrip) {
+    TableDef def;
+    def.name = "types";
+    def.row_cap = 8;
+    def.columns.push_back({"id", DataType::kInt64, 0, false, false});
+    def.columns.push_back({"f32", DataType::kFloat32, 0, true, false});
+    def.columns.push_back({"tag16", DataType::kInt8, /*len=*/16, true, false});
+    auto desc_res = catalog_->CreateTable(def);
+    ASSERT_TRUE(desc_res.IsOk()) << rtdb::ErrorMessage(desc_res.Error());
+    const auto* desc = catalog_->Descriptor(desc_res.Value());
+    ASSERT_NE(desc, nullptr);
+    // tag16 占据 16 字节定长区（覆盖 kInt8 固有宽度 1B）
+    EXPECT_EQ(desc->cols[2].len, 16u);
+
+    auto store =
+        rtdb::storage::TableStore::Attach(mem_, alloc_.get(), desc_res.Value()).TakeValue();
+    const std::string tag = "0123456789abcdef";  // 16B
+    ASSERT_EQ(store->Insert({ColumnValue::Int(1), ColumnValue::Real(1.5f), ColumnValue::Bytes(tag)},
+                            nullptr),
+              Err::kOk);
+
+    auto got = store->Get(ColumnValue::Int(1));
+    ASSERT_TRUE(got.IsOk()) << rtdb::ErrorMessage(got.Error());
+    EXPECT_DOUBLE_EQ(got.Value()[1].as_real(), 1.5);  // f32 往返（值可精确表示）
+    EXPECT_EQ(got.Value()[2].as_bytes(), tag);        // 宽定长列按字节块往返
+    EXPECT_EQ(store->Validate(), Err::kOk);
+}
+
+// ---------------------------------------------------------------------------
+// Attach 的损坏检出门槛（偏移为零 / 魔数错 / 分区缺失 / 变长池描述不一致）
+// ---------------------------------------------------------------------------
+TEST_F(TableStoreDirectTest, AttachRejectsCorruptedDescriptor) {
+    auto desc_res = catalog_->CreateTable(MakeRichDef("guard", 8));
+    ASSERT_TRUE(desc_res.IsOk());
+    const uint64_t desc_off = desc_res.Value();
+    auto* desc = const_cast<rtdb::storage::shm_TableDescriptor*>(catalog_->Descriptor(desc_off));
+
+    EXPECT_EQ(rtdb::storage::TableStore::Attach(mem_, alloc_.get(), 0).Error(),
+              Err::kInvalidArgument);
+
+    const uint64_t saved_magic = desc->magic;
+    desc->magic = 0;
+    EXPECT_EQ(rtdb::storage::TableStore::Attach(mem_, alloc_.get(), desc_off).Error(),
+              Err::kCorruption);
+    desc->magic = saved_magic;
+
+    const uint64_t saved_data = desc->data_seg_head_off;
+    desc->data_seg_head_off = 0;
+    EXPECT_EQ(rtdb::storage::TableStore::Attach(mem_, alloc_.get(), desc_off).Error(),
+              Err::kCorruption);
+    desc->data_seg_head_off = saved_data;
+
+    const uint64_t saved_slot = desc->index_head_off[0];
+    desc->index_head_off[0] = 0;
+    EXPECT_EQ(rtdb::storage::TableStore::Attach(mem_, alloc_.get(), desc_off).Error(),
+              Err::kCorruption);
+    desc->index_head_off[0] = saved_slot;
+
+    const uint64_t saved_pool_bytes = desc->var_pool_bytes;
+    desc->var_pool_bytes = 0;  // 池区存在但容量描述缺失
+    EXPECT_EQ(rtdb::storage::TableStore::Attach(mem_, alloc_.get(), desc_off).Error(),
+              Err::kCorruption);
+    desc->var_pool_bytes = saved_pool_bytes;
+
+    // 恢复后应可正常附着
+    EXPECT_TRUE(rtdb::storage::TableStore::Attach(mem_, alloc_.get(), desc_off).IsOk());
+}
+
+// ---------------------------------------------------------------------------
+// 乐观读：遭遇写入中（版本为奇数）时重试后返回 kTimeout，不采纳半更新数据
+// ---------------------------------------------------------------------------
+TEST_F(TableStoreDirectTest, OptimisticReadTimesOutOnInFlightWrite) {
+    auto desc_res = catalog_->CreateTable(MakeRichDef("inflight", 8));
+    ASSERT_TRUE(desc_res.IsOk());
+    const auto* desc = catalog_->Descriptor(desc_res.Value());
+    auto store =
+        rtdb::storage::TableStore::Attach(mem_, alloc_.get(), desc_res.Value()).TakeValue();
+    ASSERT_EQ(store->Insert(MakeRichRow(1, 1.0, 1, true, "v", "b"), nullptr), Err::kOk);
+
+    // 模拟写入方已置奇数版本但尚未完成提交。
+    auto* ver = reinterpret_cast<uint64_t*>(mem_ + desc->ver_array_off);
+    const uint64_t saved = *ver;
+    *ver = 3;
+    EXPECT_EQ(store->Get(ColumnValue::Int(1)).Error(), Err::kTimeout);
+
+    *ver = saved;  // 恢复稳定态
+    EXPECT_TRUE(store->Get(ColumnValue::Int(1)).IsOk());
+}
+
+// ---------------------------------------------------------------------------
+// 区域释放（建表回滚路径）：释放分区并使后续附着失败
+// ---------------------------------------------------------------------------
+TEST_F(TableStoreDirectTest, ReleaseRegionsFreesPhysicalBlocks) {
+    auto desc_res = catalog_->CreateTable(MakeRichDef("rollback", 8));
+    ASSERT_TRUE(desc_res.IsOk());
+    const uint64_t desc_off = desc_res.Value();
+    const auto* desc = catalog_->Descriptor(desc_off);
+    ASSERT_NE(desc, nullptr);
+
+    const uint64_t used_before = alloc_->used_bytes();
+    rtdb::storage::ReleaseRegions(desc, alloc_.get());
+    EXPECT_LT(alloc_->used_bytes(), used_before);
+    // 分区已归还：再次附着必须因区域缺失而失败。
+    EXPECT_FALSE(rtdb::storage::TableStore::Attach(mem_, alloc_.get(), desc_off).IsOk());
+}
+
 }  // namespace

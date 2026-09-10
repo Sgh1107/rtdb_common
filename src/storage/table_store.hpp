@@ -134,13 +134,14 @@ private:
 #endif
 
 /// \brief 主键列类型是否受支持（M1：整数类定长类型，且须 NOT NULL）。
-bool IsSupportedPrimaryKeyType(DataType t) noexcept;
+RTDB_API bool IsSupportedPrimaryKeyType(DataType t) noexcept;
 
 /// \brief 释放表物理区（建表回滚用；不触碰描述符本身）。
 ///
 /// 依次归还变长池区、主键索引锚点、墓碑位图、版本数组、行数据区。
 /// 仅在表内无存活数据（或表将被整体废弃）时调用。
-void ReleaseRegions(const shm_TableDescriptor* desc, infra::SlabShmAllocator* alloc) noexcept;
+RTDB_API void ReleaseRegions(const shm_TableDescriptor* desc,
+                             infra::SlabShmAllocator* alloc) noexcept;
 
 }  // namespace storage
 }  // namespace rtdb
