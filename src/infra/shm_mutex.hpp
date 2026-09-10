@@ -64,6 +64,44 @@ private:
     bool timeout_no_recover_ = false;  ///< TryLock 置位：禁止死亡恢复
 };
 
+/// \brief 根互斥锁的 RAII 守卫。
+///
+/// 构造时按给定超时加锁，析构时仅在成功持有时解锁；用于引擎内部
+/// 临界区（目录事务、行写入、分配器操作），避免异常/早退路径漏解锁。
+///
+/// \note 锁不可重入：同一作用域内不得嵌套构造同一个 `ShmRootMutex` 的守卫。
+class ShmRootMutexGuard {
+public:
+    /// \brief 构造并加锁。
+    /// \param mutex 目标锁（nullptr 表示无锁可用，如 Reader 角色）
+    /// \param timeout_ms 加锁超时（毫秒；0xFFFFFFFF 表示无限等待）
+    ShmRootMutexGuard(ShmRootMutex* mutex, uint32_t timeout_ms) noexcept
+        : mutex_(mutex), locked_(false), err_(Err::kUnsupported) {
+        if (mutex_ != nullptr) {
+            err_ = mutex_->Lock(timeout_ms);
+            locked_ = IsOk(err_);
+        }
+    }
+
+    ~ShmRootMutexGuard() noexcept {
+        if (locked_) mutex_->Unlock();
+    }
+
+    ShmRootMutexGuard(const ShmRootMutexGuard&) = delete;
+    ShmRootMutexGuard& operator=(const ShmRootMutexGuard&) = delete;
+
+    /// \brief 是否成功持有锁。
+    bool locked() const noexcept { return locked_; }
+
+    /// \brief 加锁结果（未持有时为失败码）。
+    Err error() const noexcept { return err_; }
+
+private:
+    ShmRootMutex* mutex_;
+    bool locked_;
+    Err err_;
+};
+
 }  // namespace infra
 }  // namespace rtdb
 

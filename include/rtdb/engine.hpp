@@ -3,11 +3,16 @@
 
 #include <cstdint>
 #include <memory>
+#include <string_view>
+#include <vector>
 
 #include "rtdb/api_macro.hpp"
+#include "rtdb/column_value.hpp"
 #include "rtdb/err.hpp"
 #include "rtdb/options.hpp"
 #include "rtdb/result.hpp"
+#include "rtdb/table_def.hpp"
+#include "rtdb/table_handle.hpp"
 
 namespace rtdb {
 
@@ -25,11 +30,15 @@ class ShmRootMutex;
 
 /// 实时库引擎门面（facade）。
 ///
-/// M0 阶段职责（当前）：
-///   - 打开/创建文件映像共享内存区，校验 SuperBlock；
-///   - 维护 committed_seq / session_count 等全局状态字。
-/// M1 起追加：CreateTable/OpenTable/CRUD/Batch/Scan/Subscribe —— 见
-/// docs/03 §4.2 的目标签名。
+/// 各阶段职责：
+///   - M0：打开/创建文件映像共享内存区，校验 SuperBlock，维护
+///     committed_seq / session_count 等全局状态字；
+///   - M1-W2（当前）：表目录 —— `CreateTable` / `OpenTable` / `DropTable`，
+///     目录持久化于映像内双 B+ 树；
+///   - M1-W3 起追加：CRUD / 批量 / 扫描（见 docs/03 §4.2 目标签名）。
+///
+/// 线程安全：同一实例可被多线程使用；写操作内部经根互斥锁串行化。
+/// 不同进程通过同一映像文件挂载共享数据（docs/02 §2）。
 class RTDB_API Engine {
 public:
     Engine() noexcept;
@@ -57,6 +66,55 @@ public:
     /// 用作跨进程活性/持久化的最小可见证据。
     int64_t SessionCount() const noexcept;
 
+    // ------------------ 表目录（M1-W2）------------------
+    /// \brief 建立新表。
+    ///
+    /// 校验表名/列定义/上限，分配并填充描述符后挂入目录双 B+ 树；
+    /// 任一步失败完整回滚。
+    ///
+    /// \param def 建表定义（表名非空、至少 1 列）
+    /// \return 表句柄；失败码见 `Err`：
+    ///         `kInvalidArgument` / `kLimitExceeded` / `kTableExists` /
+    ///         `kReadOnlyHandle` / `kUnsupported` / `kOutOfMemory`
+    Result<TableHandle> CreateTable(const TableDef& def);
+
+    /// \brief 按名打开已存在的表。
+    /// \param name 表名
+    /// \return 表句柄；不存在或已删除返回 `kTableNotFound`
+    Result<TableHandle> OpenTable(std::string_view name);
+
+    /// \brief 删除表（置描述符墓碑态并摘除表名索引）。
+    ///
+    /// 物理数据区不随删表释放，待后续 compact 回收；表名可被新表复用。
+    ///
+    /// \param name 表名
+    /// \return kOk；不存在返回 `kTableNotFound`；只读角色返回 `kReadOnlyHandle`
+    Result<void> DropTable(std::string_view name);
+
+    // ------------------ 行 CRUD（M1-W3）------------------
+    /// \brief 插入一行。列 0 为主键（整数类、非空），主键冲突返回
+    /// `kAlreadyExists`；行槽耗尽返回 `kOutOfMemory`。
+    /// \param table 目标表句柄
+    /// \param row 列值序列（长度须等于表列数，顺序与建表列序一致）
+    /// \return 分配到的行槽号
+    Result<uint64_t> Insert(const TableHandle& table, const std::vector<ColumnValue>& row);
+
+    /// \brief 按主键读取整行（免锁乐观读，返回自持有值）。
+    /// \return 列值序列；行不存在或已删除返回 `kNotFound`
+    Result<std::vector<ColumnValue>> GetByKey(const TableHandle& table, const ColumnValue& key);
+
+    /// \brief 按主键整行覆盖更新（主键不可变更；值须置于 row[0]）。
+    /// \return kOk / kNotFound（行不存在）/ kInvalidArgument / kReadOnlyHandle
+    Result<void> UpdateByKey(const TableHandle& table, const ColumnValue& key,
+                             const std::vector<ColumnValue>& row);
+
+    /// \brief 按主键删除行（置墓碑并摘除索引键；行槽待 compact 回收）。
+    /// \return kOk；行不存在返回 `kNotFound`
+    Result<void> DeleteByKey(const TableHandle& table, const ColumnValue& key);
+
+    /// \brief 按主键判定行是否存在。
+    Result<bool> ContainsKey(const TableHandle& table, const ColumnValue& key);
+
     // ------------------ 写侧全局锁与内存管理（M0 直通句柄）------------------
     /// 获取根互斥锁（保护分配器 freelist 与未来目录树的全局变更；
     /// 可恢复持有者崩溃后的残留死锁）。timeout_ms==0 表示纯尝试。
@@ -70,6 +128,11 @@ public:
 
 private:
     struct Impl;
+
+    /// \brief 由描述符字段装配表句柄（内部；仅传递原始字段，不泄漏内部类型）。
+    static TableHandle MakeHandle(int64_t table_id, const char* name, uint32_t layout_version,
+                                  uint32_t col_count, uint32_t row_cap, uint64_t desc_off);
+
     std::unique_ptr<Impl> impl_;
 };
 

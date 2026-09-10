@@ -6,6 +6,7 @@
 #include "platform/platform.hpp"
 #include "infra/slab_allocator.hpp"
 #include "infra/shm_mutex.hpp"
+#include "rtdb/api_macro.hpp"
 #include "rtdb/options.hpp"
 #include "rtdb/result.hpp"
 #include "infra/layout.hpp"
@@ -63,14 +64,14 @@ private:
 
 namespace layout {
 /// 填充 SuperBlock 初始内容（调用前区域已清零）。
-void InitSuperBlock(shm_SuperBlock* sb, uint64_t total_bytes, uint32_t role_flags,
-                    uint32_t fsync_policy, int64_t created_unix_ns);
+RTDB_API void InitSuperBlock(shm_SuperBlock* sb, uint64_t total_bytes, uint32_t role_flags,
+                             uint32_t fsync_policy, int64_t created_unix_ns);
 
 /// 重新计算稳定字段区 CRC 写入 layout_crc。
-void RefreshLayoutCrc(shm_SuperBlock* sb) noexcept;
+RTDB_API void RefreshLayoutCrc(shm_SuperBlock* sb) noexcept;
 
 /// 依序校验，返回首个失败的错误码。
-Err ValidateSuperBlock(const shm_SuperBlock& sb) noexcept;
+RTDB_API Err ValidateSuperBlock(const shm_SuperBlock& sb) noexcept;
 }  // namespace layout
 
 }  // namespace rtdb

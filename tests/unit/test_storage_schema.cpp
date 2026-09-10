@@ -10,9 +10,9 @@
 
 namespace {
 
+using rtdb::ColumnDef;
+using rtdb::DataType;
 using rtdb::storage::AlignOf;
-using rtdb::storage::ColDefHost;
-using rtdb::storage::DataType;
 using rtdb::storage::FixedSizeOf;
 using rtdb::storage::PlanRowLayout;
 using rtdb::storage::RowLayoutPlan;
@@ -56,7 +56,7 @@ TEST(StorageSchema, AlignOfNaturalAlignment) {
 TEST(StorageSchema, PlanRowLayoutMixedColumnOffsets) {
     // i64, f64, utf8var, i32, bool —— 依次自然对齐：
     //   i64@0(8)  f64@8(8)  var@16(8 槽)  i32@24(4)  bool@28(1) → 尾部对齐 32
-    const std::vector<ColDefHost> cols = {
+    const std::vector<ColumnDef> cols = {
         {"a_int64", DataType::kInt64}, {"b_f64", DataType::kFloat64}, {"c_str", DataType::kUtf8Var},
         {"d_i32", DataType::kInt32},   {"e_flag", DataType::kBool},
     };
@@ -75,13 +75,15 @@ TEST(StorageSchema, PlanRowLayoutMixedColumnOffsets) {
 }
 
 TEST(StorageSchema, PlanRowLayoutAllVariableColumns) {
-    const std::vector<ColDefHost> cols = {
+    const std::vector<ColumnDef> cols = {
         {"s1", DataType::kUtf8Var},
         {"b1", DataType::kBytesVar},
     };
     const RowLayoutPlan plan = PlanRowLayout(cols.data(), cols.size(), 7);
     ASSERT_EQ(plan.err, rtdb::Err::kOk);
-    EXPECT_EQ(plan.rec_fixed_len, 16u);  // 两个 8 字节 (off,len) 槽
+    // 两个 8 字节 (off,len) 槽 + 1 字节 null 位图 → 对齐 24
+    EXPECT_EQ(plan.nullmap_offset, 16u);
+    EXPECT_EQ(plan.rec_fixed_len, 24u);
     EXPECT_EQ(plan.var_col_count, 2u);
     EXPECT_EQ(plan.ver_array_bytes, 56u);
     EXPECT_EQ(plan.tombmap_bytes, 1u);  // ceil(7/8)
@@ -89,7 +91,7 @@ TEST(StorageSchema, PlanRowLayoutAllVariableColumns) {
 
 TEST(StorageSchema, PlanRowLayoutLenOverrideWidensColumn) {
     // 定长覆盖：kInt8 + len=16 视作 16 字节二进制定长字段。
-    const std::vector<ColDefHost> cols = {
+    const std::vector<ColumnDef> cols = {
         {"blob16", DataType::kInt8, /*len=*/16},
         {"tail", DataType::kInt32},
     };
@@ -108,12 +110,12 @@ TEST(StorageSchema, PlanRowLayoutRejectsInvalidInput) {
     // 空列序列。
     EXPECT_EQ(PlanRowLayout(nullptr, 3, 10).err, rtdb::Err::kInvalidArgument);
     // len 覆盖小于类型固有宽度。
-    const std::vector<ColDefHost> bad = {{"x", DataType::kInt64, /*len=*/4}};
+    const std::vector<ColumnDef> bad = {{"x", DataType::kInt64, /*len=*/4}};
     EXPECT_EQ(PlanRowLayout(bad.data(), bad.size(), 10).err, rtdb::Err::kInvalidArgument);
 }
 
 TEST(StorageSchema, PlanRowLayoutRowCapBoundaries) {
-    const std::vector<ColDefHost> cols = {{"v", DataType::kInt64}};
+    const std::vector<ColumnDef> cols = {{"v", DataType::kInt64}};
     struct Cap {
         uint32_t cap;
         uint64_t ver;

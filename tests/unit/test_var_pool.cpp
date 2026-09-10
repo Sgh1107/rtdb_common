@@ -89,6 +89,42 @@ TEST_F(VarPoolTest, BestFitSelectsSmallestSufficientHole) {
 }
 
 // ---------------------------------------------------------------------------
+// 小载荷（≤8B）块的最小尺寸与回收复用回归：
+// 曾因允许生成小于最小块的块，导致空闲链节点与尾标记重叠、空闲链被写坏、
+// 产生重叠空闲块并使后续分配互相覆盖（W3 CRUD 暴露）。
+// ---------------------------------------------------------------------------
+TEST_F(VarPoolTest, TinyAllocationsRespectMinimumBlockAndStayIsolated) {
+    // 分配 1B 载荷：块总字节须 ≥ kMinBlockBytes(40)，保证回收后节点与尾标记不重叠。
+    const uint64_t a = AllocMarked(1, 0x11);
+    EXPECT_EQ(pool_->UsedBytes(), 40u);
+    const uint64_t b = AllocMarked(1, 0x22);
+    EXPECT_EQ(pool_->UsedBytes(), 80u);
+    EXPECT_NE(a, b);
+
+    // 反复“分配 + 释放 + 校验”：空闲空间始终保持单一连续块（碎片率为 0），
+    // 且其它块的标记数据不被破坏。
+    for (int round = 0; round < 8; ++round) {
+        uint64_t c = AllocMarked(1, 0x33);
+        uint64_t d = AllocMarked(8, 0x44);
+        EXPECT_EQ(static_cast<uint8_t>(region_->mem[c]), 0x33);
+        EXPECT_EQ(static_cast<uint8_t>(region_->mem[d]), 0x44);
+        ASSERT_EQ(pool_->Deallocate(c), rtdb::Err::kOk) << "round " << round;
+        ASSERT_EQ(pool_->Deallocate(d), rtdb::Err::kOk) << "round " << round;
+        uint64_t blocks = 0;
+        EXPECT_EQ(pool_->ValidateWalk(&blocks), rtdb::Err::kOk) << "round " << round;
+        EXPECT_EQ(pool_->FragmentationRatio(), 0.0) << "round " << round;
+        EXPECT_EQ(pool_->LargestFreeBytes(), pool_->TotalUsableBytes() - pool_->UsedBytes())
+            << "round " << round;
+    }
+
+    // 全量释放后回到整池单一空闲块。
+    ASSERT_EQ(pool_->Deallocate(a), rtdb::Err::kOk);
+    ASSERT_EQ(pool_->Deallocate(b), rtdb::Err::kOk);
+    EXPECT_EQ(pool_->LargestFreeBytes(), pool_->TotalUsableBytes());
+    EXPECT_EQ(pool_->FragmentationRatio(), 0.0);
+}
+
+// ---------------------------------------------------------------------------
 // 分裂：大块切分后尾段回空闲链，顺序分配物理连续
 // ---------------------------------------------------------------------------
 TEST_F(VarPoolTest, SplitCarvesTailBackToFreeList) {

@@ -99,7 +99,10 @@ void MVarLenPool::LinkFree(uint64_t block_off) noexcept {
 
 Result<uint64_t> MVarLenPool::Allocate(uint64_t n) noexcept {
     if (n == 0 || n > ctl_->total_bytes) return Result<uint64_t>::Fail(Err::kInvalidArgument);
-    const uint64_t needed_total = 16 + AlignUp8(n) + 8;
+    // 需求块不得小于最小块：块被回收后其空闲链节点（载荷前 16B）与尾标记
+    // （末 8B）必须互不重叠，否则空闲链会写坏尾标记并产生重叠空闲块。
+    uint64_t needed_total = 16 + AlignUp8(n) + 8;
+    if (needed_total < kMinBlockBytes) needed_total = kMinBlockBytes;
 
     // 最佳适配：全链扫描，取能容纳需求的最小块。
     uint64_t best_off = 0;

@@ -1,39 +1,25 @@
 #ifndef RTDB_SRC_STORAGE_SCHEMA_HPP_
 #define RTDB_SRC_STORAGE_SCHEMA_HPP_
 
-/// \file 表 schema 类型系统与行布局计算（docs/03 §3.1，docs/08 §3-W1）。
+/// \file 表 schema 的共享内存定长结构与行布局计算（docs/03 §3.1，docs/08 §3-W1）。
 ///
 /// 约定：
-///  - 本头文件全部为 shm_ 前缀的标准布局结构（驻留映像）与宿主侧定义类型
-///    的边界，不含任何成员函数/虚函数/裸指针/std 容器；
+///  - 本头文件全部为 shm_ 前缀的标准布局结构（驻留映像）与布局计算纯函数，
+///    不含任何成员函数/虚函数/裸指针/std 容器；
 ///  - 映像内结构体靠 pointer_width 校验与同机字长保障可读性，不做字节序
 ///    序列化（WAL 记录才做逐字段小端编码，见 docs/08 §2-D3）；
-///  - 布局计算函数全部为 constexpr/纯函数，单测可直接覆盖。
+///  - 宿主侧类型（`rtdb::DataType` / `ColumnDef` / `TableDef`）定义在公共头
+///    `rtdb/table_def.hpp`，本文件仅引用。
 
 #include <cstddef>
 #include <cstdint>
-#include <string>
 #include <type_traits>
-#include <vector>
 
 #include "rtdb/err.hpp"
+#include "rtdb/table_def.hpp"
 
 namespace rtdb {
 namespace storage {
-
-/// 列数据类型。编码值随 schema 持久化，**只增不改**（新增追加到尾部）。
-enum class DataType : uint8_t {
-    kInt8 = 1,
-    kInt16 = 2,
-    kInt32 = 3,
-    kInt64 = 4,
-    kFloat32 = 5,
-    kFloat64 = 6,  ///< 索引键经可排序序数变换（docs/03 §2.2）
-    kBool = 7,
-    kUtf8Var = 8,    ///< 变长字符串：记录内存 (pool_off, len)
-    kBytesVar = 9,   ///< 变长二进制：同上
-    kUnixTsNs = 10,  ///< 语义为 Unix 纳秒时间戳的定长 i64
-};
 
 /// 定长类型的字节宽度；变长类型返回 0（内容在变长池）。
 constexpr uint32_t FixedSizeOf(DataType t) noexcept {
@@ -90,6 +76,16 @@ inline constexpr uint32_t kMaxColNameBytes = 32;                    ///< 含结�
 inline constexpr uint32_t kMaxInitCols = 16;                        ///< 描述符内联列数上限
 inline constexpr uint32_t kMaxIndexesPerTable = 16;                 ///< 每表索引上限
 inline constexpr uint64_t kTableDescMagic = 0x5254444254424C31ULL;  ///< "RTDBTBL1"
+/// 建表未指定 row_cap 时的默认行槽容量。
+inline constexpr uint32_t kDefaultRowCap = 1024;
+/// 行槽容量上限（M1）：版本数组 = row_cap × 8B 须容身单次 slab 分配（≤64KB）。
+inline constexpr uint32_t kMaxRowCap = 8192;
+/// 单行定长记录字节上限（M1）：行数据区以单块 slab 承载（≤64KB）。
+inline constexpr uint32_t kMaxRowFixedBytes = 32 * 1024;
+/// 行数据区单块上限（M1；超限表需缩小 row_cap，段目录化列 M2）。
+inline constexpr uint64_t kMaxRowDataBytes = 64 * 1024;
+/// 变长池分区缺省容量（每表一块，承载该表全部 string/blob 内容）。
+inline constexpr uint32_t kVarPoolRegionBytes = 64 * 1024;
 
 /// 描述符状态字（DropTable = 墓碑态，物理数据待 compact 回收）。
 enum class TableState : uint32_t { kActive = 0, kTombstone = 1 };
@@ -137,8 +133,9 @@ struct shm_TableDescriptor {
     uint32_t data_layout_ver;      ///< 行布局版本（在线加列递增，旧句柄据此读）
     // ---- 字符段 ----
     char name[kMaxTableNameBytes];  ///< 表名（含结尾 0，UTF-8）
-    char table_rwlock[64];          ///< 表级读写锁状态位（M1-W2 接管，先占位清零）
-    char reserved[160];
+    char table_rwlock[64];          ///< 表级读写锁状态位（M1-W3 起使用，先占位清零）
+    uint64_t var_pool_bytes;        ///< 变长池分区容量（0 = 本表无变长列）
+    uint64_t reserved[19];          ///< 预留
     // ---- 内联列定义 ----
     shm_ColDef cols[kMaxInitCols];
 };
@@ -146,30 +143,13 @@ static_assert(sizeof(shm_TableDescriptor) == 1280, "shm_TableDescriptor 必须�
 static_assert(std::is_standard_layout<shm_TableDescriptor>::value,
               "shm_TableDescriptor 必须是标准布局");
 
-// ==================== 宿主侧定义类型（可含 std 类型）====================
-
-/// 建表时的列定义（宿主侧，Open/CreateTable 入参）。
-struct ColDefHost {
-    std::string name;
-    DataType type;
-    uint32_t len = 0;  ///< 定长列的字节数覆盖（0 = 按 FixedSizeOf）；变长列恒 0
-    bool nullable = true;
-    bool has_default = false;
-};
-
-/// 建表定义（docs/03 §4.2 TableDef 的 M1 子集）。
-struct TableDefHost {
-    std::string name;
-    uint32_t row_cap = 0;  ///< 0 = 取引擎默认（按映像剩余容量在 W3 定）
-    std::vector<ColDefHost> cols;
-};
-
 // ==================== 行布局计算（纯函数，W1 单测对象）====================
 
 /// 单表物理布局的一次性计算结果。
 struct RowLayoutPlan {
     Err err = Err::kOk;            ///< 非 kOk 时其余字段无意义
-    uint32_t rec_fixed_len = 0;    ///< 定长记录字节数（含尾部对齐填充至 8）
+    uint32_t rec_fixed_len = 0;    ///< 定长记录字节数（含 null 位图与尾部对齐）
+    uint32_t nullmap_offset = 0;   ///< null 位图在记录内的偏移（每列 1 bit）
     uint32_t var_col_count = 0;    ///< 变长列数
     uint64_t ver_array_bytes = 0;  ///< 行版本数组字节数
     uint64_t tombmap_bytes = 0;    ///< 墓碑位图字节数
@@ -177,12 +157,20 @@ struct RowLayoutPlan {
 
 constexpr uint64_t AlignUp8(uint64_t v) noexcept { return (v + 7) / 8 * 8; }
 
-/// 依据列定义序列计算记录区/版本数组/墓碑位图尺寸。
-/// 列偏移按声明顺序做自然对齐排布（与 AlignOf 一致）；变长列在记录内
-/// 固定占用 8 字节 (u32 off + u32 len) 槽。
-/// \param out_offsets 可选输出：逐列的记录内偏移（容量 ≥ col_count）。
-RowLayoutPlan PlanRowLayout(const ColDefHost* cols, size_t col_count, uint32_t row_cap,
-                            uint32_t* out_offsets = nullptr) noexcept {
+/// \brief 计算记录区/版本数组/墓碑位图尺寸与逐列偏移。
+///
+/// 记录布局：`[列0][列1]...[列N-1][null 位图]`，列按声明顺序自然对齐
+/// （与 `AlignOf` 一致），变长列在记录内固定占用 8 字节 `(u32 off, u32 len)`
+/// 槽，null 位图紧随其后（`(col_count+7)/8` 字节，位 i 对应列 i），
+/// 整体对齐至 8 字节。
+///
+/// \param cols 列定义序列（非空）
+/// \param col_count 列数
+/// \param row_cap 行槽容量
+/// \param out_offsets 可选输出，逐列记录内偏移（容量 ≥ col_count）
+/// \return 布局计划；`err != kOk` 时其余字段无意义
+inline RowLayoutPlan PlanRowLayout(const ColumnDef* cols, size_t col_count, uint32_t row_cap,
+                                   uint32_t* out_offsets = nullptr) noexcept {
     RowLayoutPlan plan;
     if (cols == nullptr || col_count == 0) {
         plan.err = Err::kInvalidArgument;
@@ -202,6 +190,8 @@ RowLayoutPlan PlanRowLayout(const ColDefHost* cols, size_t col_count, uint32_t r
         off += (fixed > 0) ? (cols[i].len != 0 ? cols[i].len : fixed) : 8;
         if (fixed == 0) plan.var_col_count++;
     }
+    plan.nullmap_offset = off;
+    off += static_cast<uint32_t>((col_count + 7) / 8);  // null 位图
     plan.rec_fixed_len = static_cast<uint32_t>(AlignUp8(off));
     plan.ver_array_bytes = static_cast<uint64_t>(row_cap) * 8;
     plan.tombmap_bytes = (static_cast<uint64_t>(row_cap) + 7) / 8;
