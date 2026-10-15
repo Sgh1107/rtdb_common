@@ -47,6 +47,13 @@ public:
     /// \brief 建表时的列数（不含后续扩展列）。
     uint32_t column_count() const noexcept { return column_count_; }
 
+    /// \brief 句柄绑定时刻的扩展列数（在线加列追加；旧句柄保持旧值，
+    /// 因而看不到其后新增的列，docs/02 §3 要点 3）。
+    uint32_t ext_column_count() const noexcept { return ext_column_count_; }
+
+    /// \brief 句柄可见的总列数（内联列 + 绑定时刻的扩展列）。
+    uint32_t visible_column_count() const noexcept { return column_count_ + ext_column_count_; }
+
     /// \brief 建表时定格的行槽容量。
     uint32_t row_cap() const noexcept { return row_cap_; }
 
@@ -56,11 +63,12 @@ private:
     /// \brief 内部构造（仅引擎使用）。
     /// \param desc_off 描述符在映像内的偏移（不透明内部令牌）。
     TableHandle(int64_t table_id, std::string name, uint32_t layout_version, uint32_t col_count,
-                uint32_t row_cap, uint64_t desc_off) noexcept
+                uint32_t ext_col_count, uint32_t row_cap, uint64_t desc_off) noexcept
         : table_id_(table_id),
           name_(std::move(name)),
           layout_version_(layout_version),
           column_count_(col_count),
+          ext_column_count_(ext_col_count),
           row_cap_(row_cap),
           desc_off_(desc_off) {}
 
@@ -71,6 +79,7 @@ private:
     std::string name_;
     uint32_t layout_version_ = 0;
     uint32_t column_count_ = 0;
+    uint32_t ext_column_count_ = 0;
     uint32_t row_cap_ = 0;
     uint64_t desc_off_ = 0;
 };

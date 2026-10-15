@@ -13,3 +13,8 @@ ci_*.txt
 *.rtdb
 windows-latest/
 ubuntu-latest/
+build_wal/
+build_cov/
+build_cov2/
+build_gcc/
+.workbuddy/

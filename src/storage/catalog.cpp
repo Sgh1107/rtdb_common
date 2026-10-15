@@ -290,6 +290,24 @@ Result<uint64_t> Catalog::OpenTable(std::string_view name) const noexcept {
     return desc_res;
 }
 
+Err Catalog::ForEachTable(
+    const std::function<void(uint64_t, const shm_TableDescriptor*)>& fn) const noexcept {
+    if (root_ == nullptr) return Err::kUnsupported;
+    if (!fn) return Err::kInvalidArgument;
+
+    char lo[8];
+    char hi[8];
+    infra::EncodeOrderedInt64(std::numeric_limits<int64_t>::min(), lo);
+    infra::EncodeOrderedInt64(std::numeric_limits<int64_t>::max(), hi);
+    for (auto cur = id_tree_->SeekRange(lo, true, hi, true); cur.Valid(); cur.Next()) {
+        const uint64_t desc_off = cur.Value();
+        const shm_TableDescriptor* desc = Descriptor(desc_off);
+        if (desc == nullptr || desc->magic != kTableDescMagic) return Err::kCorruption;
+        fn(desc_off, desc);
+    }
+    return Err::kOk;
+}
+
 Err Catalog::Validate(uint64_t* out_active_tables) const noexcept {
     if (out_active_tables != nullptr) *out_active_tables = 0;
     if (root_ == nullptr) return Err::kOk;  // 未布局目录视为空目录

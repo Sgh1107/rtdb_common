@@ -14,10 +14,16 @@
 
 namespace rtdb_test {
 
-SpawnOutcome SpawnSelfWithFlag(const std::string& exe, const std::string& extra_arg) {
+void SetEnvVar(const char* name, const char* value) { ::_putenv_s(name, value); }
+void UnsetEnvVar(const char* name) { ::_putenv_s(name, ""); }
+
+namespace {
+
+/// 以 [exe, args...] 组装 CreateProcessA 命令行（exe 与各参数均加引号）。
+SpawnOutcome SpawnImpl(const std::string& exe, const std::vector<std::string>& args) {
     SpawnOutcome out;
-    // CreateProcessA 第二参要求可变缓冲。
-    std::string s = "\"" + exe + "\" \"" + kCrashLockFlag + "\" \"" + extra_arg + "\"";
+    std::string s = "\"" + exe + "\"";
+    for (const std::string& a : args) s += " \"" + a + "\"";
     std::vector<char> cmdline(s.begin(), s.end());
     cmdline.push_back('\0');
     STARTUPINFOA si{};
@@ -36,6 +42,16 @@ SpawnOutcome SpawnSelfWithFlag(const std::string& exe, const std::string& extra_
     return out;
 }
 
+}  // namespace
+
+SpawnOutcome SpawnSelfWithFlag(const std::string& exe, const std::string& extra_arg) {
+    return SpawnImpl(exe, {kCrashLockFlag, extra_arg});
+}
+
+SpawnOutcome SpawnSelf(const std::string& exe, const std::vector<std::string>& args) {
+    return SpawnImpl(exe, args);
+}
+
 }  // namespace rtdb_test
 
 #else
@@ -48,13 +64,21 @@ SpawnOutcome SpawnSelfWithFlag(const std::string& exe, const std::string& extra_
 
 namespace rtdb_test {
 
-SpawnOutcome SpawnSelfWithFlag(const std::string& exe, const std::string& extra_arg) {
+void SetEnvVar(const char* name, const char* value) { ::setenv(name, value, 1); }
+void UnsetEnvVar(const char* name) { ::unsetenv(name); }
+
+namespace {
+
+SpawnOutcome SpawnImpl(const std::string& exe, const std::vector<std::string>& args) {
     SpawnOutcome out;
     const pid_t pid = ::fork();
     if (pid < 0) return out;
     if (pid == 0) {
-        ::execl(exe.c_str(), exe.c_str(), kCrashLockFlag, extra_arg.c_str(),
-                static_cast<char*>(nullptr));
+        std::vector<char*> argv;
+        argv.push_back(const_cast<char*>(exe.c_str()));
+        for (const std::string& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+        ::execv(exe.c_str(), argv.data());
         ::_exit(127);  // exec 失败
     }
     int status = 0;
@@ -62,6 +86,16 @@ SpawnOutcome SpawnSelfWithFlag(const std::string& exe, const std::string& extra_
     out.spawned = true;
     out.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     return out;
+}
+
+}  // namespace
+
+SpawnOutcome SpawnSelfWithFlag(const std::string& exe, const std::string& extra_arg) {
+    return SpawnImpl(exe, {std::string(kCrashLockFlag), extra_arg});
+}
+
+SpawnOutcome SpawnSelf(const std::string& exe, const std::vector<std::string>& args) {
+    return SpawnImpl(exe, args);
 }
 
 }  // namespace rtdb_test

@@ -18,12 +18,15 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_library(rtdbcore SHARED
   src/engine.cpp
   src/infra/err.cpp
+  src/infra/failpoint.cpp
   src/infra/shm_region.cpp
   src/infra/slab_allocator.cpp
   src/infra/shm_mutex.cpp
   src/storage/catalog.cpp
   src/storage/table_store.cpp
   src/storage/var_pool.cpp
+  src/storage/wal_ring.cpp
+  src/storage/group_commit.cpp
 )
 if(WIN32)
   target_sources(rtdbcore PRIVATE
@@ -92,6 +95,7 @@ if(RTDB_BUILD_TESTS)
     tests/unit/test_var_pool.cpp
     tests/unit/test_catalog.cpp
     tests/unit/test_table_store.cpp
+    tests/unit/test_wal.cpp
   )
   target_link_libraries(rtdb_unit_tests PRIVATE rtdbcore GTest::gtest_main)
   target_include_directories(rtdb_unit_tests

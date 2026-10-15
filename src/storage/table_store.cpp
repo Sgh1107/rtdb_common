@@ -3,6 +3,9 @@
 #include <cstring>
 #include <utility>
 
+#include "infra/failpoint.hpp"
+#include "storage/alter.hpp"
+
 namespace rtdb {
 namespace storage {
 
@@ -39,6 +42,51 @@ int64_t LoadInteger(const uint8_t* src, uint32_t width) noexcept {
     const uint32_t bits = width * 8;
     if (bits < 64 && (v & (1LL << (bits - 1))) != 0) v |= ~((1LL << bits) - 1);
     return v;
+}
+
+/// 标量按类型+宽度写入（内联定长列与 ext 槽共用同一规则）。
+void StoreScalar(uint8_t* dst, uint32_t width, DataType t, const ColumnValue& v) noexcept {
+    if (t == DataType::kFloat32) {
+        const float f = static_cast<float>(v.as_real());
+        std::memcpy(dst, &f, 4);
+    } else if (t == DataType::kFloat64) {
+        const double d = v.as_real();
+        std::memcpy(dst, &d, 8);
+    } else {
+        StoreInteger(dst, width, v.as_int());
+    }
+}
+
+/// 标量按类型+宽度读出（ext 槽/default 共用）。
+ColumnValue LoadScalar(const uint8_t* src, uint32_t width, DataType t) noexcept {
+    if (t == DataType::kFloat32) {
+        float f = 0;
+        std::memcpy(&f, src, 4);
+        return ColumnValue::Real(static_cast<double>(f));
+    }
+    if (t == DataType::kFloat64) {
+        double d = 0;
+        std::memcpy(&d, src, 8);
+        return ColumnValue::Real(d);
+    }
+    if (t == DataType::kBool) return ColumnValue::Bool(LoadInteger(src, width) != 0);
+    return ColumnValue::IntOf(t, LoadInteger(src, width));
+}
+
+/// ext 后缀每列的状态字节（槽值之前 1 字节）。
+constexpr uint8_t kExtStatusValue = 1;  ///< 显式非空值
+constexpr uint8_t kExtStatusNull = 2;   ///< 显式 NULL
+
+/// 位图测试/设置（行号 → bit）。
+bool BitTest(const uint8_t* bits, uint64_t row_no) noexcept {
+    return ((bits[row_no / 8] >> (row_no % 8)) & 0x1u) != 0;
+}
+void BitSet(uint8_t* bits, uint64_t row_no, bool v) noexcept {
+    if (v) {
+        bits[row_no / 8] = static_cast<uint8_t>(bits[row_no / 8] | (1u << (row_no % 8)));
+    } else {
+        bits[row_no / 8] = static_cast<uint8_t>(bits[row_no / 8] & ~(1u << (row_no % 8)));
+    }
 }
 
 }  // namespace
@@ -204,6 +252,20 @@ Result<std::unique_ptr<TableStore>> TableStore::Attach(void* base, infra::SlabSh
     auto* slot = reinterpret_cast<PrimaryIndexTree::Slot*>(static_cast<char*>(base) +
                                                            store->index_slot_off_);
     store->index_.reset(new PrimaryIndexTree(base, alloc, slot));
+
+    // 二级索引链（W5-d）：按创建序遍历元数据并逐个附着树实例
+    // （只读角色无分配器，仅做非零校验；树可按槽只读使用）。
+    std::vector<shm_SecIdxMeta*> sec_metas;
+    const Err sec_walk = WalkSecondaryIndexes(base, desc, &sec_metas);
+    if (!IsOk(sec_walk)) return Result<std::unique_ptr<TableStore>>::Fail(sec_walk);
+    for (shm_SecIdxMeta* m : sec_metas) {
+        if (alloc != nullptr && !alloc->OwnsOffset(m->tree_slot_off))
+            return Result<std::unique_ptr<TableStore>>::Fail(Err::kCorruption);
+        auto* sec_slot = reinterpret_cast<SecIndexTree::Slot*>(static_cast<char*>(base) +
+                                                               m->tree_slot_off);
+        store->sec_meta_.push_back(m);
+        store->sec_trees_.emplace_back(new SecIndexTree(base, alloc, sec_slot));
+    }
     return Result<std::unique_ptr<TableStore>>::Ok(std::move(store));
 }
 
@@ -300,6 +362,32 @@ Err TableStore::BuildRecord(const std::vector<ColumnValue>& row, std::vector<uin
             StoreInteger(buf + c.offset, c.len, row[i].as_int());
         }
     }
+
+    // 扩展列后缀（W5-b）：按添加序为调用方可见的每个扩展列追加
+    // [status:1][slot_bytes 值]。句柄可见数 < 当前扩展数时，其后新增的
+    // 列不出现于后缀——应用期不写其槽，读取走惰性默认值。
+    if (row.size() > desc_->col_count) {
+        std::vector<shm_ExtColRegion*> regions;
+        const Err werr = WalkExtColumns(base_, desc_, &regions);
+        if (!IsOk(werr)) return werr;
+        const size_t provided = row.size() - desc_->col_count;
+        if (provided > regions.size()) return Err::kInvalidArgument;  // 行宽超过当前 schema
+        for (size_t j = 0; j < provided; ++j) {
+            const shm_ExtColRegion* r = regions[j];
+            const DataType et = static_cast<DataType>(r->type);
+            const ColumnValue& v = row[desc_->col_count + j];
+            if (v.is_null()) {
+                if (r->nullable == 0) return Err::kInvalidArgument;  // NOT NULL 扩展列
+                rec->push_back(kExtStatusNull);
+                rec->resize(rec->size() + r->slot_bytes, 0);
+                continue;
+            }
+            rec->push_back(kExtStatusValue);
+            const size_t at = rec->size();
+            rec->resize(at + r->slot_bytes, 0);
+            StoreScalar(rec->data() + at, r->slot_bytes, et, v);
+        }
+    }
     return Err::kOk;
 }
 
@@ -313,6 +401,52 @@ void TableStore::ReleaseRecordVars(const uint8_t* rec) const noexcept {
         uint32_t off = 0;
         std::memcpy(&off, rec + c.offset, 4);
         if (off != 0) var_pool_->Deallocate(off);
+    }
+}
+
+// ------------------ 扩展列（W5-b）------------------
+
+Err TableStore::ApplyExtSuffix(const uint8_t* suffix, size_t suffix_len,
+                               uint64_t row_no) noexcept {
+    if (suffix_len == 0) return Err::kOk;
+    if (suffix == nullptr) return Err::kInvalidArgument;
+    if (row_no >= desc_->row_cap) return Err::kCorruption;
+
+    std::vector<shm_ExtColRegion*> regions;
+    const Err werr = WalkExtColumns(base_, desc_, &regions);
+    if (!IsOk(werr)) return werr;
+
+    size_t pos = 0;
+    for (size_t j = 0; j < regions.size() && pos < suffix_len; ++j) {
+        shm_ExtColRegion* r = regions[j];
+        const size_t need = 1 + r->slot_bytes;
+        if (pos + need > suffix_len) return Err::kCorruption;  // 后缀撕裂
+        const uint8_t status = suffix[pos];
+        uint8_t* slot = ExtColSlots(r) + row_no * r->slot_bytes;
+        if (status == kExtStatusValue) {
+            std::memcpy(slot, suffix + pos + 1, r->slot_bytes);
+            BitSet(ExtColSetBits(r), row_no, true);
+            BitSet(ExtColNullBits(r), row_no, false);
+        } else if (status == kExtStatusNull) {
+            std::memset(slot, 0, r->slot_bytes);
+            BitSet(ExtColSetBits(r), row_no, true);
+            BitSet(ExtColNullBits(r), row_no, true);
+        } else {
+            return Err::kCorruption;  // 未知状态字节
+        }
+        pos += need;
+    }
+    return Err::kOk;
+}
+
+void TableStore::ClearExtBits(uint64_t row_no) const noexcept {
+    if (row_no >= desc_->row_cap) return;
+    std::vector<shm_ExtColRegion*> regions;
+    if (!IsOk(WalkExtColumns(base_, desc_, &regions))) return;  // 链已损坏：无从清理
+    for (shm_ExtColRegion* r : regions) {
+        BitSet(ExtColSetBits(r), row_no, false);
+        BitSet(ExtColNullBits(r), row_no, false);
+        std::memset(ExtColSlots(r) + row_no * r->slot_bytes, 0, r->slot_bytes);
     }
 }
 
@@ -359,40 +493,631 @@ std::vector<ColumnValue> TableStore::DecodeRecord(const uint8_t* rec) const noex
     return out;
 }
 
-Err TableStore::Insert(const std::vector<ColumnValue>& row, uint64_t* out_row_no) noexcept {
+// ------------------ WAL 先行协议：暂存（docs/08 §2-D2）------------------
+
+Err TableStore::StageInsert(const std::vector<ColumnValue>& row, StagedRowOp* out) noexcept {
     if (alloc_ == nullptr) return Err::kReadOnlyHandle;
-    if (row.size() != desc_->col_count) return Err::kInvalidArgument;
-    char key[8];
-    if (!EncodeKey(row[0], key)) return Err::kInvalidArgument;
+    if (out == nullptr) return Err::kInvalidArgument;
+    // 行宽须落在 [内联列数, 内联+当前扩展数]：旧句柄可见列数少于当前
+    // schema 时按前缀写入，其后扩展列走惰性默认值（W5-b）。
+    if (row.size() < desc_->col_count ||
+        row.size() > static_cast<size_t>(desc_->col_count) + desc_->ext_col_count)
+        return Err::kInvalidArgument;
+    if (!EncodeKey(row[0], out->key)) return Err::kInvalidArgument;
     uint64_t existing = 0;
-    if (index_->Find(key, &existing)) return Err::kAlreadyExists;
+    if (index_->Find(out->key, &existing)) return Err::kAlreadyExists;
+
+    // 唯一二级索引冲突预检（W5-d，暂存阶段零副作用；批内两行同值互不
+    // 可见——"批内操作互不依赖"的既定边界，docs/08 §2-D3）。
+    const Err uerr = CheckSecUnique(row, 0, false);
+    if (!IsOk(uerr)) return uerr;
 
     const uint64_t row_no = desc_->row_count;
     if (row_no >= desc_->row_cap) return Err::kOutOfMemory;  // M1：行槽不复用
 
-    std::vector<uint8_t> rec;
-    std::vector<uint64_t> vars;
-    const Err build = BuildRecord(row, &rec, &vars);
-    if (!IsOk(build)) return build;
-
-    // 写入协议：置奇数版本 → 写记录 → 置偶数版本 → 发布索引键。
-    uint64_t* ver = VersionSlot(row_no);
-    *ver = 1;
-    std::memcpy(RowPtr(row_no), rec.data(), desc_->rec_fixed_len);
-    SetTombstone(row_no, false);
-    *ver = 2;
-
-    const Err ins = index_->Insert(key, row_no);
-    if (!IsOk(ins)) {
-        for (uint64_t v : vars) var_pool_->Deallocate(v);
-        std::memset(RowPtr(row_no), 0, desc_->rec_fixed_len);
-        *ver = 0;
-        return ins;
+    out->kind = StagedRowOp::Kind::kInsert;
+    out->row_no = row_no;
+    out->row_ver = 2;  // 首次发布：0 → 1(写入中) → 2(稳定)
+    out->old_rec.clear();
+    out->allocated_vars.clear();
+    const Err build = BuildRecord(row, &out->rec, &out->allocated_vars);
+    if (!IsOk(build)) {
+        out->rec.clear();
+        out->allocated_vars.clear();
+        return build;
     }
-    desc_->row_count++;
-    desc_->committed_row_count++;
-    if (out_row_no != nullptr) *out_row_no = row_no;
+    desc_->row_count++;  // 行槽保留（应用失败由 ReleaseStaged 回退）
     return Err::kOk;
+}
+
+Err TableStore::StageUpdate(const ColumnValue& key, const std::vector<ColumnValue>& row,
+                            StagedRowOp* out) noexcept {
+    if (alloc_ == nullptr) return Err::kReadOnlyHandle;
+    if (out == nullptr) return Err::kInvalidArgument;
+    if (row.size() < desc_->col_count ||
+        row.size() > static_cast<size_t>(desc_->col_count) + desc_->ext_col_count)
+        return Err::kInvalidArgument;
+    char k[8];
+    if (!EncodeKey(key, k) || !EncodeKey(row[0], out->key)) return Err::kInvalidArgument;
+    if (std::memcmp(k, out->key, 8) != 0) return Err::kInvalidArgument;  // 主键不可变更
+
+    uint64_t row_no = 0;
+    if (!index_->Find(k, &row_no)) return Err::kNotFound;
+    if (row_no >= desc_->row_cap) return Err::kCorruption;
+    if (IsTombstoned(row_no)) return Err::kNotFound;
+
+    // 唯一二级索引冲突预检（W5-d）：排除本行当前条目（值未变时放行）。
+    const Err uerr = CheckSecUnique(row, row_no, true);
+    if (!IsOk(uerr)) return uerr;
+
+    out->kind = StagedRowOp::Kind::kUpdate;
+    out->row_no = row_no;
+    out->row_ver = *VersionSlot(row_no) + 2;
+    out->allocated_vars.clear();
+    const Err build = BuildRecord(row, &out->rec, &out->allocated_vars);
+    if (!IsOk(build)) {
+        out->rec.clear();
+        out->allocated_vars.clear();
+        return build;
+    }
+    // 旧记录副本：应用发布新版本后回收其变长块（读者按版本复核丢弃半更新数据）。
+    out->old_rec.assign(RowPtr(row_no), RowPtr(row_no) + desc_->rec_fixed_len);
+    return Err::kOk;
+}
+
+Err TableStore::StageRemove(const ColumnValue& key, StagedRowOp* out) noexcept {
+    if (alloc_ == nullptr) return Err::kReadOnlyHandle;
+    if (out == nullptr) return Err::kInvalidArgument;
+    if (!EncodeKey(key, out->key)) return Err::kInvalidArgument;
+    uint64_t row_no = 0;
+    if (!index_->Find(out->key, &row_no)) return Err::kNotFound;
+    if (row_no >= desc_->row_cap) return Err::kCorruption;
+    if (IsTombstoned(row_no)) return Err::kNotFound;
+
+    out->kind = StagedRowOp::Kind::kDelete;
+    out->row_no = row_no;
+    out->row_ver = *VersionSlot(row_no) + 2;
+    out->rec.clear();
+    out->allocated_vars.clear();
+    out->old_rec.assign(RowPtr(row_no), RowPtr(row_no) + desc_->rec_fixed_len);
+    return Err::kOk;
+}
+
+// ------------------ WAL 先行协议：应用 ------------------
+
+Err TableStore::ApplyStaged(StagedRowOp* st) noexcept {
+    if (st == nullptr) return Err::kInvalidArgument;
+    uint64_t* ver = VersionSlot(st->row_no);
+
+    switch (st->kind) {
+        case StagedRowOp::Kind::kInsert: {
+            // 写入协议：置奇数版本 → 写记录 → 写扩展列槽 → 置偶数版本 →
+            // 发布索引键（ext 先于版本翻转，崩溃恢复不出现半 ext 状态）。
+            *ver = 1;
+            std::memcpy(RowPtr(st->row_no), st->rec.data(), desc_->rec_fixed_len);
+            if (st->rec.size() > desc_->rec_fixed_len) {
+                const Err ee = ApplyExtSuffix(st->rec.data() + desc_->rec_fixed_len,
+                                              st->rec.size() - desc_->rec_fixed_len, st->row_no);
+                if (!IsOk(ee)) {
+                    ClearExtBits(st->row_no);
+                    std::memset(RowPtr(st->row_no), 0, desc_->rec_fixed_len);
+                    *ver = 0;
+                    return ee;
+                }
+            }
+            SetTombstone(st->row_no, false);
+            *ver = st->row_ver;
+            // 注入点：行数据已发布、主键索引未发布（docs/06 §3 "索引更新一半"）。
+            failpoint::CrashPoint("wal.apply.mid");
+            if (failpoint::ErrorPoint("wal.index.insert")) {
+                // 模拟索引分配失败：数据页回滚；变长块/行槽留给 ReleaseStaged。
+                ClearExtBits(st->row_no);
+                std::memset(RowPtr(st->row_no), 0, desc_->rec_fixed_len);
+                *ver = 0;
+                return Err::kOutOfMemory;
+            }
+            const Err ins = index_->Insert(st->key, st->row_no);
+            if (!IsOk(ins)) {
+                ClearExtBits(st->row_no);
+                std::memset(RowPtr(st->row_no), 0, desc_->rec_fixed_len);
+                *ver = 0;
+                return ins;
+            }
+            // 二级索引维护（W5-d）：主键发布后按整行当前状态建键；键含
+            // row_no，同值多行自然并存（非唯一索引的自然形态）。失败上抛
+            // 由调用方毒化——WAL 已先行，Open 重建自愈。
+            if (HaveSecIdx()) {
+                std::vector<SecEntry> keys;
+                const Err ke = SecKeysOfRow(st->row_no, &keys);
+                if (!IsOk(ke)) return ke;
+                const Err ie = InsertSecKeys(keys);
+                if (!IsOk(ie)) return ie;
+            }
+            desc_->committed_row_count++;
+            st->allocated_vars.clear();  // 变长块所有权转移至行数据
+            return Err::kOk;
+        }
+        case StagedRowOp::Kind::kUpdate: {
+            // 旧二级索引键（W5-d）：写入前取当前行状态（ext 列同取）。
+            std::vector<SecEntry> old_keys;
+            if (HaveSecIdx()) {
+                const Err ke = SecKeysOfRow(st->row_no, &old_keys);
+                if (!IsOk(ke)) return ke;
+            }
+            *ver = st->row_ver - 1;  // 奇数：写入中
+            std::memcpy(RowPtr(st->row_no), st->rec.data(), desc_->rec_fixed_len);
+            if (st->rec.size() > desc_->rec_fixed_len) {
+                const Err ee = ApplyExtSuffix(st->rec.data() + desc_->rec_fixed_len,
+                                              st->rec.size() - desc_->rec_fixed_len, st->row_no);
+                if (!IsOk(ee)) return ee;  // 版本仍为奇数：读者重试；调用方毒化
+            }
+            *ver = st->row_ver;  // 偶数：稳定
+            if (HaveSecIdx()) {
+                // 新键按写入后的当前行状态取（旧句柄窄行写入时未提供的
+                // ext 列保留旧值，天然正确）；先摘旧键再插新键——并发
+                // 读者至多短暂缺席（近似视图），不会重复命中旧值+新值。
+                std::vector<SecEntry> new_keys;
+                const Err ke = SecKeysOfRow(st->row_no, &new_keys);
+                if (!IsOk(ke)) return ke;
+                RemoveSecKeys(old_keys);
+                const Err ie = InsertSecKeys(new_keys);
+                if (!IsOk(ie)) return ie;  // 调用方毒化；Open 重建自愈
+            }
+            ReleaseRecordVars(st->old_rec.data());
+            return Err::kOk;
+        }
+        case StagedRowOp::Kind::kDelete: {
+            // 旧二级索引键（W5-d）：删除前取当前行状态（ext 列同取）。
+            std::vector<SecEntry> old_keys;
+            if (HaveSecIdx()) {
+                const Err ke = SecKeysOfRow(st->row_no, &old_keys);
+                if (!IsOk(ke)) return ke;
+            }
+            *ver = st->row_ver - 1;
+            SetTombstone(st->row_no, true);
+            *ver = st->row_ver;
+            const Err err = index_->Remove(st->key);
+            if (!IsOk(err)) return err;  // 调用方毒化引擎（WAL 已先行）
+            // 摘除二级索引键：读者按行号读行，墓碑即缺席（先于/后于主键
+            // 删除均可，不影响查询正确性）。
+            RemoveSecKeys(old_keys);
+            if (desc_->committed_row_count > 0) desc_->committed_row_count--;
+            ReleaseRecordVars(st->old_rec.data());
+            return Err::kOk;
+        }
+        default:
+            return Err::kInternal;
+    }
+}
+
+void TableStore::ReleaseStaged(StagedRowOp* st) noexcept {
+    if (st == nullptr) return;
+    for (uint64_t off : st->allocated_vars) {
+        if (var_pool_ != nullptr) var_pool_->Deallocate(off);
+    }
+    st->allocated_vars.clear();
+    // insert 行槽保留回退：仅当该暂存是最后一次保留（LIFO）时严格成立；
+    // 否则槽位作为"保留未用"遗留（不可达、无害），随 M2 compact 收敛。
+    if (st->kind == StagedRowOp::Kind::kInsert && desc_->row_count > 0 &&
+        st->row_no + 1 == desc_->row_count) {
+        desc_->row_count--;
+    }
+    st->rec.clear();
+    st->old_rec.clear();
+}
+
+// ------------------ 恢复重放（docs/08 §3-W4）------------------
+
+Err TableStore::ReplayUpsert(uint64_t row_no, uint64_t row_ver, const uint8_t* rec,
+                             uint32_t rec_len) noexcept {
+    if (alloc_ == nullptr) return Err::kCorruption;  // 只读角色不参与重放
+    if (rec == nullptr || rec_len < desc_->rec_fixed_len) return Err::kCorruption;
+    if (row_no >= desc_->row_cap) return Err::kCorruption;
+
+    // 索引键必须与写路径同构：记录内主键列按自然编码存储，而索引键为
+    // EncodeOrderedInt64 有序编码（两者字节序不同）——先解码主键列再
+    // EncodeKey，复刻 StageInsert 的键生成（docs/08 §3-W4 修复）。
+    const std::vector<ColumnValue> row = DecodeRecord(rec);
+    if (row.empty()) return Err::kCorruption;
+    char key_buf[8];
+    if (!EncodeKey(row[0], key_buf)) return Err::kCorruption;
+    const uint8_t* key = reinterpret_cast<const uint8_t*>(key_buf);
+    uint64_t existing = 0;
+    const bool found = index_->Find(key, &existing);
+    if (found) {
+        if (existing == row_no) return Err::kOk;  // 已发布：幂等跳过
+        return Err::kCorruption;                  // 键被其他槽持有：结构违例
+    }
+
+    uint64_t* ver = VersionSlot(row_no);
+    if (*ver < row_ver) {
+        // 数据未应用（或写入中断）：整行重写并清墓碑。
+        std::memcpy(RowPtr(row_no), rec, desc_->rec_fixed_len);
+        SetTombstone(row_no, false);
+        // 扩展列后缀（W5-b）：与主记录同批重放；记录早于加列时无后缀，
+        // 链短于后缀时余部忽略（加列先于记录落盘的崩溃残差，M1 边界）。
+        if (rec_len > desc_->rec_fixed_len) {
+            const Err ee = ApplyExtSuffix(rec + desc_->rec_fixed_len,
+                                          rec_len - desc_->rec_fixed_len, row_no);
+            if (!IsOk(ee)) return ee;
+        }
+        *ver = row_ver;
+        // 旧记录变长块不回收：撕裂内容上执行 Deallocate 有池破坏风险；
+        // 泄漏有界，随 M2 compact 收敛（docs/08 §3-W4 落地记录）。
+    }
+    // 版本已到位但索引缺失（应用中断于发布前）→ 仅补发布索引。
+    const Err ins = index_->Insert(key, row_no);
+    if (!IsOk(ins)) return ins;
+    if (row_no + 1 > desc_->row_count) desc_->row_count = static_cast<uint32_t>(row_no + 1);
+    return Err::kOk;
+}
+
+Err TableStore::ReplayDelete(uint64_t row_no, uint64_t row_ver, const uint8_t* key8) noexcept {
+    if (alloc_ == nullptr) return Err::kCorruption;
+    if (key8 == nullptr) return Err::kCorruption;
+    if (row_no >= desc_->row_cap) return Err::kCorruption;
+
+    uint64_t existing = 0;
+    const bool have = index_->Find(key8, &existing);
+    if (have && existing != row_no) return Err::kCorruption;
+
+    uint64_t* ver = VersionSlot(row_no);
+    if (*ver < row_ver) {
+        SetTombstone(row_no, true);
+        *ver = row_ver;
+    }
+    if (have) {
+        const Err err = index_->Remove(key8);
+        if (!IsOk(err)) return err;
+    }
+    return Err::kOk;
+}
+
+Err TableStore::RebuildCommittedCountAfterReplay() noexcept {
+    desc_->committed_row_count = static_cast<uint32_t>(index_->Size());
+    return Err::kOk;
+}
+
+// ------------------ 二级索引（M1-W5-d，docs/08 §3-W5）------------------
+
+Err TableStore::CreateSecondaryIndex(const SecondaryIndexDef& idx) noexcept {
+    if (alloc_ == nullptr) return Err::kReadOnlyHandle;
+    const Err verr = ValidateSecondaryIndexDef(idx, desc_, base_);
+    if (!IsOk(verr)) return verr;
+
+    // 分配 Slot 锚点与元数据块（先完整写入，再挂链；失败完整回滚）。
+    Result<uint64_t> slot_res = alloc_->Allocate(static_cast<uint64_t>(sizeof(SecIndexTree::Slot)));
+    if (!slot_res.IsOk()) return slot_res.Error();
+    const uint64_t slot_off = slot_res.Value();
+    std::memset(alloc_->OffsetToPtr(slot_off), 0, sizeof(SecIndexTree::Slot));
+
+    Result<uint64_t> meta_res = alloc_->Allocate(static_cast<uint64_t>(sizeof(shm_SecIdxMeta)));
+    if (!meta_res.IsOk()) {
+        alloc_->Deallocate(slot_off);
+        return meta_res.Error();
+    }
+    const uint64_t meta_off = meta_res.Value();
+    auto* meta = reinterpret_cast<shm_SecIdxMeta*>(alloc_->OffsetToPtr(meta_off));
+    std::memset(meta, 0, sizeof(*meta));
+    meta->magic = kSecIdxMagic;
+    meta->next_off = 0;  // 先不挂链：中断留孤儿块（不可达、无害）
+    meta->tree_slot_off = slot_off;
+    meta->col = idx.column_index;
+    meta->unique = idx.unique ? 1 : 0;
+    meta->state = 0;
+    std::memcpy(meta->name, idx.name.c_str(), idx.name.size() + 1);  // 含结尾 0
+
+    // 注入点：元数据已写、尚未挂链（崩溃 → 表无此索引，docs/06 §3）。
+    failpoint::CrashPoint("secidx.before_link");
+
+    // populate 先于 link：读者要么看不到索引，要么看到全量（无半截视图）。
+    // 唯一索引在此校验存量数据；违例回滚分配、表 schema 不变。
+    SecIndexTree tree(base_, alloc_,
+                      reinterpret_cast<SecIndexTree::Slot*>(alloc_->OffsetToPtr(slot_off)));
+    const Err perr = PopulateSecondaryIndex(meta, &tree);
+    if (!IsOk(perr)) {
+        // 已灌入的树节点不回收（页回收归 M2 compact），仅归还锚点/元数据块。
+        alloc_->Deallocate(meta_off);
+        alloc_->Deallocate(slot_off);
+        return perr;
+    }
+
+    // 挂链（头插）+ 计数递增 + 附着到本实例（此后本会话立即可查）。
+    meta->next_off = SecIdxHeadOff(desc_);
+    desc_->reserved[0] = meta_off;
+    desc_->reserved[1] = SecIdxCount(desc_) + 1;
+    sec_meta_.push_back(meta);
+    sec_trees_.emplace_back(new SecIndexTree(
+        base_, alloc_, reinterpret_cast<SecIndexTree::Slot*>(alloc_->OffsetToPtr(slot_off))));
+    return Err::kOk;
+}
+
+Err TableStore::PopulateSecondaryIndex(shm_SecIdxMeta* meta, SecIndexTree* tree) noexcept {
+    if (meta == nullptr || tree == nullptr) return Err::kInvalidArgument;
+    // 主键序遍历（升序）；逐行取被索引列当前值建键。
+    char lo8[8];
+    char hi8[8];
+    infra::EncodeOrderedInt64(INT64_MIN, lo8);
+    infra::EncodeOrderedInt64(INT64_MAX, hi8);
+    auto cur = index_->SeekRange(lo8, true, hi8, true);
+    while (cur.Valid()) {
+        const uint64_t row_no = cur.Value();
+        // 墓碑行不在主键索引中（删除即摘键），此处为防御性双查；
+        // 奇数版本行（崩溃残留的写入中态）跳过，由后续重写收敛。
+        if (row_no < desc_->row_cap && !IsTombstoned(row_no) && (*VersionSlot(row_no) & 1u) == 0) {
+            ColumnValue v = ColumnValue::Null();
+            const Err ce = ColumnValueAt(meta->col, row_no, &v);
+            if (!IsOk(ce)) return ce;
+            char vk[8];
+            if (EncodeSecValue(v, vk)) {
+                if (meta->unique != 0 && SecPrefixExists(*tree, vk))
+                    return Err::kAlreadyExists;  // 存量数据违反唯一约束
+                SecEntry e;
+                MakeSecKey(vk, row_no, e.key.data());
+                e.present = true;
+                const Err ie = tree->Insert(e.key.data(), row_no);
+                if (!IsOk(ie)) return ie;
+            }
+        }
+        cur.Next();
+    }
+    return Err::kOk;
+}
+
+Err TableStore::ColumnValueAt(uint32_t global_col, uint64_t row_no, ColumnValue* out) const noexcept {
+    if (out == nullptr) return Err::kInvalidArgument;
+    if (row_no >= desc_->row_cap) return Err::kCorruption;
+
+    if (global_col < desc_->col_count) {
+        // 内联列：直读主记录（调用方均持根锁或在写入协议内，无并发写）。
+        const uint8_t* rec = RowPtr(row_no);
+        if (((rec[nullmap_offset_ + global_col / 8] >> (global_col % 8)) & 0x1u) != 0) {
+            *out = ColumnValue::Null();
+            return Err::kOk;
+        }
+        const shm_ColDef& c = desc_->cols[global_col];
+        const DataType t = static_cast<DataType>(c.type);
+        if (t == DataType::kFloat32) {
+            float f = 0;
+            std::memcpy(&f, rec + c.offset, 4);
+            *out = ColumnValue::Real(static_cast<double>(f));
+        } else if (t == DataType::kFloat64) {
+            double d = 0;
+            std::memcpy(&d, rec + c.offset, 8);
+            *out = ColumnValue::Real(d);
+        } else if (t == DataType::kBool) {
+            *out = ColumnValue::Bool(LoadInteger(rec + c.offset, c.len) != 0);
+        } else if (FixedSizeOf(t) > 0) {
+            *out = ColumnValue::IntOf(t, LoadInteger(rec + c.offset, c.len));
+        } else {
+            return Err::kUnsupported;  // 变长列：校验期已拒，此处兜底
+        }
+        return Err::kOk;
+    }
+
+    // 扩展列：槽值 / set / null 位（与 ReadRow 的 ext 解码同一规则）。
+    const uint32_t j = global_col - desc_->col_count;
+    std::vector<shm_ExtColRegion*> regions;
+    const Err werr = WalkExtColumns(base_, desc_, &regions);
+    if (!IsOk(werr)) return werr;
+    if (j >= regions.size()) return Err::kCorruption;
+    shm_ExtColRegion* r = regions[j];
+    const DataType t = static_cast<DataType>(r->type);
+    if (!BitTest(ExtColSetBits(r), row_no)) {
+        if (r->has_default != 0 && r->default_is_null == 0) {
+            *out = LoadScalar(reinterpret_cast<const uint8_t*>(&r->default_value), r->slot_bytes, t);
+        } else {
+            *out = ColumnValue::Null();
+        }
+        return Err::kOk;
+    }
+    if (BitTest(ExtColNullBits(r), row_no)) {
+        *out = ColumnValue::Null();
+        return Err::kOk;
+    }
+    *out = LoadScalar(ExtColSlots(r) + row_no * r->slot_bytes, r->slot_bytes, t);
+    return Err::kOk;
+}
+
+Err TableStore::SecKeysOfRow(uint64_t row_no, std::vector<SecEntry>* out) const noexcept {
+    if (out == nullptr) return Err::kInvalidArgument;
+    out->clear();
+    out->resize(sec_meta_.size());  // 与 sec_trees_ 平行对齐
+    for (size_t i = 0; i < sec_meta_.size(); ++i) {
+        ColumnValue v = ColumnValue::Null();
+        const Err ce = ColumnValueAt(sec_meta_[i]->col, row_no, &v);
+        if (!IsOk(ce)) return ce;
+        char vk[8];
+        if (!EncodeSecValue(v, vk)) continue;  // NULL/不可编码：该行不入此索引
+        MakeSecKey(vk, row_no, (*out)[i].key.data());
+        (*out)[i].present = true;
+    }
+    return Err::kOk;
+}
+
+Err TableStore::InsertSecKeys(const std::vector<SecEntry>& keys) noexcept {
+    for (size_t i = 0; i < keys.size() && i < sec_trees_.size(); ++i) {
+        if (!keys[i].present) continue;
+        const uint64_t row_no =
+            static_cast<uint64_t>(infra::DecodeOrderedInt64(keys[i].key.data() + 8));
+        const Err ie = sec_trees_[i]->Insert(keys[i].key.data(), row_no);
+        // 同键同行号已存在 = 状态本就正确（幂等）；其余错误上抛。
+        if (!IsOk(ie) && ie != Err::kAlreadyExists) return ie;
+    }
+    return Err::kOk;
+}
+
+void TableStore::RemoveSecKeys(const std::vector<SecEntry>& keys) noexcept {
+    for (size_t i = 0; i < keys.size() && i < sec_trees_.size(); ++i) {
+        if (!keys[i].present) continue;
+        // 键缺失不影响结构（读者按行号读行，墓碑/旧值即缺席）。
+        (void)sec_trees_[i]->Remove(keys[i].key.data());
+    }
+}
+
+Err TableStore::CheckSecUnique(const std::vector<ColumnValue>& row, uint64_t self_row_no,
+                               bool has_self) const noexcept {
+    for (size_t i = 0; i < sec_meta_.size(); ++i) {
+        if (sec_meta_[i]->unique == 0) continue;
+        const uint32_t col = sec_meta_[i]->col;
+        // 写入行未提供该列（旧句柄窄行）：惰性默认值不参与唯一性校验
+        // （M1 边界，docs/08 §3-W5）。
+        if (col >= row.size()) continue;
+        const ColumnValue& v = row[col];
+        if (v.is_null()) continue;  // NULL 不入唯一索引（SQL 语义）
+        if ((v.type() == DataType::kFloat32 || v.type() == DataType::kFloat64) &&
+            v.as_real() != v.as_real()) {
+            return Err::kInvalidArgument;  // NaN 不可有序编码：拒绝写入
+        }
+        char vk[8];
+        if (!EncodeSecValue(v, vk)) continue;
+        // 前缀探测：同值存在其他行 → 冲突（更新场景排除自身当前条目）。
+        char lo[16];
+        char hi[16];
+        std::memcpy(lo, vk, 8);
+        infra::EncodeOrderedInt64(INT64_MIN, lo + 8);
+        std::memcpy(hi, vk, 8);
+        infra::EncodeOrderedInt64(INT64_MAX, hi + 8);
+        auto cur = sec_trees_[i]->SeekRange(lo, true, hi, true);
+        while (cur.Valid()) {
+            if (!has_self || cur.Value() != self_row_no) return Err::kAlreadyExists;
+            cur.Next();
+        }
+    }
+    return Err::kOk;
+}
+
+Result<std::vector<std::vector<ColumnValue>>> TableStore::GetBySecondary(
+    const std::string& index_name, const ColumnValue& key) const noexcept {
+    const shm_SecIdxMeta* meta = FindSecMetaByName(base_, desc_, index_name);
+    if (meta == nullptr)
+        return Result<std::vector<std::vector<ColumnValue>>>::Fail(Err::kNotFound);
+    char vk[8];
+    if (!EncodeSecValue(key, vk))
+        return Result<std::vector<std::vector<ColumnValue>>>::Fail(Err::kInvalidArgument);
+
+    const SecIndexTree* tree = nullptr;
+    for (size_t i = 0; i < sec_meta_.size(); ++i) {
+        if (sec_meta_[i] == meta) {
+            tree = sec_trees_[i].get();
+            break;
+        }
+    }
+    if (tree == nullptr)
+        return Result<std::vector<std::vector<ColumnValue>>>::Fail(Err::kCorruption);
+
+    // 同值区间 [值|MIN, 值|MAX]：同值多行按 row_no 升序连续。
+    char lo[16];
+    char hi[16];
+    std::memcpy(lo, vk, 8);
+    infra::EncodeOrderedInt64(INT64_MIN, lo + 8);
+    std::memcpy(hi, vk, 8);
+    infra::EncodeOrderedInt64(INT64_MAX, hi + 8);
+
+    std::vector<std::vector<ColumnValue>> out;
+    auto cur = tree->SeekRange(lo, true, hi, true);
+    while (cur.Valid()) {
+        std::vector<ColumnValue> row;
+        const Err e = ReadRow(cur.Value(), &row);
+        if (IsOk(e)) {
+            out.push_back(std::move(row));
+        } else if (e != Err::kNotFound && e != Err::kTimeout) {
+            return Result<std::vector<std::vector<ColumnValue>>>::Fail(e);  // 结构错误上抛
+        }
+        // kNotFound/kTimeout：并发删除/更新中的行，缺席于本次近似查询（M1）。
+        cur.Next();
+    }
+    return Result<std::vector<std::vector<ColumnValue>>>::Ok(std::move(out));
+}
+
+Err TableStore::RebuildSecondaryIndexes() noexcept {
+    if (alloc_ == nullptr) return Err::kReadOnlyHandle;
+    for (size_t i = 0; i < sec_meta_.size(); ++i) {
+        SecIndexTree* tree = sec_trees_[i].get();
+        // 就地清空（根置零）：各进程缓存的树实例按同一 Slot 绑定，不可
+        // 更换锚点指针；旧节点不可达，待 M2 compact 回收。
+        tree->Reset();
+        const Err e = PopulateSecondaryIndex(sec_meta_[i], tree);
+        if (!IsOk(e)) return e;
+    }
+    return Err::kOk;
+}
+
+// ------------------ 兼容封装：单步 CRUD（不经 WAL，直测/工具用）------------------
+
+Err TableStore::Insert(const std::vector<ColumnValue>& row, uint64_t* out_row_no) noexcept {
+    StagedRowOp st;
+    const Err stage = StageInsert(row, &st);
+    if (!IsOk(stage)) return stage;
+    const Err apply = ApplyStaged(&st);
+    if (!IsOk(apply)) {
+        ReleaseStaged(&st);
+        return apply;
+    }
+    if (out_row_no != nullptr) *out_row_no = st.row_no;
+    return Err::kOk;
+}
+
+/// 免锁乐观读一行（主记录与 ext 槽在同一版本窗口内拷贝；W3 读协议，
+/// W5-b 扩展列同窗口、W5-c 扫描复用）。
+Err TableStore::ReadRow(uint64_t row_no, std::vector<ColumnValue>* out) const noexcept {
+    if (out == nullptr) return Err::kInvalidArgument;
+    if (row_no >= desc_->row_cap) return Err::kCorruption;
+
+    // 扩展列链快照（添加序；无扩展列时零开销）。
+    std::vector<shm_ExtColRegion*> regions;
+    if (desc_->ext_col_count != 0) {
+        const Err werr = WalkExtColumns(base_, desc_, &regions);
+        if (!IsOk(werr)) return werr;
+    }
+    struct ExtCell {
+        uint8_t set = 0;
+        uint8_t is_null = 0;
+        std::vector<uint8_t> value;
+    };
+    std::vector<ExtCell> cells(regions.size());
+    for (size_t j = 0; j < regions.size(); ++j) cells[j].value.resize(regions[j]->slot_bytes);
+
+    std::vector<uint8_t> rec;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const uint64_t* ver = VersionSlot(row_no);
+        const uint64_t v1 = *ver;
+        if ((v1 & 1u) != 0) continue;  // 写入中，重试
+        if (IsTombstoned(row_no)) return Err::kNotFound;
+        rec.assign(RowPtr(row_no), RowPtr(row_no) + desc_->rec_fixed_len);
+        for (size_t j = 0; j < regions.size(); ++j) {
+            shm_ExtColRegion* r = regions[j];
+            const uint8_t* slot = ExtColSlots(r) + row_no * r->slot_bytes;
+            std::memcpy(cells[j].value.data(), slot, r->slot_bytes);
+            cells[j].set = BitTest(ExtColSetBits(r), row_no) ? 1 : 0;
+            cells[j].is_null = BitTest(ExtColNullBits(r), row_no) ? 1 : 0;
+        }
+        std::vector<ColumnValue> values = DecodeRecord(rec.data());
+        const uint64_t v2 = *ver;
+        if (v1 == v2 && (v2 & 1u) == 0) {
+            // 扩展列解码（W5-b）：未设置 → 惰性默认值；设置且 null 位 → NULL。
+            for (size_t j = 0; j < regions.size(); ++j) {
+                const shm_ExtColRegion* r = regions[j];
+                const DataType et = static_cast<DataType>(r->type);
+                const ExtCell& c = cells[j];
+                if (c.set == 0) {
+                    if (r->has_default != 0 && r->default_is_null == 0) {
+                        values.push_back(LoadScalar(
+                            reinterpret_cast<const uint8_t*>(&r->default_value), r->slot_bytes, et));
+                    } else {
+                        values.push_back(ColumnValue::Null());
+                    }
+                } else if (c.is_null != 0) {
+                    values.push_back(ColumnValue::Null());
+                } else {
+                    values.push_back(LoadScalar(c.value.data(), r->slot_bytes, et));
+                }
+            }
+            *out = std::move(values);
+            return Err::kOk;
+        }
+    }
+    return Err::kTimeout;  // 并发更新中：调用方按语义跳过或上报
 }
 
 Result<std::vector<ColumnValue>> TableStore::Get(const ColumnValue& key) const noexcept {
@@ -400,73 +1125,71 @@ Result<std::vector<ColumnValue>> TableStore::Get(const ColumnValue& key) const n
     if (!EncodeKey(key, k)) return Result<std::vector<ColumnValue>>::Fail(Err::kInvalidArgument);
     uint64_t row_no = 0;
     if (!index_->Find(k, &row_no)) return Result<std::vector<ColumnValue>>::Fail(Err::kNotFound);
-    if (row_no >= desc_->row_cap) return Result<std::vector<ColumnValue>>::Fail(Err::kCorruption);
+    std::vector<ColumnValue> values;
+    const Err e = ReadRow(row_no, &values);
+    if (!IsOk(e)) return Result<std::vector<ColumnValue>>::Fail(e);
+    return Result<std::vector<ColumnValue>>::Ok(std::move(values));
+}
 
-    // 免锁乐观读：版本一致且为偶数才采纳。
-    std::vector<uint8_t> rec;
-    for (int attempt = 0; attempt < 4; ++attempt) {
-        const uint64_t* ver = VersionSlot(row_no);
-        const uint64_t v1 = *ver;
-        if ((v1 & 1u) != 0) continue;  // 写入中，重试
-        if (IsTombstoned(row_no)) return Result<std::vector<ColumnValue>>::Fail(Err::kNotFound);
-        rec.assign(RowPtr(row_no), RowPtr(row_no) + desc_->rec_fixed_len);
-        std::vector<ColumnValue> values = DecodeRecord(rec.data());
-        const uint64_t v2 = *ver;
-        if (v1 == v2 && (v2 & 1u) == 0)
-            return Result<std::vector<ColumnValue>>::Ok(std::move(values));
+Result<std::vector<std::vector<ColumnValue>>> TableStore::Scan(const ColumnValue* lo, bool lo_incl,
+                                                               const ColumnValue* hi,
+                                                               bool hi_incl) const noexcept {
+    // 边界编码：nullptr = 无界 → 有序编码极值（包含性强制为闭）。
+    char lo8[8];
+    char hi8[8];
+    if (lo != nullptr) {
+        if (!EncodeKey(*lo, lo8)) return Result<std::vector<std::vector<ColumnValue>>>::Fail(
+                                           Err::kInvalidArgument);
+    } else {
+        infra::EncodeOrderedInt64(INT64_MIN, lo8);
+        lo_incl = true;
     }
-    return Result<std::vector<ColumnValue>>::Fail(Err::kTimeout);
+    if (hi != nullptr) {
+        if (!EncodeKey(*hi, hi8)) return Result<std::vector<std::vector<ColumnValue>>>::Fail(
+                                           Err::kInvalidArgument);
+    } else {
+        infra::EncodeOrderedInt64(INT64_MAX, hi8);
+        hi_incl = true;
+    }
+
+    std::vector<std::vector<ColumnValue>> out;
+    auto cur = index_->SeekRange(lo8, lo_incl, hi8, hi_incl);
+    while (cur.Valid()) {
+        const uint64_t row_no = cur.Value();
+        std::vector<ColumnValue> row;
+        const Err e = ReadRow(row_no, &row);
+        if (IsOk(e)) {
+            out.push_back(std::move(row));
+        } else if (e != Err::kNotFound && e != Err::kTimeout) {
+            return Result<std::vector<std::vector<ColumnValue>>>::Fail(e);  // 结构错误上抛
+        }
+        // kNotFound/kTimeout：并发删除/更新中的行，缺席于本次近似扫描（M1）。
+        cur.Next();
+    }
+    return Result<std::vector<std::vector<ColumnValue>>>::Ok(std::move(out));
 }
 
 Err TableStore::Update(const ColumnValue& key, const std::vector<ColumnValue>& row) noexcept {
-    if (alloc_ == nullptr) return Err::kReadOnlyHandle;
-    if (row.size() != desc_->col_count) return Err::kInvalidArgument;
-    char k[8];
-    char new_k[8];
-    if (!EncodeKey(key, k) || !EncodeKey(row[0], new_k)) return Err::kInvalidArgument;
-    if (std::memcmp(k, new_k, 8) != 0) return Err::kInvalidArgument;  // 主键不可变更
-
-    uint64_t row_no = 0;
-    if (!index_->Find(k, &row_no)) return Err::kNotFound;
-    if (row_no >= desc_->row_cap) return Err::kCorruption;
-    if (IsTombstoned(row_no)) return Err::kNotFound;
-
-    std::vector<uint8_t> rec;
-    std::vector<uint64_t> vars;
-    const Err build = BuildRecord(row, &rec, &vars);
-    if (!IsOk(build)) return build;
-
-    // 旧记录副本：用于版本发布后再回收其变长块（读者按版本复核丢弃半更新数据）。
-    std::vector<uint8_t> old_rec(RowPtr(row_no), RowPtr(row_no) + desc_->rec_fixed_len);
-
-    uint64_t* ver = VersionSlot(row_no);
-    *ver = *ver + 1;  // 奇数：写入中
-    std::memcpy(RowPtr(row_no), rec.data(), desc_->rec_fixed_len);
-    *ver = *ver + 1;  // 偶数：稳定
-    ReleaseRecordVars(old_rec.data());
+    StagedRowOp st;
+    const Err stage = StageUpdate(key, row, &st);
+    if (!IsOk(stage)) return stage;
+    const Err apply = ApplyStaged(&st);
+    if (!IsOk(apply)) {
+        ReleaseStaged(&st);
+        return apply;
+    }
     return Err::kOk;
 }
 
 Err TableStore::Remove(const ColumnValue& key) noexcept {
-    if (alloc_ == nullptr) return Err::kReadOnlyHandle;
-    char k[8];
-    if (!EncodeKey(key, k)) return Err::kInvalidArgument;
-    uint64_t row_no = 0;
-    if (!index_->Find(k, &row_no)) return Err::kNotFound;
-    if (row_no >= desc_->row_cap) return Err::kCorruption;
-    if (IsTombstoned(row_no)) return Err::kNotFound;
-
-    std::vector<uint8_t> old_rec(RowPtr(row_no), RowPtr(row_no) + desc_->rec_fixed_len);
-
-    uint64_t* ver = VersionSlot(row_no);
-    *ver = *ver + 1;
-    SetTombstone(row_no, true);
-    *ver = *ver + 1;
-
-    const Err err = index_->Remove(k);
-    if (!IsOk(err)) return err;
-    if (desc_->committed_row_count > 0) desc_->committed_row_count--;
-    ReleaseRecordVars(old_rec.data());
+    StagedRowOp st;
+    const Err stage = StageRemove(key, &st);
+    if (!IsOk(stage)) return stage;
+    const Err apply = ApplyStaged(&st);
+    if (!IsOk(apply)) {
+        ReleaseStaged(&st);
+        return apply;
+    }
     return Err::kOk;
 }
 

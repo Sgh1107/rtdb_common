@@ -24,7 +24,19 @@ struct ShmRegionParams {
 
 /// 共享内存区的宿主侧包装：负责打开映射 + SuperBlock 校验/初始化 +
 /// 全局状态字的类型安全访问（docs/03 §2.1 ShmRegion）。
-class ShmRegion {
+///
+/// 注：本类属内部 infra 组件，但单元测试需白盒直建区域（docs/06 §1
+/// "组件测试落真实 tmpdir 映像"），故随 rtdbcore 导出符号（与下方
+/// layout 自由函数同一处理），公共 API 面仍以 include/rtdb/ 为准。
+///
+/// C4251（unique_ptr 成员需 dll 接口）对本类为误报：客户端仅经 Open 的
+/// 返回值持有本对象，从不直接销毁 file_/alloc_/mutex_ 成员，且成员类型
+/// 的完整定义随本头一并可见。定向抑制，避免淹没 /W4 下的真实告警。
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4251)
+#endif
+class RTDB_API ShmRegion {
 public:
     ~ShmRegion();
 
@@ -50,7 +62,8 @@ public:
 
     int64_t LoadCommittedSeq() const noexcept;
     void StoreCommittedSeq(int64_t v) noexcept;
-    Err Flush() noexcept;  ///< 头部区间回写文件
+    Err Flush() noexcept;   ///< 头部区间回写文件
+    Err FlushAll() noexcept;  ///< 全映像回写文件（组提交/覆盖协议/优雅收尾）
 
 private:
     ShmRegion() = default;
@@ -61,6 +74,9 @@ private:
     std::unique_ptr<infra::SlabShmAllocator> alloc_;
     std::unique_ptr<infra::ShmRootMutex> mutex_;
 };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 namespace layout {
 /// 填充 SuperBlock 初始内容（调用前区域已清零）。

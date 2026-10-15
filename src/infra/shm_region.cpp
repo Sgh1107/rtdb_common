@@ -158,4 +158,6 @@ void ShmRegion::StoreCommittedSeq(int64_t v) noexcept {
 
 Err ShmRegion::Flush() noexcept { return file_->flush(base_, kHeaderReservedBytes); }
 
+Err ShmRegion::FlushAll() noexcept { return file_->flush(base_, mapped_bytes()); }
+
 }  // namespace rtdb

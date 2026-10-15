@@ -90,6 +90,95 @@ inline constexpr uint32_t kVarPoolRegionBytes = 64 * 1024;
 /// 描述符状态字（DropTable = 墓碑态，物理数据待 compact 回收）。
 enum class TableState : uint32_t { kActive = 0, kTombstone = 1 };
 
+/// 在线加列扩展区魔数（"RTDBEXT1"）。
+inline constexpr uint64_t kExtColMagic = 0x5254444245585431ULL;
+/// 每表扩展列数上限（M1）：总列数 ≤ kMaxInitCols + kMaxExtCols = 32。
+inline constexpr uint32_t kMaxExtCols = 16;
+/// 扩展列槽字节上限（M1：定长 ≤8B 标量；宽字段/变长扩展列归 M2）。
+inline constexpr uint32_t kMaxExtSlotBytes = 8;
+
+/// 二级索引元数据魔数（"RTDBSIX1"）。
+inline constexpr uint64_t kSecIdxMagic = 0x5254444253495831ULL;
+/// 每表二级索引数上限（M1；与 SuperBlock.max_indexes_per_table 一致）。
+inline constexpr uint32_t kMaxSecIdxPerTable = 16;
+
+/// 共享内存二级索引元数据（docs/03 §2.2/§3.1，docs/08 §3-W5；单块 Slab 分配）。
+///
+/// 每个二级索引一块元数据，经 `next_off` 链成倒序创建链，表描述符
+/// `reserved[0]` 指向链头（0 = 无二级索引）。B+ 树本体经
+/// `tree_slot_off` 指向独立分配的 Slot 锚点。
+///
+/// 键布局（M1 非唯一索引的自然形态，唯一索引同布局 + 写路径前缀校验）：
+/// `[EncodeOrderedInt64(值) 8B][EncodeOrderedInt64(row_no) 8B]`，
+/// 同值条目按 row_no 升序连续，范围游标即可取同值多行。
+struct shm_SecIdxMeta {
+    uint64_t magic;         ///< 固定 kSecIdxMagic
+    uint64_t next_off;      ///< 链下一个元数据偏移（0 = 尾）
+    uint64_t tree_slot_off;  ///< B+ 树 Slot 锚点偏移（SharedBTree<16,uint64_t>）
+    uint32_t col;           ///< 被索引列全局序号（含扩展列）
+    uint32_t unique;        ///< 0/1
+    uint32_t state;         ///< 预留（M1 恒 0 = 活跃）
+    uint32_t reserved;
+    char name[kMaxColNameBytes];  ///< 索引名（含结尾 0，UTF-8）
+};
+static_assert(sizeof(shm_SecIdxMeta) == 72, "shm_SecIdxMeta 必须恰好 72 字节");
+static_assert(std::is_standard_layout<shm_SecIdxMeta>::value, "索引元数据必须是标准布局");
+
+/// 共享内存在线加列扩展区（docs/03 §3.1，docs/08 §2-D5，§3-W5；单块 Slab 分配）。
+///
+/// 每列一个区域，经 `next_off` 链成倒序添加链（头 = 最新）；描述符
+/// `ext_col_off` 指向链头，`ext_col_count` 计数（遍历以计数为准，
+/// 链上多余节点为崩溃残留的孤儿区，不可达、无害）。
+///
+/// 区内部局（单块分配，零基址寻址）：
+/// ```
+/// [shm_ExtColRegion 头]
+/// [slots  row_cap × slot_bytes]   ← 行槽值（未设置行为 0）
+/// [set   位图 bitmap_bytes]       ← 1 = 该行显式设置过（非默认）
+/// [null  位图 bitmap_bytes]       ← 1 = 显式设置且为 NULL
+/// ```
+/// 读取规则：未设置 → 惰性默认值（has_default 且非 NULL 时取默认标量，
+/// 否则 NULL）；设置且 null 位为 1 → NULL；否则取槽值。
+struct shm_ExtColRegion {
+    uint64_t magic;         ///< 固定 kExtColMagic
+    uint64_t next_off;      ///< 链上下一个区域偏移（0 = 尾）
+    uint32_t slot_bytes;    ///< 每行槽字节数（1..kMaxExtSlotBytes）
+    uint32_t bitmap_bytes;  ///< 单张位图字节数 (row_cap+7)/8
+    uint32_t row_cap;       ///< 行槽容量（须等于描述符 row_cap）
+    uint32_t col;           ///< 全局列序号（col_count + 添加次序）
+    uint32_t layout_ver;    ///< 加入时递增后的 data_layout_ver
+    uint8_t type;           ///< DataType（M1：定长 ≤8B）
+    uint8_t nullable;       ///< 0/1
+    uint8_t has_default;    ///< 0/1
+    uint8_t default_is_null;  ///< 默认值是否为 NULL（has_default 时有效）
+    uint16_t reserved;
+    uint32_t reserved2;
+    uint64_t default_value;  ///< 标量默认值原始 8B（整数小端/浮点 IEEE/bool 0-1）
+    char name[kMaxColNameBytes];  ///< 列名（含结尾 0，UTF-8）
+};
+static_assert(sizeof(shm_ExtColRegion) == 88, "shm_ExtColRegion 必须恰好 88 字节");
+static_assert(std::is_standard_layout<shm_ExtColRegion>::value, "扩展区头必须是标准布局");
+
+/// 扩展区总字节数（头 + 槽区 + 两张位图）。
+inline uint64_t ExtColRegionBytes(uint32_t row_cap, uint32_t slot_bytes) noexcept {
+    return static_cast<uint64_t>(sizeof(shm_ExtColRegion)) +
+           static_cast<uint64_t>(row_cap) * slot_bytes +
+           2 * ((static_cast<uint64_t>(row_cap) + 7) / 8);
+}
+
+/// 槽区基址（区头之后）。
+inline uint8_t* ExtColSlots(shm_ExtColRegion* r) noexcept {
+    return reinterpret_cast<uint8_t*>(r) + sizeof(shm_ExtColRegion);
+}
+/// set 位图基址（槽区之后）。
+inline uint8_t* ExtColSetBits(shm_ExtColRegion* r) noexcept {
+    return ExtColSlots(r) + static_cast<uint64_t>(r->row_cap) * r->slot_bytes;
+}
+/// null 位图基址（set 位图之后）。
+inline uint8_t* ExtColNullBits(shm_ExtColRegion* r) noexcept {
+    return ExtColSetBits(r) + r->bitmap_bytes;
+}
+
 /// 共享内存列定义（48B 定长，标准布局）。
 struct shm_ColDef {
     char name[kMaxColNameBytes];  ///< 列名（含结尾 0，UTF-8）
@@ -135,6 +224,9 @@ struct shm_TableDescriptor {
     char name[kMaxTableNameBytes];  ///< 表名（含结尾 0，UTF-8）
     char table_rwlock[64];          ///< 表级读写锁状态位（M1-W3 起使用，先占位清零）
     uint64_t var_pool_bytes;        ///< 变长池分区容量（0 = 本表无变长列）
+    /// 预留字段语义（M1-W5-d 起启用）：
+    ///  - reserved[0] = 二级索引链头偏移（`shm_SecIdxMeta` 链，0 = 无二级索引）；
+    ///  - reserved[1] = 二级索引数（遍历深度；链上更深节点为崩溃残留孤儿区）。
     uint64_t reserved[19];          ///< 预留
     // ---- 内联列定义 ----
     shm_ColDef cols[kMaxInitCols];

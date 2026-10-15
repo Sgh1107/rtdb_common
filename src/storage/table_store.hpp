@@ -24,7 +24,9 @@
 /// 定长类型；单表行数据区受 `kMaxRowDataBytes` 约束（段目录化列 M2）。
 
 #include <cstdint>
+#include <array>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "infra/shared_btree.hpp"
@@ -34,6 +36,7 @@
 #include "rtdb/result.hpp"
 #include "rtdb/table_def.hpp"
 #include "storage/schema.hpp"
+#include "storage/sec_index.hpp"
 #include "storage/var_pool.hpp"
 
 namespace rtdb {
@@ -42,7 +45,37 @@ namespace storage {
 /// 主键索引：key = `EncodeOrderedInt64(主键值)`，payload = 行槽号。
 using PrimaryIndexTree = infra::SharedBTree<8, uint64_t>;
 
-/// \brief 单表行存储：格式化物理区 + 行级 CRUD。
+/// \brief 单行变更的暂存产物（WAL 先行协议，docs/08 §2-D2，§3-W4）。
+///
+/// 写路径顺序：Stage*（校验 + 构建，含变长块分配与 insert 行槽保留）
+/// → WAL 追加 → Apply*（数据页/索引变更）→ 提交标记。
+/// 批量（Engine::ExecuteBatch）先对全部操作 Stage，再整体 WAL 化后依次
+/// Apply——COMMIT 记录先于任何数据页变更落环，恢复时"无 COMMIT 整批作废"
+/// 或"有 COMMIT 整批重放"，两段皆原子（docs/08 §2-D3）。
+///
+/// 生命周期约定：
+///  - Stage 成功后 `allocated_vars` 中的变长块归暂存产物所有；
+///  - ApplyStaged 成功 → 块所有权随记录转移进行数据，`allocated_vars` 清空，
+///    此后**不得**再 ReleaseStaged；
+///  - ApplyStaged 失败 → 数据页已由 Apply 内部回滚，变长块与行槽保留权
+///    仍在暂存产物，调用方必须 ReleaseStaged 收尾；
+///  - ReleaseStaged 对 insert 会回退行槽保留（desc_->row_count--），
+///    批量中止须按暂存逆序调用（LIFO）。
+struct StagedRowOp {
+    enum class Kind : uint8_t { kInsert = 1, kUpdate = 2, kDelete = 3 };
+
+    Kind kind = Kind::kInsert;
+    uint64_t row_no = 0;        ///< insert=保留的行槽号；update/delete=目标行槽号
+    uint64_t row_ver = 0;       ///< 应用完成后的行版本号（偶数；重放判重依据）
+    std::vector<uint8_t> rec;   ///< insert/update：主记录（rec_fixed_len 字节）+
+                                 ///< 扩展列后缀（每列 [status:1][slot_bytes 值]，
+                                 ///< 按添加序；W5-b。无扩展列时即主记录）
+    std::vector<uint8_t> old_rec;  ///< update/delete：旧记录副本（应用成功后回收其变长块）
+    std::vector<uint64_t> allocated_vars;  ///< 暂存期持有的变长块偏移
+    char key[8];                ///< 主键有序编码（WAL 载荷 / 索引操作共用）
+};
+
+/// \brief 单表行存储：格式化物理区 + 行级 CRUD + WAL 暂存/应用/重放。
 #if defined(_MSC_VER)
 #pragma warning(push)
 // C4251: 内部持有 std::unique_ptr 成员（不参与 DLL 接口实体化）。
@@ -77,6 +110,21 @@ public:
     /// \return 列值序列；行不存在或已删除返回 kNotFound
     Result<std::vector<ColumnValue>> Get(const ColumnValue& key) const noexcept;
 
+    /// \brief 主键范围扫描（W5-c；物化返回，游标 API 归 M2）。
+    ///
+    /// 沿主键索引叶链顺序推进，逐行免锁乐观读（与 Get 同协议）。
+    /// 语义边界（M1）：
+    ///  - `lo`/`hi` 为 Null（is_null）表示该侧无界；两端默认闭区间；
+    ///  - 结果为**近似视图**：并发插入可能缺席、并发更新中的行重试
+    ///    若干次后跳过、并发删除的行直接缺席——不承诺快照隔离；
+    ///  - 行按主键升序返回；旧句柄的列截断由调用方（Engine）处理。
+    /// \param lo 下界（nullptr = 无界）
+    /// \param hi 上界（nullptr = 无界）
+    /// \return 行序列（每行 = 当前全量 schema 的列值）
+    Result<std::vector<std::vector<ColumnValue>>> Scan(const ColumnValue* lo, bool lo_incl,
+                                                       const ColumnValue* hi,
+                                                       bool hi_incl) const noexcept;
+
     /// \brief 按主键整行覆盖更新（主键不可变更）。
     Err Update(const ColumnValue& key, const std::vector<ColumnValue>& row) noexcept;
 
@@ -85,6 +133,69 @@ public:
 
     /// \brief 按主键判定行是否存在。
     Result<bool> Contains(const ColumnValue& key) const noexcept;
+
+    // ------------------ WAL 先行协议（docs/08 §2-D2，W4）------------------
+    /// \brief 暂存插入：校验 + 构建记录 + 分配变长块 + 保留行槽（row_count++）。
+    /// 主键冲突返回 kAlreadyExists；行槽耗尽返回 kOutOfMemory。
+    Err StageInsert(const std::vector<ColumnValue>& row, StagedRowOp* out) noexcept;
+
+    /// \brief 暂存整行覆盖更新（主键不可变更，row[0] 须等于原主键）。
+    Err StageUpdate(const ColumnValue& key, const std::vector<ColumnValue>& row,
+                    StagedRowOp* out) noexcept;
+
+    /// \brief 暂存删除（目标须存在且未墓碑化）。
+    Err StageRemove(const ColumnValue& key, StagedRowOp* out) noexcept;
+
+    /// \brief 应用暂存变更（数据页 + 索引 + 计数账本）。
+    ///
+    /// 失败语义：insert 的数据页变更内部回滚（行槽内容清零、版本归零），
+    /// 变长块/行槽保留权留给调用方 ReleaseStaged；update/delete 应用中途
+    /// 失败（仅索引操作可失败）由调用方毒化引擎（WAL 已先行，重启重放收敛）。
+    /// 内部注入点：`wal.apply.mid`（数据已发布、索引未发布）。
+    Err ApplyStaged(StagedRowOp* st) noexcept;
+
+    /// \brief 释放暂存产物（变长块归还 + insert 行槽保留回退）。
+    /// 批量中止须按暂存逆序调用；Apply 成功后不得调用。
+    void ReleaseStaged(StagedRowOp* st) noexcept;
+
+    // ------------------ 恢复重放（docs/08 §3-W4）------------------
+    /// \brief 幂等重放一条 Insert/Update 记录（row_no + row_ver 判重）。
+    ///
+    /// 索引已发布 → 视为已应用（kOk）；版本落后 → 整行重写并补发布索引；
+    /// 版本已到位但索引缺失（应用中断）→ 仅补发布索引。
+    /// \param rec 整行记录；rec_len < rec_fixed_len 返回 kCorruption
+    Err ReplayUpsert(uint64_t row_no, uint64_t row_ver, const uint8_t* rec,
+                     uint32_t rec_len) noexcept;
+
+    /// \brief 幂等重放一条 Delete 记录（key8 = 主键有序编码 8B）。
+    Err ReplayDelete(uint64_t row_no, uint64_t row_ver, const uint8_t* key8) noexcept;
+
+    /// \brief 重放收尾：committed_row_count = 索引规模（live rows）。
+    /// row_count 已在 ReplayUpsert 中按 row_no+1 单调修正。
+    Err RebuildCommittedCountAfterReplay() noexcept;
+
+    // ------------------ 二级索引（M1-W5-d，docs/08 §3-W5）------------------
+    /// \brief 创建二级索引（调用方须持根锁且为可写角色）。
+    ///
+    /// 顺序：校验定义 → 分配 Slot 锚点与元数据块 → 注入点
+    /// `secidx.before_link` → populate 存量行 → 挂链 + 计数递增。
+    /// populate 先于 link：读者要么看不到索引，要么看到全量（无半截视图）；
+    /// 中断在挂链前留不可达孤儿块（无害，M2 compact 收敛）。
+    /// 唯一索引对存量数据校验冲突，违例返回 kAlreadyExists。
+    Err CreateSecondaryIndex(const SecondaryIndexDef& idx) noexcept;
+
+    /// \brief 按二级索引等值查询（免锁近似读，同 Scan 语义边界）。
+    ///
+    /// 同值多行按 row_no 升序返回；索引不存在返回 kNotFound；空值键
+    /// 返回 kInvalidArgument（NULL 不入索引）。
+    Result<std::vector<std::vector<ColumnValue>>> GetBySecondary(const std::string& index_name,
+                                                                 const ColumnValue& key) const noexcept;
+
+    /// \brief 全量重建全部二级索引（写侧 Open 重放后自愈；持根锁）。
+    ///
+    /// 就地清空各索引树后按主键序遍历重灌（当前行状态含 ext 惰性默认值）；
+    /// 旧节点不可达，待 M2 compact 回收。
+    Err RebuildSecondaryIndexes() noexcept;
 
     /// \brief 已提交可见行数。
     uint64_t live_rows() const noexcept { return desc_->committed_row_count; }
@@ -96,7 +207,8 @@ public:
     /// 索引规模 + 墓碑数 == 已用槽数，且版本数组均为稳定偶数。
     Err Validate(uint64_t* out_index_entries = nullptr) const noexcept;
 
-    /// \brief 描述符只读指针。
+    /// \brief 描述符指针（调用方持根锁时可经此变更 schema，如在线加列）。
+    shm_TableDescriptor* descriptor() noexcept { return desc_; }
     const shm_TableDescriptor* descriptor() const noexcept { return desc_; }
 
 private:
@@ -111,13 +223,55 @@ private:
     void SetTombstone(uint64_t row_no, bool dead) const noexcept;
     /// \brief 主键编码；不可编码（类型不符/空值）返回 false。
     static bool EncodeKey(const ColumnValue& key, char out[8]) noexcept;
-    /// \brief 组装记录缓冲（含变长块分配）；失败时释放已分配块。
+    /// \brief 组装记录缓冲（含变长块分配与扩展列后缀；失败时释放已分配块）。
     Err BuildRecord(const std::vector<ColumnValue>& row, std::vector<uint8_t>* rec,
                     std::vector<uint64_t>* allocated_var_offs) const noexcept;
+    /// \brief 应用扩展列后缀（W5-b）：按添加序写各 ext 区槽值与 set/null 位。
+    /// 后缀列数多于链长时余部忽略（加列先于记录落盘的崩溃残差，M1 边界）。
+    Err ApplyExtSuffix(const uint8_t* suffix, size_t suffix_len, uint64_t row_no) noexcept;
+    /// \brief 清零指定行的扩展列 set/null 位（插入回滚用，防槽位复用残留）。
+    void ClearExtBits(uint64_t row_no) const noexcept;
     /// \brief 释放记录中的变长块。
     void ReleaseRecordVars(const uint8_t* rec) const noexcept;
     /// \brief 从记录解码列值。
     std::vector<ColumnValue> DecodeRecord(const uint8_t* rec) const noexcept;
+    /// \brief 免锁乐观读一行（主记录 + ext 槽同一版本窗口拷贝）。
+    /// 墓碑返回 kNotFound；重试耗尽返回 kTimeout（并发更新中）。
+    Err ReadRow(uint64_t row_no, std::vector<ColumnValue>* out) const noexcept;
+
+    // ------------------ 二级索引私有助手（W5-d）------------------
+    /// 单索引的键条目（与 sec_meta_/sec_trees_ 平行对齐；present=false
+    /// 表示该行此列值不出现在索引中——NULL/不可编码）。
+    struct SecEntry {
+        std::array<char, 16> key{};
+        bool present = false;
+    };
+
+    bool HaveSecIdx() const noexcept { return !sec_meta_.empty(); }
+
+    /// \brief 按当前行状态（主记录 + ext 槽/惰性默认值）取被索引列值。
+    Err ColumnValueAt(uint32_t global_col, uint64_t row_no, ColumnValue* out) const noexcept;
+
+    /// \brief 取一行在各二级索引下的键条目（创建序，与 sec_trees_ 平行）。
+    Err SecKeysOfRow(uint64_t row_no, std::vector<SecEntry>* out) const noexcept;
+
+    /// \brief 向各二级索引插入键条目（kAlreadyExists 视为幂等 OK：
+    /// 同键同行号即正确状态；其余错误上抛由调用方毒化）。
+    Err InsertSecKeys(const std::vector<SecEntry>& keys) noexcept;
+
+    /// \brief 从各二级索引摘除键条目（键不存在不影响结构）。
+    void RemoveSecKeys(const std::vector<SecEntry>& keys) noexcept;
+
+    /// \brief 唯一索引冲突预检（暂存阶段，零副作用；docs/08 §3-W5）。
+    /// \param row 写入行（列序号 ≥ row.size() 的列不参与：旧句柄未提供，
+    ///            惰性默认值不校验——M1 边界）
+    /// \param self_row_no 更新场景的目标行号（排除自身当前条目）
+    /// \param has_self 是否为更新（true = 存在自身条目需排除）
+    Err CheckSecUnique(const std::vector<ColumnValue>& row, uint64_t self_row_no,
+                       bool has_self) const noexcept;
+
+    /// \brief 向（新）索引树灌入全部存活行的键（唯一索引带冲突校验）。
+    Err PopulateSecondaryIndex(shm_SecIdxMeta* meta, SecIndexTree* tree) noexcept;
 
     void* base_ = nullptr;
     infra::SlabShmAllocator* alloc_ = nullptr;
@@ -128,6 +282,9 @@ private:
     uint32_t nullmap_offset_ = 0;
     std::unique_ptr<MVarLenPool> var_pool_;
     std::unique_ptr<PrimaryIndexTree> index_;
+    /// 二级索引元数据（创建序）与树实例（平行；W5-d）。
+    std::vector<shm_SecIdxMeta*> sec_meta_;
+    std::vector<std::unique_ptr<SecIndexTree>> sec_trees_;
 };
 #if defined(_MSC_VER)
 #pragma warning(pop)

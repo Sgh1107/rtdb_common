@@ -19,6 +19,7 @@
 /// 不会观察到未初始化/半写入的描述符。
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string_view>
 
@@ -126,6 +127,15 @@ public:
     /// \param out_active_tables 可选输出：活跃表数
     /// \return kOk 或 kCorruption
     Err Validate(uint64_t* out_active_tables = nullptr) const noexcept;
+
+    /// \brief 遍历目录内全部表（含墓碑表；按表 id 升序）。
+    ///
+    /// 供开卷类操作（如二级索引延迟重建，M1-W5-d）枚举活跃表；
+    /// 墓碑表由调用方按 `state` 过滤（物理区待 compact 回收）。
+    /// 回调同步调用，`desc` 指针仅在回调执行期内有效。
+    /// \param fn void(uint64_t desc_off, const shm_TableDescriptor* desc)
+    /// \return kOk / kUnsupported（目录未布局）/ kInvalidArgument / kCorruption
+    Err ForEachTable(const std::function<void(uint64_t, const shm_TableDescriptor*)>& fn) const noexcept;
 
 private:
     Catalog() = default;
