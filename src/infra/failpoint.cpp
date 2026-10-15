@@ -40,6 +40,23 @@ inline std::string GetEnvCopy(const char* name) {
 #endif
 }
 
+#if defined(__GNUC__) && !defined(__clang__)
+extern "C" void __gcov_dump(void) __attribute__((weak));
+#endif
+
+/// 硬退出（kill -9 等价）：不析构静态对象、不跑 atexit。
+///
+/// 与 std::quick_exit 语义一致；区别仅在 gcov 插桩构建（MinGW/UCRT）下：
+/// libgcc 覆盖率运行时经退出转储链会触发 UCRT fast-fail(0xC0000409)，
+/// 使退出码退化为非预期值、且 .gcda 可能未落盘。故在 weak 符号可用时
+/// 先主动 __gcov_dump 再 _Exit——普通构建下 weak 引用为 null，零影响。
+[[noreturn]] inline void HardExit(int code) noexcept {
+#if defined(__GNUC__) && !defined(__clang__)
+    if (__gcov_dump) __gcov_dump();
+#endif
+    std::fflush(nullptr);
+    std::_Exit(code);
+}
 
 inline void ArmLocked(const std::string& name, Mode mode) {
     Map()[name] = mode;
@@ -109,7 +126,7 @@ void ResetFromEnv() {
 void CrashPoint(const char* name) {
     detail::ParseEnvOnce();
     if (!detail::AnyArmed().load(std::memory_order_relaxed)) return;
-    if (detail::ConsumeHit(name, Mode::kCrash)) std::quick_exit(kCrashExitCode);
+    if (detail::ConsumeHit(name, Mode::kCrash)) detail::HardExit(kCrashExitCode);
 }
 
 bool ErrorPoint(const char* name) {
