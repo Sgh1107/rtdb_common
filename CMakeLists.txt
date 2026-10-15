@@ -27,6 +27,9 @@ add_library(rtdbcore SHARED
   src/storage/var_pool.cpp
   src/storage/wal_ring.cpp
   src/storage/group_commit.cpp
+  src/storage/snapshot.cpp
+  src/storage/alter.cpp
+  src/storage/sec_index.cpp
 )
 if(WIN32)
   target_sources(rtdbcore PRIVATE
@@ -96,6 +99,7 @@ if(RTDB_BUILD_TESTS)
     tests/unit/test_catalog.cpp
     tests/unit/test_table_store.cpp
     tests/unit/test_wal.cpp
+    tests/unit/test_w5.cpp
   )
   target_link_libraries(rtdb_unit_tests PRIVATE rtdbcore GTest::gtest_main)
   target_include_directories(rtdb_unit_tests

@@ -21,6 +21,21 @@ inline constexpr const char* kCrashLockFlag = "--rtdb-child-crash-lock";
 /// 由 RTDB_FAILPOINTS 环境变量决定在哪个注入点硬退出。
 inline constexpr const char* kWalCrashFlag = "--rtdb-child-wal-crash";
 
+/// W5 冷快照崩溃注入子进程模式标记：main() 见到本参数即执行脚本化负载
+/// （建表 + 3 行插入 + CreateSnapshot），由 RTDB_FAILPOINTS 决定在哪个
+/// 注入点（snapshot.before_copy）硬退出。
+inline constexpr const char* kW5SnapFlag = "--rtdb-child-w5-snap";
+
+/// W5 在线加列崩溃注入子进程模式标记：main() 见到本参数即执行脚本化负载
+/// （建表 + 3 行插入 + AlterTableAddColumn），由 RTDB_FAILPOINTS 决定在
+/// 哪个注入点（alter.before_link）硬退出。
+inline constexpr const char* kW5AlterFlag = "--rtdb-child-w5-alter";
+
+/// W5 二级索引崩溃注入子进程模式标记：main() 见到本参数即执行脚本化负载
+/// （建表 + 3 行插入 + CreateSecondaryIndex），由 RTDB_FAILPOINTS 决定在
+/// 哪个注入点（secidx.before_link）硬退出。
+inline constexpr const char* kW5SecIdxFlag = "--rtdb-child-w5-secidx";
+
 /// 以 [kCrashLockFlag, extra_arg] 启动自身可执行文件并阻塞等待。
 SpawnOutcome SpawnSelfWithFlag(const std::string& exe, const std::string& extra_arg);
 

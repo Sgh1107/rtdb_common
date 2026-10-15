@@ -72,6 +72,14 @@ public:
 
     uint64_t Size() const noexcept { return slot_->count; }
 
+    /// 就地清空（根置零、计数归零）：旧节点不可达（页回收归 compact）。
+    /// 用于二级索引的全量重建（M1-W5-d）：各进程缓存的树实例按同一 Slot
+    /// 绑定，重建不可更换锚点指针，只能就地重置后重灌。
+    void Reset() noexcept {
+        slot_->root_off = 0;
+        slot_->count = 0;
+    }
+
     /// 调试/测试：遍历全树校验结构不变量（层级单调、节点内严格递增、
     /// 容量上界、叶链完整、跨叶有序）。
     Err Validate(uint64_t* visited_nodes) const noexcept;

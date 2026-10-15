@@ -10,6 +10,21 @@
 ///   注入点硬退出（failpoint kCrash 模式，quick_exit(9)）；未命中则
 ///   正常返回 0。父进程负责设置/清除环境变量并重开映像验证恢复语义。
 ///
+/// 用法三：rtdb_unit_tests --rtdb-child-w5-snap <image_path>
+///   W5 冷快照崩溃注入子进程（docs/06 §3 注入矩阵 snapshot 中点）：
+///   执行脚本化负载（建表 → 3 行插入 → CreateSnapshot），在
+///   RTDB_FAILPOINTS 指定的注入点（snapshot.before_copy）硬退出。
+///
+/// 用法四：rtdb_unit_tests --rtdb-child-w5-alter <image_path>
+///   W5 在线加列崩溃注入子进程（docs/06 §3 注入矩阵 alter 中点）：
+///   执行脚本化负载（建表 → 3 行插入 → AlterTableAddColumn），在
+///   RTDB_FAILPOINTS 指定的注入点（alter.before_link）硬退出。
+///
+/// 用法五：rtdb_unit_tests --rtdb-child-w5-secidx <image_path>
+///   W5 二级索引崩溃注入子进程（docs/06 §3 注入矩阵 secidx 中点）：
+///   执行脚本化负载（建表 → 3 行插入 → CreateSecondaryIndex），在
+///   RTDB_FAILPOINTS 指定的注入点（secidx.before_link）硬退出。
+///
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -81,6 +96,115 @@ int RunWalCrashChild(const std::string& file_path) {
     return 0;  // 注入点未命中，正常完成
 }
 
+/// W5 冷快照崩溃注入子进程：脚本化负载（建表 "t"：id i64 主键 + val i64，
+/// 3 行插入，随后 CreateSnapshot）。注入时序同 WAL 子进程：先解除注入
+/// 完成建表与行写，再经 ResetFromEnv 恢复规格，只作用于快照阶段。
+int RunW5SnapChild(const std::string& file_path) {
+    failpoint::ClearAll();  // 触发 env 解析后整体解除，保前置阶段无注入
+    rtdb::Options opts;
+    opts.instance_name = "w5_snap_child";
+    opts.file_path = file_path;
+    opts.initial_size_bytes = 2 * 1024 * 1024;
+    auto res = rtdb::Engine::Open(opts);
+    if (!res.IsOk()) return 3;
+    auto eng = res.TakeValue();
+
+    rtdb::TableDef def;
+    def.name = "t";
+    def.columns.push_back({"id", rtdb::DataType::kInt64, 0, false, false});
+    def.columns.push_back({"val", rtdb::DataType::kInt64, 0, true, false});
+    auto t = eng->CreateTable(def);
+    if (!t.IsOk()) return 4;
+    const rtdb::TableHandle table = t.Value();
+    for (int64_t i = 1; i <= 3; ++i) {
+        auto ins =
+            eng->Insert(table, {rtdb::ColumnValue::Int(i), rtdb::ColumnValue::Int(i * 10)});
+        if (!ins.IsOk()) return 5;
+    }
+
+    failpoint::ResetFromEnv();  // 恢复注入，只作用于快照阶段
+    auto snap = eng->CreateSnapshot();
+    if (!snap.IsOk()) return 6;  // 注入点未命中却失败 → 子进程异常
+    return 0;
+}
+
+/// W5 在线加列崩溃注入子进程：脚本化负载（建表 "t"：id i64 主键 + val i64，
+/// 3 行插入，随后 AlterTableAddColumn 追加 tag(i64, 默认 42)）。
+/// 注入时序同 WAL 子进程：先解除注入完成前置阶段，再经 ResetFromEnv
+/// 恢复规格，只作用于加列阶段。
+int RunW5AlterChild(const std::string& file_path) {
+    failpoint::ClearAll();  // 触发 env 解析后整体解除，保前置阶段无注入
+    rtdb::Options opts;
+    opts.instance_name = "w5_alter_child";
+    opts.file_path = file_path;
+    opts.initial_size_bytes = 2 * 1024 * 1024;
+    auto res = rtdb::Engine::Open(opts);
+    if (!res.IsOk()) return 3;
+    auto eng = res.TakeValue();
+
+    rtdb::TableDef def;
+    def.name = "t";
+    def.columns.push_back({"id", rtdb::DataType::kInt64, 0, false, false});
+    def.columns.push_back({"val", rtdb::DataType::kInt64, 0, true, false});
+    auto t = eng->CreateTable(def);
+    if (!t.IsOk()) return 4;
+    const rtdb::TableHandle table = t.Value();
+    for (int64_t i = 1; i <= 3; ++i) {
+        auto ins =
+            eng->Insert(table, {rtdb::ColumnValue::Int(i), rtdb::ColumnValue::Int(i * 10)});
+        if (!ins.IsOk()) return 5;
+    }
+
+    failpoint::ResetFromEnv();  // 恢复注入，只作用于加列阶段
+    rtdb::ColumnDef col;
+    col.name = "tag";
+    col.type = rtdb::DataType::kInt64;
+    col.nullable = true;
+    col.has_default = true;
+    col.default_value.is_null = false;
+    col.default_value.int_value = 42;
+    auto add = eng->AlterTableAddColumn(table, col);
+    if (!add.IsOk()) return 6;  // 注入点未命中却失败 → 子进程异常
+    return 0;
+}
+
+/// W5 二级索引崩溃注入子进程：脚本化负载（建表 "t"：id i64 主键 + val i64，
+/// 3 行插入，随后在 val 列创建非唯一二级索引 "idx_val"）。
+/// 注入时序同 WAL 子进程：先解除注入完成前置阶段，再经 ResetFromEnv
+/// 恢复规格，只作用于建索引阶段。
+int RunW5SecIdxChild(const std::string& file_path) {
+    failpoint::ClearAll();  // 触发 env 解析后整体解除，保前置阶段无注入
+    rtdb::Options opts;
+    opts.instance_name = "w5_secidx_child";
+    opts.file_path = file_path;
+    opts.initial_size_bytes = 2 * 1024 * 1024;
+    auto res = rtdb::Engine::Open(opts);
+    if (!res.IsOk()) return 3;
+    auto eng = res.TakeValue();
+
+    rtdb::TableDef def;
+    def.name = "t";
+    def.columns.push_back({"id", rtdb::DataType::kInt64, 0, false, false});
+    def.columns.push_back({"val", rtdb::DataType::kInt64, 0, true, false});
+    auto t = eng->CreateTable(def);
+    if (!t.IsOk()) return 4;
+    const rtdb::TableHandle table = t.Value();
+    for (int64_t i = 1; i <= 3; ++i) {
+        auto ins =
+            eng->Insert(table, {rtdb::ColumnValue::Int(i), rtdb::ColumnValue::Int(i * 10)});
+        if (!ins.IsOk()) return 5;
+    }
+
+    failpoint::ResetFromEnv();  // 恢复注入，只作用于建索引阶段
+    rtdb::SecondaryIndexDef idx;
+    idx.name = "idx_val";
+    idx.column_index = 1;
+    idx.unique = false;
+    auto cr = eng->CreateSecondaryIndex(table, idx);
+    if (!cr.IsOk()) return 6;  // 注入点未命中却失败 → 子进程异常
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -88,6 +212,12 @@ int main(int argc, char** argv) {
         return RunCrashLockChild(argv[2]);
     if (argc >= 3 && std::string(argv[1]) == rtdb_test::kWalCrashFlag)
         return RunWalCrashChild(argv[2]);
+    if (argc >= 3 && std::string(argv[1]) == rtdb_test::kW5SnapFlag)
+        return RunW5SnapChild(argv[2]);
+    if (argc >= 3 && std::string(argv[1]) == rtdb_test::kW5AlterFlag)
+        return RunW5AlterChild(argv[2]);
+    if (argc >= 3 && std::string(argv[1]) == rtdb_test::kW5SecIdxFlag)
+        return RunW5SecIdxChild(argv[2]);
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }
