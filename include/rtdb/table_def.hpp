@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace rtdb {
@@ -67,16 +68,53 @@ struct ColumnDef {
     ColumnDefault default_value;
 };
 
-/// \brief 宿主侧建表定义（docs/03 §4.2 `TableDef` 的 M1 子集）。
+/// \brief 二级索引定义（M2：`TableDef::secondary` 入参元素，按列名寻址）。
+///
+/// 语义与 M1 的 `SecondaryIndexDef`（按列序号）一致，此处按列名声明更贴合
+/// docs/04 §2 的规范表述；`Engine::CreateSecondaryIndex` 仍接
+/// `SecondaryIndexDef`（存量 API 不动）。
+struct IndexDef {
+    /// 索引名（表内唯一，非空，长度限制见 `kMaxColNameBytes - 1`）。
+    std::string_view name;
+
+    /// 被索引列名序列（M2 仅支持单列；多列返回 kUnsupported）。
+    std::vector<std::string_view> columns;
+
+    /// 是否唯一索引（true 时同值只允许一行；NULL 不入索引、不参与唯一性）。
+    bool unique = false;
+};
+
+/// \brief 宿主侧建表定义（docs/03 §4.2 `TableDef` 的 M1 子集 + M2 规范面对齐，
+/// docs/10 §2-M2-D1）。
 struct TableDef {
     /// 表名（UTF-8，非空，长度限制见 `kMaxTableNameBytes - 1`）。
     std::string name;
 
-    /// 行槽容量；0 表示由引擎取默认值（`kDefaultRowCap`）。
-    uint32_t row_cap = 0;
-
     /// 列定义序列（至少 1 列，不超过 `kMaxInitCols`）。
     std::vector<ColumnDef> columns;
+
+    /// 主键列名（M2，docs/04 §2）。空 = 列 0 隐式主键（M1 语义）；
+    /// 显式声明时须解析到列 0 且满足整数类/非空约束，其余（多列或非
+    /// 列 0）返回 `kUnsupported`——复合主键与任意位置主键随段目录化
+    /// 复评（docs/10 §2-M2-D5）。
+    std::vector<std::string_view> primary_key;
+
+    /// 建表直建二级索引（M2 便利面，docs/04 §2）。等价于建表后逐个
+    /// `CreateSecondaryIndex`；为空时不建。单个索引语义同
+    /// `CreateSecondaryIndex`（M2 仅单列，多列 kUnsupported）。
+    std::vector<IndexDef> secondary;
+
+    /// 行槽容量提示（docs/04 §2 `max_rows_hint`）；0 = 引擎取默认值
+    /// （`kDefaultRowCap`）。两道 M1 闸门（超出均返回 `kLimitExceeded`）：
+    /// ① `kMaxRowCap`（8192，版本数组须容身单次 slab 分配 ≤64KB）；
+    /// ② `rec_fixed_len × row_cap ≤ kMaxRowDataBytes`（64KB 行数据区，
+    /// 按列宽折算实际可行容量——宽表的可行值远小于 8192）。
+    /// 段目录化复评见 docs/10 §2-M2-D5。与 `row_cap` 同时非零且不一致时
+    /// kInvalidArgument。
+    size_t max_rows_hint = 0;
+
+    /// 行槽容量直填（M1 字段，保留）；0 表示按 `max_rows_hint` / 默认值。
+    uint32_t row_cap = 0;
 };
 
 /// \brief 二级索引定义（`Engine::CreateSecondaryIndex` 入参；M1-W5 框架）。

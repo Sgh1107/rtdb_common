@@ -85,8 +85,8 @@ protected:
 
     rtdb::Options Opts() const {
         rtdb::Options opts;
-        opts.instance_name = "w5_snap_a";
-        opts.file_path = kImage;
+        opts.instance = "w5_snap_a";
+        opts.path = kImage;
         opts.initial_size_bytes = 2ull << 20;
         opts.role = rtdb::Role::Standalone;
         return opts;
@@ -175,8 +175,8 @@ TEST_F(W5SnapshotTest, SnapshotCopyIsLoadableImage) {
         ASSERT_TRUE(snap.IsOk());
     }
     rtdb::Options sopts;
-    sopts.instance_name = "w5_snap_copy";  // 区别于活映像实例名
-    sopts.file_path = kSnap;
+    sopts.instance = "w5_snap_copy";  // 区别于活映像实例名
+    sopts.path = kSnap;
     sopts.initial_size_bytes = 2ull << 20;
     auto open = rtdb::Engine::Open(sopts);
     ASSERT_TRUE(open.IsOk()) << rtdb::ErrorMessage(open.Error());
@@ -205,8 +205,8 @@ TEST_F(W5SnapshotTest, ReaderCannotSnapshot) {
         ASSERT_TRUE(snap.IsOk());
     }
     rtdb::Options ropts;
-    ropts.instance_name = "w5_snap_reader";
-    ropts.file_path = kImage;
+    ropts.instance = "w5_snap_reader";
+    ropts.path = kImage;
     ropts.initial_size_bytes = 2ull << 20;
     ropts.role = rtdb::Role::Reader;
     auto open = rtdb::Engine::Open(ropts);
@@ -293,8 +293,8 @@ protected:
 
     rtdb::Options Opts() const {
         rtdb::Options opts;
-        opts.instance_name = "w5_snap_crash";
-        opts.file_path = kImage;
+        opts.instance = "w5_snap_crash";
+        opts.path = kImage;
         opts.initial_size_bytes = 2ull << 20;
         opts.role = rtdb::Role::Standalone;
         return opts;
@@ -355,8 +355,8 @@ protected:
 
     rtdb::Options Opts() const {
         rtdb::Options opts;
-        opts.instance_name = "w5_alter_a";
-        opts.file_path = kImage;
+        opts.instance = "w5_alter_a";
+        opts.path = kImage;
         opts.initial_size_bytes = 2ull << 20;
         opts.role = rtdb::Role::Standalone;
         return opts;
@@ -677,8 +677,8 @@ TEST_F(W5AlterTest, AddColumnThenSnapshotRoundTrip) {
 
     // 副本独立挂载：ext 语义一致。
     rtdb::Options sopts;
-    sopts.instance_name = "w5_alter_snap_copy";
-    sopts.file_path = kSnap;
+    sopts.instance = "w5_alter_snap_copy";
+    sopts.path = kSnap;
     sopts.initial_size_bytes = 2ull << 20;
     auto copen = rtdb::Engine::Open(sopts);
     ASSERT_TRUE(copen.IsOk()) << rtdb::ErrorMessage(copen.Error());
@@ -704,8 +704,8 @@ protected:
 
     rtdb::Options Opts() const {
         rtdb::Options opts;
-        opts.instance_name = "w5_alter_crash";
-        opts.file_path = kImage;
+        opts.instance = "w5_alter_crash";
+        opts.path = kImage;
         opts.initial_size_bytes = 2ull << 20;
         opts.role = rtdb::Role::Standalone;
         return opts;
@@ -759,8 +759,8 @@ protected:
 
     rtdb::Options Opts() const {
         rtdb::Options opts;
-        opts.instance_name = "w5_scan_a";
-        opts.file_path = kImage;
+        opts.instance = "w5_scan_a";
+        opts.path = kImage;
         opts.initial_size_bytes = 4ull << 20;
         opts.role = rtdb::Role::Standalone;
         return opts;
@@ -943,8 +943,8 @@ TEST_F(W5ScanTest, ReaderCanScan) {
         for (int64_t i = 1; i <= 4; ++i) ASSERT_TRUE(eng->Insert(t, Row(i, i * 10)).IsOk());
     }
     rtdb::Options ropts;
-    ropts.instance_name = "w5_scan_reader";
-    ropts.file_path = kImage;
+    ropts.instance = "w5_scan_reader";
+    ropts.path = kImage;
     ropts.initial_size_bytes = 4ull << 20;
     ropts.role = rtdb::Role::Reader;
     auto open = rtdb::Engine::Open(ropts);
@@ -1001,8 +1001,8 @@ protected:
 
     rtdb::Options Opts() const {
         rtdb::Options opts;
-        opts.instance_name = "w5_secidx_a";
-        opts.file_path = kImage;
+        opts.instance = "w5_secidx_a";
+        opts.path = kImage;
         opts.initial_size_bytes = 4ull << 20;
         opts.role = rtdb::Role::Standalone;
         return opts;
@@ -1253,8 +1253,8 @@ TEST_F(W5SecIdxTest, SecIdxSnapshotRoundTrip) {
     }
     // 副本独立挂载：Open 时同样重建 → 可查、可继续写。
     rtdb::Options sopts;
-    sopts.instance_name = "w5_secidx_copy";
-    sopts.file_path = kSnap;
+    sopts.instance = "w5_secidx_copy";
+    sopts.path = kSnap;
     sopts.initial_size_bytes = 4ull << 20;
     auto copen = rtdb::Engine::Open(sopts);
     ASSERT_TRUE(copen.IsOk()) << rtdb::ErrorMessage(copen.Error());
@@ -1281,8 +1281,8 @@ TEST_F(W5SecIdxTest, ReaderCanQuerySecondary) {
         ASSERT_TRUE(eng->CreateSecondaryIndex(t, SecIdx("idx_val", 1, false)).IsOk());
     }
     rtdb::Options ropts;
-    ropts.instance_name = "w5_secidx_reader";
-    ropts.file_path = kImage;
+    ropts.instance = "w5_secidx_reader";
+    ropts.path = kImage;
     ropts.initial_size_bytes = 4ull << 20;
     ropts.role = rtdb::Role::Reader;
     auto open = rtdb::Engine::Open(ropts);
@@ -1334,8 +1334,8 @@ protected:
 
     rtdb::Options Opts() const {
         rtdb::Options opts;
-        opts.instance_name = "w5_secidx_crash";
-        opts.file_path = kImage;
+        opts.instance = "w5_secidx_crash";
+        opts.path = kImage;
         opts.initial_size_bytes = 2ull << 20;
         opts.role = rtdb::Role::Standalone;
         return opts;

@@ -294,8 +294,8 @@ protected:
 
     rtdb::Options MakeOpts(rtdb::Role role = rtdb::Role::Standalone) {
         rtdb::Options opts;
-        opts.instance_name = "catalog_test";
-        opts.file_path = kImage;
+        opts.instance = "catalog_test";
+        opts.path = kImage;
         opts.initial_size_bytes = 1ull << 20;
         opts.role = role;
         return opts;

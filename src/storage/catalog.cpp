@@ -145,6 +145,11 @@ Result<uint64_t> Catalog::CreateTable(const TableDef& def) noexcept {
     if (root_->table_count >= sb_->max_tables) return Result<uint64_t>::Fail(Err::kLimitExceeded);
 
     // ---- 主键约束（M1）：列 0 为整数类定长类型且 NOT NULL ----
+    // M2：primary_key 显式声明时须解析到列 0（复合/非列 0 主键随段目录化
+    // 复评，docs/10 §2-M2-D1/M2-D5）。
+    if (def.primary_key.size() > 1) return Result<uint64_t>::Fail(Err::kUnsupported);
+    if (!def.primary_key.empty() && def.primary_key[0] != def.columns[0].name)
+        return Result<uint64_t>::Fail(Err::kUnsupported);
     if (!IsSupportedPrimaryKeyType(def.columns[0].type))
         return Result<uint64_t>::Fail(Err::kUnsupported);
     if (def.columns[0].nullable) return Result<uint64_t>::Fail(Err::kInvalidArgument);
@@ -155,9 +160,16 @@ Result<uint64_t> Catalog::CreateTable(const TableDef& def) noexcept {
     uint64_t existing_id = 0;
     if (name_tree_->Find(name_key, &existing_id)) return Result<uint64_t>::Fail(Err::kTableExists);
 
-    // ---- 行布局计算 ----
-    const uint32_t row_cap = def.row_cap == 0 ? kDefaultRowCap : def.row_cap;
-    if (row_cap == 0) return Result<uint64_t>::Fail(Err::kInvalidArgument);
+    // ---- 行布局计算（row_cap 直填优先，否则 max_rows_hint，再默认）----
+    if (def.row_cap != 0 && def.max_rows_hint != 0 && def.row_cap != def.max_rows_hint)
+        return Result<uint64_t>::Fail(Err::kInvalidArgument);
+    uint32_t row_cap = def.row_cap;
+    if (row_cap == 0 && def.max_rows_hint != 0) {
+        if (def.max_rows_hint > kMaxRowCap) return Result<uint64_t>::Fail(Err::kLimitExceeded);
+        row_cap = static_cast<uint32_t>(def.max_rows_hint);
+    }
+    if (row_cap == 0) row_cap = kDefaultRowCap;
+    if (row_cap > kMaxRowCap) return Result<uint64_t>::Fail(Err::kLimitExceeded);
 
     std::unique_ptr<uint32_t[]> col_offsets(new uint32_t[col_count]);
     const RowLayoutPlan plan =

@@ -17,28 +17,32 @@ enum class Role : uint8_t {
     Reader = 2,
 };
 
-/// WAL 刷盘策略（M1 生效；当前阶段仅随元数据持久化）。参考 docs/03 §3.2。
+/// WAL 刷盘策略（M1 生效，三档语义见 docs/08 §2-D1）。
 enum class FsyncPolicy : uint8_t {
     Never = 0,
     PerSecond = 1,
     Always = 2,
 };
 
-/// Engine 打开参数。
+/// Engine 打开参数（字段命名对齐 docs/04 §3 规范表述；M2 收敛，库未发行
+/// 无外部用户，直接改名，见 docs/10 §2-M2-D1）。
 struct Options {
     /// 实例名：用作命名对象前缀与日志标识（不含路径分隔符）。
-    std::string instance_name;
+    std::string instance;
 
     /// 数据映像文件路径。内置文件映射共享内存的持久化载体，
     /// 同一文件的多次打开即多进程共享同一数据区。
-    std::string file_path;
+    std::string path;
 
     /// 新建映像时的目标大小（含头部）。实际实现按需扩段时上限另议；
     /// 对已存在文件此参数被忽略。
     uint64_t initial_size_bytes = 64ull * 1024 * 1024;
 
     Role role = Role::Standalone;
-    FsyncPolicy fsync = FsyncPolicy::PerSecond;
+
+    /// WAL 持久化档位（默认 per_second：写入页缓存即返回，后台节流 flush；
+    /// 进程崩溃零丢失，断电丢最近 ≤1s 窗口。见 docs/08 §2-D1 三档表）。
+    FsyncPolicy wal_fsync = FsyncPolicy::PerSecond;
 };
 
 }  // namespace rtdb

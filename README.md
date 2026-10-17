@@ -23,19 +23,26 @@
 6. [测试与质量保障](docs/06_测试与质量保障.md)
 7. [M0 里程碑交付说明](docs/07_M0里程碑交付说明.md) —— M0 做了什么、编译运行与测试的预期结果
 8. [M1 引擎开发计划](docs/08_M1引擎开发计划.md) —— M1 周计划、核心技术决策（WAL 持久化语义等）与 wal-kv 经验移植
+9. [M1 里程碑交付说明](docs/09_M1交付说明.md) —— M1 交付清单、四构建矩阵、混沌×100、覆盖率与 bench 实测证据
+10. [M2 接口开发计划](docs/10_M2接口开发计划.md) —— M2 周计划与 NativeApi/CAbi/RecordBlock/Result 收敛决策
 
-## 当前状态（M0 已验收 · M1-W4 完成并本机验证 · 2026-10）
+## 当前状态（M0 已验收 · M1 已验收 · M2-W1 进行中 · 2026-10）
 
 platform/infra 全部组件、SharedBTree、Slab 分配器完成并通过 **M0 验收**
 （验收记录见 [docs/05 §3.1](docs/05_交付清单与里程碑计划.md)，里程碑交付说明见
 [docs/07](docs/07_M0里程碑交付说明.md)），里程碑标记 `m0`。
-**M1 引擎进行中（W1~W4 已落地，单测 83 用例，Windows Release/Debug 双配置 83/83
-全绿零告警）**：D1 拍板固化（映像内 WalRing + 三档持久化语义）、SuperBlock v2、
-Err 3xx 段、storage schema 类型系统与行布局计算、MVarLenPool 变长池、
-**表目录（双 B+ 树 + 建删表事务）**、**行 CRUD（主键唯一索引 + 版本乐观读 +
-墓碑删除 + 变长池回收）**、**WAL 组提交（影像内 WalRing + 覆盖协议 + 三档 fsync +
-`ExecuteBatch` 原子批 + 崩溃恢复重放 + failpoint 注入框架）**；计划、落地记录与
-本机验证记录见 [docs/08](docs/08_M1引擎开发计划.md)。
+**M1 引擎已验收关闭（2026-10-14，单测 113 用例）**：表目录（双 B+ 树 + 建删表
+事务）、行 CRUD（主键唯一索引 + 版本乐观读 + 墓碑删除）、WAL 组提交（影像内
+WalRing + 覆盖协议 + 三档 fsync + `ExecuteBatch` 原子批 + 崩溃恢复重放 +
+failpoint 注入）、冷快照、在线加列、范围扫描、二级索引框架——出口标准两条
+（kill -9 混沌 ×100 verify 100/100 PASS、CRUD 全链路单测绿）+ 覆盖率门禁
+（95.9%/91.0%/93.9%）+ bench 五项优于基线，四构建全绿零告警，证据见
+[docs/09](docs/09_M1交付说明.md)。
+**M2 接口进行中（W1 NativeApi 收敛）**：伞头 `rtdb/rtdb.hpp`、Options 字段
+对齐 docs/04、`TableDef` 扩展（primary_key/secondary/max_rows_hint）、
+`Row`/`TableHandle::Upsert` 便利面、`Result` operator* 与
+RTDB_CHECK/RTDB_ASSIGN_OR_MOVE 宏、验收程序 `examples/api_demo`；
+计划与决策见 [docs/10](docs/10_M2接口开发计划.md)。
 
 | 组件 | 位置 | 状态 |
 |---|---|---|

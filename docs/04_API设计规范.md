@@ -33,34 +33,49 @@ using RowId = int64;
 
 ```cpp
 #include <rtdb/rtdb.hpp>
-int main() {
+
+// RTDB_CHECK / RTDB_ASSIGN_OR_MOVE 契约：所在函数返回 Err（main 内经
+// 静态 Run 函数中转），失败即以错误码返回——见 result.hpp 注释。
+static rtdb::Err Run() {
     rtdb::Options opt{ .instance="plant1", .role=rtdb::Role::Writer,
-                       .path="./data/plant1.rtdb", .wal_fsync=FsyncPolicy::PerSecond };
+                       .path="./data/plant1.rtdb", .wal_fsync=rtdb::FsyncPolicy::PerSecond };
     RTDB_ASSIGN_OR_MOVE(auto eng, rtdb::Engine::Open(opt));
 
-    static const rtdb::ColumnDef kCols[] = {
-        {"id",   rtdb::DataType::Int64,  0, false},
-        {"val",  rtdb::DataType::Float64,0, true },
-        {"desc", rtdb::DataType::String, 64,true },
+    const std::vector<rtdb::ColumnDef> cols = {
+        {"id",   rtdb::DataType::kInt64,  0, false, false, {}},
+        {"val",  rtdb::DataType::kFloat64,0, true,  false, {}},
+        {"desc", rtdb::DataType::kUtf8Var,0, true,  false, {}},
     };
-    RTDB_CHECK(eng.CreateTable({.name="measure", .columns=kCols,
-                                .primary_key={{"id"}}, .max_rows_hint=1000000}));
+    RTDB_CHECK(eng->CreateTable({.name="measure", .columns=cols,
+                                 .primary_key={{"id"}}, .max_rows_hint=2048}));
 
-    auto tbl = *eng.OpenTable("measure");
-    // 单条 upsert（免锁乐观读，失败自动重试）
+    auto tbl = *eng->OpenTable("measure");
+    // 单条 upsert（存在则按所给列合并覆盖，不存在则插入）
     tbl.Upsert(rtdb::Row{{"id", int64_t{42}}, {"val", 220.5}});
 
-    // 百万级批量入口：列式块
-    rtdb::RecordBlock blk("measure", 100000);
+    // 百万级批量入口：列式块（M2-W2 落地）
+    rtdb::RecordBlock blk("measure", 512);
     blk.AppendColumn("id", ids).AppendColumn("val", vals);
-    auto n = eng.UpsertBatch(blk);
+    auto n = eng->UpsertBatch(blk);
 
-    // 订阅：纳秒序列号游标增量推送（本机事件唤醒，非轮询）
-    rtdb::ChangeCursor cur = eng.Subscribe({"measure"});
-    while (auto delta = cur.Next(std::chrono::milliseconds(50)))
-        for (auto& chg : *delta) /* ... */;
+    // 订阅：纳兹序列号游标增量推送（M3，本示例不含；engine 的 WalRing
+    // 与 committed_seq 基座 M1 已就绪，只差会话层）
+    // rtdb::ChangeCursor cur = eng.Subscribe({"measure"});
+    // while (auto delta = cur.Next(std::chrono::milliseconds(50)))
+    //     for (auto& chg : *delta) /* ... */;
+    return rtdb::Err::kOk;
 }
 ```
+
+> **M2 收敛说明（2026-10，docs/10 §2-M2-D1，验收程序 `examples/api_demo`）**：
+> ① `columns` 落定为 `std::vector<ColumnDef>`（原规范的 span 写法迁移成本高于
+> 收益，记录在案）；② 变长列 `len` 必须为 0（M1 语义，单列长度上限约束列入
+> 复评清单）；③ `max_rows_hint` 受两道 M1 闸门限制（`kMaxRowCap=8192` 与
+> 行数据区 `rec_fixed_len × row_cap ≤ 64KB`），上例 3 列约 32B/行取 2048，
+> 百万级提示随段目录化复评开放；④ `RecordBlock`/`UpsertBatch` 段落在 M2-W2
+> 落地（C 侧对应 `rtdb_abi_upsert_block`）；⑤ 订阅族归 M3（docs/05 §3）；
+> ⑥ 本库标准为 C++17，指示器初始化（ designated initializers ）在 MSVC 需
+> C++20，验收程序按聚合赋值形态落定（不依赖编译器扩展）。
 
 ## 4. C ABI 面（导出符号前缀 `rtdb_abi_`）
 ```c

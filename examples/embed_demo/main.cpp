@@ -9,8 +9,8 @@ int main(int argc, char** argv) {
     const char* image_path = argc > 1 ? argv[1] : "demo_instance.rtdb";
 
     rtdb::Options opts;
-    opts.instance_name = "demo";
-    opts.file_path = image_path;
+    opts.instance = "demo";
+    opts.path = image_path;
     opts.initial_size_bytes = 8 * 1024 * 1024;
     opts.role = rtdb::Role::Standalone;
 

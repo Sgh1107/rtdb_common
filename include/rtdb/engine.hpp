@@ -115,6 +115,12 @@ public:
     /// \return 分配到的行槽号
     Result<uint64_t> Insert(const TableHandle& table, const std::vector<ColumnValue>& row);
 
+    /// \brief upsert 一行（M2，docs/04 §3 便利面；语义同
+    /// `TableHandle::Upsert`）：存在则按所给列合并覆盖，不存在则插入。
+    /// \param row 按列名定位的部分行（须含主键列）
+    /// \return 行槽号
+    Result<uint64_t> Upsert(const TableHandle& table, const Row& row);
+
     /// \brief 按主键读取整行（免锁乐观读，返回自持有值）。
     ///
     /// 返回列数 = 句柄可见列数（建表列 + 句柄绑定时刻的扩展列）；
@@ -123,9 +129,10 @@ public:
     Result<std::vector<ColumnValue>> GetByKey(const TableHandle& table, const ColumnValue& key);
 
     /// \brief 按主键整行覆盖更新（主键不可变更；值须置于 row[0]）。
+    /// \param out_row_no 可选输出：目标行槽号（M2 upsert 合并路径用）
     /// \return kOk / kNotFound（行不存在）/ kInvalidArgument / kReadOnlyHandle
     Result<void> UpdateByKey(const TableHandle& table, const ColumnValue& key,
-                             const std::vector<ColumnValue>& row);
+                             const std::vector<ColumnValue>& row, uint64_t* out_row_no = nullptr);
 
     /// \brief 按主键删除行（置墓碑并摘除索引键；行槽待 compact 回收）。
     /// \return kOk；行不存在返回 `kNotFound`

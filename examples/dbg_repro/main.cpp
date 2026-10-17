@@ -35,11 +35,11 @@ int main(int argc, char** argv) {
     const std::string image = argv[1];
 
     rtdb::Options opts;
-    opts.instance_name = "dbg_repro";
-    opts.file_path = image;
+    opts.instance = "dbg_repro";
+    opts.path = image;
     opts.initial_size_bytes = 2ull << 20;
     opts.role = rtdb::Role::Standalone;
-    opts.fsync = rtdb::FsyncPolicy::Always;
+    opts.wal_fsync = rtdb::FsyncPolicy::Always;
 
     auto open_res = rtdb::Engine::Open(opts);
     if (!open_res.IsOk()) {

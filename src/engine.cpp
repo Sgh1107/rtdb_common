@@ -1,5 +1,6 @@
 #include "rtdb/engine.hpp"
 
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -28,7 +29,7 @@ inline constexpr uint32_t kEngineLockTimeoutMs = 5000;
 }  // namespace
 
 struct Engine::Impl {
-    /// 映像文件路径（冷快照拷贝的派生基准；由 Options.file_path 带入）。
+    /// 映像文件路径（冷快照拷贝的派生基准；由 Options.path 带入）。
     std::string image_path;
     std::unique_ptr<ShmRegion> region;
     std::unique_ptr<storage::Catalog> catalog;
@@ -206,15 +207,15 @@ Engine::Engine(Engine&&) noexcept = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
 
 Result<std::unique_ptr<Engine>> Engine::Open(const Options& opts) {
-    if (opts.instance_name.empty() || opts.file_path.empty())
+    if (opts.instance.empty() || opts.path.empty())
         return Result<std::unique_ptr<Engine>>::Fail(Err::kInvalidArgument);
     // 头部 + 元数据分区之后至少要有一点可分配空间。
     if (opts.initial_size_bytes < static_cast<uint64_t>(layout::kDataStartOffset) + 4096)
         return Result<std::unique_ptr<Engine>>::Fail(Err::kIncompatibleLayout);
 
     ShmRegionParams rp;
-    rp.map_name = "rtdb_" + opts.instance_name;
-    rp.file_path = opts.file_path;
+    rp.map_name = "rtdb_" + opts.instance;
+    rp.file_path = opts.path;
     rp.size_bytes = opts.initial_size_bytes;
     switch (opts.role) {
         case Role::Writer:
@@ -229,11 +230,11 @@ Result<std::unique_ptr<Engine>> Engine::Open(const Options& opts) {
             break;
     }
     rp.role = opts.role;
-    rp.fsync = opts.fsync;
+    rp.fsync = opts.wal_fsync;
 
     auto engine = std::unique_ptr<Engine>(new Engine());
     engine->impl_.reset(new Impl());
-    engine->impl_->image_path = opts.file_path;
+    engine->impl_->image_path = opts.path;
     auto region_res = ShmRegion::Open(rp);
     if (!region_res.IsOk()) return Result<std::unique_ptr<Engine>>::Fail(region_res.Error());
     engine->impl_->region = region_res.TakeValue();
@@ -271,7 +272,7 @@ Result<std::unique_ptr<Engine>> Engine::Open(const Options& opts) {
         const Err rebuild_err = engine->impl_->RebuildSecondaryIndexes();
         if (!IsOk(rebuild_err)) return Result<std::unique_ptr<Engine>>::Fail(rebuild_err);
 
-        engine->impl_->commit.reset(new storage::GroupCommit(region, sb, opts.fsync));
+        engine->impl_->commit.reset(new storage::GroupCommit(region, sb, opts.wal_fsync));
         region->Flush();  // 环偏移/CRC 与恢复后的水位字段落盘
     }
 
@@ -311,6 +312,26 @@ Result<TableHandle> Engine::CreateTable(const TableDef& def) {
         return Result<TableHandle>::Fail(Err::kReadOnlyHandle);
     if (impl_->ring != nullptr && impl_->ring->poisoned())
         return Result<TableHandle>::Fail(Err::kPoisoned);
+
+    // ---- M2：TableDef.secondary 前置校验（docs/10 §2-M2-D1）----
+    // 列名在 def.columns 上解析（单列约束）；索引名格式与列类型由 store 层
+    // CreateSecondaryIndex 复核；索引间重名在此拦截（kAlreadyExists）。
+    for (const IndexDef& idx : def.secondary) {
+        if (idx.columns.size() != 1) return Result<TableHandle>::Fail(Err::kUnsupported);
+        bool found = false;
+        for (const ColumnDef& col : def.columns) {
+            if (col.name == idx.columns[0]) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return Result<TableHandle>::Fail(Err::kInvalidArgument);
+        for (const IndexDef& other : def.secondary) {
+            if (&other != &idx && other.name == idx.name)
+                return Result<TableHandle>::Fail(Err::kAlreadyExists);
+        }
+    }
+
     infra::ShmRootMutexGuard guard(impl_->region->root_mutex(), kEngineLockTimeoutMs);
     if (!guard.locked()) return Result<TableHandle>::Fail(guard.error());
 
@@ -337,9 +358,39 @@ Result<TableHandle> Engine::CreateTable(const TableDef& def) {
         }
     }
 
-    return Result<TableHandle>::Ok(MakeHandle(static_cast<int64_t>(desc->table_id), desc->name,
-                                              desc->data_layout_ver, desc->col_count,
-                                              desc->ext_col_count, desc->row_cap, desc_off));
+    // ---- M2：建表直建二级索引（TableDef.secondary 便利面）----
+    // 崩溃安全序与 CreateSecondaryIndex 相同（分配 → populate → 挂链，
+    // 不写 WAL，由写侧 Open 全量重建兜底）；失败回滚建表（墓碑 + 摘名，
+    // 物理区泄漏同 DropTable 既有语义，待 compact）。
+    for (const IndexDef& idx : def.secondary) {
+        uint32_t col_index = 0;
+        for (size_t i = 0; i < def.columns.size(); ++i) {
+            if (def.columns[i].name == idx.columns[0]) {
+                col_index = static_cast<uint32_t>(i);
+                break;
+            }
+        }
+        SecondaryIndexDef sidx;
+        sidx.name = std::string(idx.name);
+        sidx.column_index = col_index;
+        sidx.unique = idx.unique;
+        auto store_res = impl_->StoreFor(desc_off, static_cast<int64_t>(desc->table_id));
+        if (!store_res.IsOk()) {
+            impl_->catalog->DropTable(def.name);
+            return Result<TableHandle>::Fail(store_res.Error());
+        }
+        const Err ierr = store_res.Value()->CreateSecondaryIndex(sidx);
+        if (!IsOk(ierr)) {
+            impl_->catalog->DropTable(def.name);
+            return Result<TableHandle>::Fail(ierr);
+        }
+    }
+
+    TableHandle handle = MakeHandle(static_cast<int64_t>(desc->table_id), desc->name,
+                                    desc->data_layout_ver, desc->col_count, desc->ext_col_count,
+                                    desc->row_cap, desc_off);
+    handle.set_engine(this);
+    return Result<TableHandle>::Ok(std::move(handle));
 }
 
 Result<TableHandle> Engine::OpenTable(std::string_view name) {
@@ -350,9 +401,11 @@ Result<TableHandle> Engine::OpenTable(std::string_view name) {
     const uint64_t desc_off = desc_res.Value();
     const storage::shm_TableDescriptor* desc = impl_->catalog->Descriptor(desc_off);
     if (desc == nullptr) return Result<TableHandle>::Fail(Err::kCorruption);
-    return Result<TableHandle>::Ok(MakeHandle(static_cast<int64_t>(desc->table_id), desc->name,
-                                              desc->data_layout_ver, desc->col_count,
-                                              desc->ext_col_count, desc->row_cap, desc_off));
+    TableHandle handle = MakeHandle(static_cast<int64_t>(desc->table_id), desc->name,
+                                    desc->data_layout_ver, desc->col_count, desc->ext_col_count,
+                                    desc->row_cap, desc_off);
+    handle.set_engine(this);
+    return Result<TableHandle>::Ok(std::move(handle));
 }
 
 Result<void> Engine::DropTable(std::string_view name) {
@@ -427,13 +480,136 @@ Result<uint64_t> Engine::Insert(const TableHandle& table, const std::vector<Colu
         }
     }
     // flush 在根锁之外流水线化（组提交聚合，docs/08 §2-D2）。
-    // flush 在根锁之外流水线化（组提交聚合，docs/08 §2-D2）。
     // always 档 flush 失败/超时 = 持久化承诺破裂 → 毒化拒写。
     if (res.IsOk() && impl_->commit != nullptr && commit_seq != 0) {
         const Err fe = impl_->commit->OnCommit(commit_seq);
         if (!IsOk(fe)) impl_->Poison();
     }
     return res;
+}
+
+// ---- M2：upsert 便利面（docs/04 §3 `tbl.Upsert(Row)`，docs/10 §2-M2-D1）----
+// 语义：存在则按所给列**合并**覆盖（未提供列保持原值），不存在则插入
+// （未提供列按 schema 填充：nullable → NULL；非空且无默认值 →
+// kInvalidArgument）。合并路径为"读-改-写"非原子（Standalone 单写者
+// 语义下等价；并发写者以最后一次覆盖为准，记录在案）。
+Result<uint64_t> Engine::Upsert(const TableHandle& table, const Row& row) {
+    if (!impl_ || !impl_->catalog) return Result<uint64_t>::Fail(Err::kUnsupported);
+    if (!table.IsValid()) return Result<uint64_t>::Fail(Err::kInvalidArgument);
+    if (impl_->region->allocator() == nullptr) return Result<uint64_t>::Fail(Err::kReadOnlyHandle);
+    if (impl_->ring != nullptr && impl_->ring->poisoned())
+        return Result<uint64_t>::Fail(Err::kPoisoned);
+    if (row.empty()) return Result<uint64_t>::Fail(Err::kInvalidArgument);
+
+    auto store_res = impl_->StoreFor(table.desc_off(), table.table_id());
+    if (!store_res.IsOk()) return Result<uint64_t>::Fail(store_res.Error());
+    const storage::shm_TableDescriptor* desc = store_res.Value()->descriptor();
+    const uint32_t visible = table.visible_column_count();
+
+    // ---- 可见列元数据（名 / 可空 / 默认值；init 列 + ext 列两段收集）----
+    struct ColMeta {
+        const char* name = nullptr;
+        bool nullable = false;
+        bool has_default = false;
+        bool default_is_null = false;
+        uint64_t default_raw = 0;
+        DataType type = DataType::kInt64;
+    };
+    std::vector<ColMeta> meta(visible);
+    for (uint32_t i = 0; i < visible && i < desc->col_count; ++i) {
+        meta[i].name = desc->cols[i].name;
+        meta[i].nullable = desc->cols[i].nullable != 0;
+        meta[i].type = static_cast<DataType>(desc->cols[i].type);
+    }
+    if (visible > desc->col_count) {
+        std::vector<storage::shm_ExtColRegion*> regions;
+        if (!IsOk(storage::WalkExtColumns(impl_->region->base_address(), desc, &regions)))
+            return Result<uint64_t>::Fail(Err::kCorruption);
+        for (storage::shm_ExtColRegion* r : regions) {
+            if (r->col >= desc->col_count && r->col < visible) {
+                meta[r->col].name = r->name;
+                meta[r->col].nullable = r->nullable != 0;
+                meta[r->col].has_default = r->has_default != 0;
+                meta[r->col].default_is_null = r->default_is_null != 0;
+                meta[r->col].default_raw = r->default_value;
+                meta[r->col].type = static_cast<DataType>(r->type);
+            }
+        }
+        for (uint32_t i = desc->col_count; i < visible; ++i) {
+            if (meta[i].name == nullptr) return Result<uint64_t>::Fail(Err::kCorruption);
+        }
+    }
+
+    // ---- Row 校验：列名须在可见集内、不得重名、主键列（列 0）必给 ----
+    std::vector<const ColumnValue*> provided(visible, nullptr);
+    for (const auto& kv : row) {
+        uint32_t idx = visible;
+        for (uint32_t i = 0; i < visible; ++i) {
+            if (kv.first == meta[i].name) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx == visible || provided[idx] != nullptr)
+            return Result<uint64_t>::Fail(Err::kInvalidArgument);
+        provided[idx] = &kv.second;
+    }
+    if (provided[0] == nullptr) return Result<uint64_t>::Fail(Err::kInvalidArgument);
+    const ColumnValue& pk = *provided[0];
+
+    // ---- 存在性分流 ----
+    auto exists_res = ContainsKey(table, pk);
+    if (!exists_res.IsOk()) return Result<uint64_t>::Fail(exists_res.Error());
+
+    std::vector<ColumnValue> full(visible);
+    if (exists_res.Value()) {
+        // 合并：现存行 + 所给列覆盖
+        auto cur_res = GetByKey(table, pk);
+        if (!cur_res.IsOk()) return Result<uint64_t>::Fail(cur_res.Error());
+        const std::vector<ColumnValue>& cur = cur_res.Value();
+        if (cur.size() != visible) return Result<uint64_t>::Fail(Err::kCorruption);
+        for (uint32_t i = 0; i < visible; ++i) full[i] = provided[i] != nullptr ? *provided[i] : cur[i];
+        uint64_t row_no = 0;
+        const Result<void> ures = UpdateByKey(table, pk, full, &row_no);
+        if (!ures.IsOk()) return Result<uint64_t>::Fail(ures.Error());
+        return Result<uint64_t>::Ok(row_no);
+    }
+
+    // 插入：缺列按 schema 填充（ext 列默认值经 EncodeExtDefault 的逆解码）
+    for (uint32_t i = 0; i < visible; ++i) {
+        if (provided[i] != nullptr) {
+            full[i] = *provided[i];
+            continue;
+        }
+        if (i < desc->col_count) {
+            if (meta[i].nullable) {
+                full[i] = ColumnValue::Null();
+            } else {
+                return Result<uint64_t>::Fail(Err::kInvalidArgument);  // 非空列无默认值可填
+            }
+            continue;
+        }
+        if (meta[i].has_default) {
+            if (meta[i].default_is_null) {
+                full[i] = ColumnValue::Null();
+            } else if (meta[i].type == DataType::kFloat32) {
+                float f = 0.0F;
+                std::memcpy(&f, &meta[i].default_raw, sizeof(f));
+                full[i] = ColumnValue::Real(static_cast<double>(f));
+            } else if (meta[i].type == DataType::kFloat64) {
+                double d = 0.0;
+                std::memcpy(&d, &meta[i].default_raw, sizeof(d));
+                full[i] = ColumnValue::Real(d);
+            } else {
+                full[i] = ColumnValue::Int(static_cast<int64_t>(meta[i].default_raw));
+            }
+        } else if (meta[i].nullable) {
+            full[i] = ColumnValue::Null();
+        } else {
+            return Result<uint64_t>::Fail(Err::kInvalidArgument);
+        }
+    }
+    return Insert(table, full);
 }
 
 Result<std::vector<ColumnValue>> Engine::GetByKey(const TableHandle& table,
@@ -456,7 +632,8 @@ Result<std::vector<ColumnValue>> Engine::GetByKey(const TableHandle& table,
 }
 
 Result<void> Engine::UpdateByKey(const TableHandle& table, const ColumnValue& key,
-                                 const std::vector<ColumnValue>& row) {
+                                 const std::vector<ColumnValue>& row, uint64_t* out_row_no) {
+    if (out_row_no != nullptr) *out_row_no = 0;
     if (!impl_ || !impl_->catalog) return Result<void>::Fail(Err::kUnsupported);
     if (!table.IsValid()) return Result<void>::Fail(Err::kInvalidArgument);
     if (impl_->region->allocator() == nullptr) return Result<void>::Fail(Err::kReadOnlyHandle);
@@ -492,6 +669,7 @@ Result<void> Engine::UpdateByKey(const TableHandle& table, const ColumnValue& ke
         } else {
             failpoint::CrashPoint("wal.commit.before");
             impl_->MarkCommitted(commit_seq);
+            if (out_row_no != nullptr) *out_row_no = st.row_no;
             res = Result<void>::Ok();
         }
     }
@@ -826,6 +1004,26 @@ infra::SlabShmAllocator* Engine::RawAllocator() const noexcept {
 
 infra::ShmRootMutex* Engine::RawRootMutex() const noexcept {
     return impl_ ? impl_->region->root_mutex() : nullptr;
+}
+
+// ------------------ TableHandle 成员便利面（M2，docs/04 §3）------------------
+// 句柄不拥有引擎：仅转发到发放句柄的 Engine；无效句柄（未绑定/已默认
+// 构造）返回 kInvalidArgument。
+
+Result<uint64_t> TableHandle::Upsert(const Row& row) const {
+    if (engine_ == nullptr || !IsValid()) return Result<uint64_t>::Fail(Err::kInvalidArgument);
+    return engine_->Upsert(*this, row);
+}
+
+Result<std::vector<ColumnValue>> TableHandle::Get(const ColumnValue& key) const {
+    if (engine_ == nullptr || !IsValid())
+        return Result<std::vector<ColumnValue>>::Fail(Err::kInvalidArgument);
+    return engine_->GetByKey(*this, key);
+}
+
+Result<void> TableHandle::Delete(const ColumnValue& key) const {
+    if (engine_ == nullptr || !IsValid()) return Result<void>::Fail(Err::kInvalidArgument);
+    return engine_->DeleteByKey(*this, key);
 }
 
 }  // namespace rtdb

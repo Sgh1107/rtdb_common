@@ -236,11 +236,11 @@ protected:
 
     rtdb::Options Opts(rtdb::FsyncPolicy fsync = rtdb::FsyncPolicy::PerSecond) const {
         rtdb::Options opts;
-        opts.instance_name = "wal_engine_test";
-        opts.file_path = kImage;
+        opts.instance = "wal_engine_test";
+        opts.path = kImage;
         opts.initial_size_bytes = 2ull << 20;
         opts.role = rtdb::Role::Standalone;
-        opts.fsync = fsync;
+        opts.wal_fsync = fsync;
         return opts;
     }
 
@@ -495,8 +495,8 @@ protected:
 
     rtdb::Options Opts() const {
         rtdb::Options opts;
-        opts.instance_name = "wal_crash_parent";
-        opts.file_path = Image();
+        opts.instance = "wal_crash_parent";
+        opts.path = Image();
         opts.initial_size_bytes = 2ull << 20;
         opts.role = rtdb::Role::Standalone;
         return opts;

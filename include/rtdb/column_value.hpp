@@ -84,6 +84,23 @@ public:
         return cv;
     }
 
+    // ---- M2 隐式构造（docs/04 §3 `Row{{"id", int64_t{42}}, …}` 便利面，
+    /// docs/10 §2-M2-D1）。集合最小化：整型/浮点/布尔/字符串四类；
+    /// bool 单列重载避免与整型/浮点的重载歧义。 ----
+    ColumnValue() noexcept = default;                        ///< 空值
+    ColumnValue(int64_t v) noexcept                          ///< → kInt64
+        : type_(DataType::kInt64), is_null_(false), int_(v) {}
+    ColumnValue(double v) noexcept                           ///< → kFloat64
+        : type_(DataType::kFloat64), is_null_(false), real_(v) {}
+    ColumnValue(bool v) noexcept                             ///< → kBool
+        : type_(DataType::kBool), is_null_(false), int_(v ? 1 : 0) {}
+    ColumnValue(const char* s)                               ///< → kUtf8Var
+        : type_(DataType::kUtf8Var), is_null_(false), bytes_(s != nullptr ? s : "") {}
+    ColumnValue(std::string_view s)                          ///< → kUtf8Var
+        : type_(DataType::kUtf8Var), is_null_(false), bytes_(s) {}
+    ColumnValue(const std::string& s)                        ///< → kUtf8Var
+        : type_(DataType::kUtf8Var), is_null_(false), bytes_(s) {}
+
     /// \brief 是否为空值。
     bool is_null() const noexcept { return is_null_; }
 
@@ -102,15 +119,19 @@ public:
     /// \brief 变长内容（空值或非变长值为空串）。
     const std::string& as_bytes() const noexcept { return bytes_; }
 
-private:
-    ColumnValue() noexcept = default;
-
     DataType type_ = DataType::kInt64;
     bool is_null_ = true;
     int64_t int_ = 0;
     double real_ = 0.0;
     std::string bytes_;
 };
+
+/// \brief 命名列值行（docs/04 §3 `rtdb::Row`）：按列名定位的**部分行**。
+///
+/// 用于 `TableHandle::Upsert` 等便利面：未提供的列按 schema 填充
+/// （nullable → NULL；非空且无默认值 → kInvalidArgument）。重名列
+/// 或表外列名按 kInvalidArgument 拒绝。
+using Row = std::vector<std::pair<std::string_view, ColumnValue>>;
 
 #if defined(_MSC_VER)
 #pragma warning(pop)

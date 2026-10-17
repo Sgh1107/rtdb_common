@@ -21,8 +21,8 @@ void CleanupTempFile() {
 
 rtdb::Options MakeOpts(const char* name, uint64_t size = 1024 * 1024) {
     rtdb::Options o;
-    o.instance_name = name;
-    o.file_path = kTmpFile;
+    o.instance = name;
+    o.path = kTmpFile;
     o.initial_size_bytes = size;
     return o;
 }

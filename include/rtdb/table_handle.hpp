@@ -57,6 +57,22 @@ public:
     /// \brief 建表时定格的行槽容量。
     uint32_t row_cap() const noexcept { return row_cap_; }
 
+    // ------------------ 成员便利面（M2，docs/04 §3，docs/10 §2-M2-D1）------------------
+    /// \brief upsert 一行（存在则按所给列合并覆盖，不存在则插入）。
+    ///
+    /// `row` 为按列名定位的部分行（`rtdb::Row`）：必须含主键列（列 0）；
+    /// 未提供的列——更新路径保持原值，插入路径按 schema 填充
+    /// （nullable → NULL；非空且无默认值 → kInvalidArgument）。
+    /// 句柄不拥有引擎；无效句柄返回 kInvalidArgument。
+    /// 只读方法：不修改句柄状态（引擎侧完成全部变更）。
+    Result<uint64_t> Upsert(const Row& row) const;
+
+    /// \brief 按主键读整行（等价 `Engine::GetByKey`）。
+    Result<std::vector<ColumnValue>> Get(const ColumnValue& key) const;
+
+    /// \brief 按主键删除（等价 `Engine::DeleteByKey`）。
+    Result<void> Delete(const ColumnValue& key) const;
+
 private:
     friend class Engine;
 
@@ -72,6 +88,10 @@ private:
           row_cap_(row_cap),
           desc_off_(desc_off) {}
 
+    /// \brief 绑定发放该句柄的引擎（M2 成员便利面；非拥有指针，
+    /// 引擎须存活于句柄使用期，docs/10 §2-M2-D1 风险行）。
+    void set_engine(Engine* engine) noexcept { engine_ = engine; }
+
     /// \brief 描述符偏移（内部令牌；Public API 使用者不得解释其含义）。
     uint64_t desc_off() const noexcept { return desc_off_; }
 
@@ -82,6 +102,7 @@ private:
     uint32_t ext_column_count_ = 0;
     uint32_t row_cap_ = 0;
     uint64_t desc_off_ = 0;
+    Engine* engine_ = nullptr;  ///< 非拥有（M2 成员便利面）
 };
 
 #if defined(_MSC_VER)

@@ -79,8 +79,8 @@ extern "C" void __gcov_dump(void) __attribute__((weak));
 
 int RunCrashLockChild(const std::string& file_path) {
     rtdb::Options opts;
-    opts.instance_name = "crash_child";
-    opts.file_path = file_path;
+    opts.instance = "crash_child";
+    opts.path = file_path;
     opts.initial_size_bytes = 1024 * 1024;
     auto res = rtdb::Engine::Open(opts);
     if (!res.IsOk()) return 3;
@@ -96,8 +96,8 @@ int RunCrashLockChild(const std::string& file_path) {
 int RunWalCrashChild(const std::string& file_path) {
     failpoint::ClearAll();  // 触发 env 解析后整体解除，保 DDL 阶段无注入
     rtdb::Options opts;
-    opts.instance_name = "wal_crash_child";
-    opts.file_path = file_path;
+    opts.instance = "wal_crash_child";
+    opts.path = file_path;
     opts.initial_size_bytes = 2 * 1024 * 1024;
     auto res = rtdb::Engine::Open(opts);
     if (!res.IsOk()) return 3;
@@ -137,8 +137,8 @@ int RunWalCrashChild(const std::string& file_path) {
 int RunW5SnapChild(const std::string& file_path) {
     failpoint::ClearAll();  // 触发 env 解析后整体解除，保前置阶段无注入
     rtdb::Options opts;
-    opts.instance_name = "w5_snap_child";
-    opts.file_path = file_path;
+    opts.instance = "w5_snap_child";
+    opts.path = file_path;
     opts.initial_size_bytes = 2 * 1024 * 1024;
     auto res = rtdb::Engine::Open(opts);
     if (!res.IsOk()) return 3;
@@ -170,8 +170,8 @@ int RunW5SnapChild(const std::string& file_path) {
 int RunW5AlterChild(const std::string& file_path) {
     failpoint::ClearAll();  // 触发 env 解析后整体解除，保前置阶段无注入
     rtdb::Options opts;
-    opts.instance_name = "w5_alter_child";
-    opts.file_path = file_path;
+    opts.instance = "w5_alter_child";
+    opts.path = file_path;
     opts.initial_size_bytes = 2 * 1024 * 1024;
     auto res = rtdb::Engine::Open(opts);
     if (!res.IsOk()) return 3;
@@ -210,8 +210,8 @@ int RunW5AlterChild(const std::string& file_path) {
 int RunW5SecIdxChild(const std::string& file_path) {
     failpoint::ClearAll();  // 触发 env 解析后整体解除，保前置阶段无注入
     rtdb::Options opts;
-    opts.instance_name = "w5_secidx_child";
-    opts.file_path = file_path;
+    opts.instance = "w5_secidx_child";
+    opts.path = file_path;
     opts.initial_size_bytes = 2 * 1024 * 1024;
     auto res = rtdb::Engine::Open(opts);
     if (!res.IsOk()) return 3;
@@ -249,16 +249,16 @@ int RunChaosWriteChild(const std::string& file_path, const std::string& scenario
                        const std::string& fsync_mode) {
     failpoint::ClearAll();  // 触发 env 解析后整体解除，保前置阶段无注入
     rtdb::Options opts;
-    opts.instance_name = "chaos_child";
-    opts.file_path = file_path;
+    opts.instance = "chaos_child";
+    opts.path = file_path;
     opts.initial_size_bytes = 2 * 1024 * 1024;
     opts.role = rtdb::Role::Standalone;
     if (fsync_mode == "always") {
-        opts.fsync = rtdb::FsyncPolicy::Always;
+        opts.wal_fsync = rtdb::FsyncPolicy::Always;
     } else if (fsync_mode == "never") {
-        opts.fsync = rtdb::FsyncPolicy::Never;
+        opts.wal_fsync = rtdb::FsyncPolicy::Never;
     } else {
-        opts.fsync = rtdb::FsyncPolicy::PerSecond;
+        opts.wal_fsync = rtdb::FsyncPolicy::PerSecond;
     }
     auto res = rtdb::Engine::Open(opts);
     if (!res.IsOk()) return 3;
@@ -350,11 +350,11 @@ int RunChaosWriteChild(const std::string& file_path, const std::string& scenario
 int RunChaosVerifyChild(const std::string& file_path, const std::string& scenario) {
     constexpr int64_t kSeed = 5;
     rtdb::Options opts;
-    opts.instance_name = "chaos_verify";
-    opts.file_path = file_path;
+    opts.instance = "chaos_verify";
+    opts.path = file_path;
     opts.initial_size_bytes = 2 * 1024 * 1024;
     opts.role = rtdb::Role::Standalone;
-    opts.fsync = rtdb::FsyncPolicy::PerSecond;
+    opts.wal_fsync = rtdb::FsyncPolicy::PerSecond;
 
     int failures = 0;
     const auto check = [&failures](bool ok, const char* what) {
@@ -468,8 +468,8 @@ int RunChaosVerifyChild(const std::string& file_path, const std::string& scenari
         if (std::filesystem::exists(snap, ec)) {
             // 副本须为可独立挂载的一致性点映像（换实例名，防命名映射混淆）。
             rtdb::Options sopts;
-            sopts.instance_name = "chaos_verify_snap";
-            sopts.file_path = snap;
+            sopts.instance = "chaos_verify_snap";
+            sopts.path = snap;
             sopts.initial_size_bytes = 2 * 1024 * 1024;
             auto sopen = rtdb::Engine::Open(sopts);
             check(sopen.IsOk(), "snapshot_copy_loadable");
@@ -524,11 +524,11 @@ int RunBenchChild(const std::string& file_path, uint32_t rows) {
     const uint32_t n = rows < kRowCap ? rows : kRowCap;
 
     rtdb::Options opts;
-    opts.instance_name = "bench";
-    opts.file_path = file_path;
+    opts.instance = "bench";
+    opts.path = file_path;
     opts.initial_size_bytes = 8ull * 1024 * 1024;
     opts.role = rtdb::Role::Standalone;
-    opts.fsync = rtdb::FsyncPolicy::PerSecond;
+    opts.wal_fsync = rtdb::FsyncPolicy::PerSecond;
 
     std::printf("BENCH rows=%u row_cap=%u image=%s\n", n, kRowCap, file_path.c_str());
 
@@ -573,7 +573,7 @@ int RunBenchChild(const std::string& file_path, uint32_t rows) {
     {
         eng.reset();  // 先收尾 per_second 档实例
         rtdb::Options aopts = opts;
-        aopts.fsync = rtdb::FsyncPolicy::Always;
+        aopts.wal_fsync = rtdb::FsyncPolicy::Always;
         auto aopen = rtdb::Engine::Open(aopts);
         if (!aopen.IsOk()) {
             std::printf("BENCH_FAIL reopen_always: %s\n",

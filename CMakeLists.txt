@@ -112,6 +112,7 @@ if(RTDB_BUILD_TESTS)
     tests/unit/test_table_store.cpp
     tests/unit/test_wal.cpp
     tests/unit/test_w5.cpp
+    tests/unit/test_native_api.cpp
   )
   add_executable(rtdb_unit_tests ${rtdb_test_sources})
   target_link_libraries(rtdb_unit_tests PRIVATE rtdbcore GTest::gtest_main)
@@ -159,12 +160,18 @@ endif()
 if(RTDB_BUILD_EXAMPLES)
   add_executable(embed_demo examples/embed_demo/main.cpp)
   target_link_libraries(embed_demo PRIVATE rtdbcore)
+  # M2-W1：docs/04 §3 Native API 验收程序（伞头 + 规范面便利 API）。
+  add_executable(api_demo examples/api_demo/main.cpp)
+  target_link_libraries(api_demo PRIVATE rtdbcore)
   if(MSVC)
     target_compile_options(embed_demo PRIVATE /W4 /permissive- /utf-8)
+    target_compile_options(api_demo PRIVATE /W4 /permissive- /utf-8)
   else()
     target_compile_options(embed_demo PRIVATE -Wall -Wextra)
+    target_compile_options(api_demo PRIVATE -Wall -Wextra)
   endif()
   set_target_properties(embed_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+  set_target_properties(api_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 endif()
 
 # ---------------------------------------------------------------

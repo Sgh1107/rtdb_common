@@ -122,8 +122,8 @@ TEST(ShmMutexDeathRecovery, RecoversAfterHolderHardKill) {
     fs::remove(img, ec);
 
     rtdb::Options opts;
-    opts.instance_name = "crash_recovery";
-    opts.file_path = img;
+    opts.instance = "crash_recovery";
+    opts.path = img;
     opts.initial_size_bytes = 1024 * 1024;
 
     {  // 先建好映像
