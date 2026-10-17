@@ -6,7 +6,9 @@
 #define RTDB_VERSION_MAJOR 0
 #define RTDB_VERSION_MINOR 1
 #define RTDB_VERSION_PATCH 0
-#define RTDB_ABI_VERSION 0
+/// C ABI 语义版本（docs/04 §1：CAbi 符号冻结语义版本化）。v1 = M2-W3
+/// 冻结首个符号集（rtdb_cabi.h；与头内 RTDB_ABI_VER 须一致）。
+#define RTDB_ABI_VERSION 1
 
 namespace rtdb {
 

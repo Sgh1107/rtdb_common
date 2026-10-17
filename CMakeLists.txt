@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(rtdb_common VERSION 0.1.0 LANGUAGES CXX)
+project(rtdb_common VERSION 0.1.0 LANGUAGES CXX C)
 
 option(RTDB_BUILD_TESTS "Build unit tests" ON)
 # GoogleTest 仅在构建测试时经 FetchContent 拉取（docs/01 技术选型约定），
@@ -23,6 +23,7 @@ option(RTDB_COVERAGE_STATIC_CORE "Static-link core into tests (gcov builds)" OFF
 
 set(rtdb_core_sources
   src/engine.cpp
+  src/api/c_abi.cpp
   src/infra/err.cpp
   src/infra/failpoint.cpp
   src/infra/shm_region.cpp
@@ -114,6 +115,7 @@ if(RTDB_BUILD_TESTS)
     tests/unit/test_w5.cpp
     tests/unit/test_native_api.cpp
     tests/unit/test_record_block.cpp
+    tests/unit/test_cabi.cpp
   )
   add_executable(rtdb_unit_tests ${rtdb_test_sources})
   target_link_libraries(rtdb_unit_tests PRIVATE rtdbcore GTest::gtest_main)
@@ -164,15 +166,23 @@ if(RTDB_BUILD_EXAMPLES)
   # M2-W1：docs/04 §3 Native API 验收程序（伞头 + 规范面便利 API）。
   add_executable(api_demo examples/api_demo/main.cpp)
   target_link_libraries(api_demo PRIVATE rtdbcore)
+  # M2-W3：C ABI 验收程序（纯 C，验证跨语言绑定基座）。
+  add_executable(cabi_demo examples/cabi_demo/main.c)
+  target_link_libraries(cabi_demo PRIVATE rtdbcore)
+  set_target_properties(cabi_demo PROPERTIES
+    C_STANDARD 99 C_STANDARD_REQUIRED ON)
   if(MSVC)
     target_compile_options(embed_demo PRIVATE /W4 /permissive- /utf-8)
     target_compile_options(api_demo PRIVATE /W4 /permissive- /utf-8)
+    target_compile_options(cabi_demo PRIVATE /W4 /utf-8)
   else()
     target_compile_options(embed_demo PRIVATE -Wall -Wextra)
     target_compile_options(api_demo PRIVATE -Wall -Wextra)
+    target_compile_options(cabi_demo PRIVATE -Wall -Wextra)
   endif()
   set_target_properties(embed_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
   set_target_properties(api_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+  set_target_properties(cabi_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 endif()
 
 # ---------------------------------------------------------------
