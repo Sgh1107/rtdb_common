@@ -15,7 +15,7 @@
 /// 用法：
 ///   bench_net [--rows N] [--batch K] [--ops-rows M] [--write-samples S]
 ///             [--sub-samples S] [--ping-samples S] [--page-rows P]
-///             [--table T] [--image FILE] [--keep] [--ci]
+///             [--table T] [--image FILE] [--keep] [--ci] [--relaxed]
 ///             [--host H --port P --user U --password PW --salt S]
 ///
 /// 默认：rows=200000 batch=512（CI：rows=50000）——同键覆盖写，槽位占用
@@ -64,6 +64,7 @@ struct Args {
     bool no_sub = false;
     bool keep = false;
     bool ci = false;
+    bool relaxed = false;  // 显式放宽 CI 阈值（Debug/覆盖率构建由 CMake 传 --relaxed）
     bool external = false;
     bool rows_set = false;
     bool ops_rows_set = false;
@@ -79,6 +80,8 @@ struct Args {
 bool ParseArgs(int argc, char** argv, Args* a) {
     for (int i = 1; i < argc; ++i) {
         const std::string k = argv[i];
+        // CMake `$<CONFIG:Debug>` 空展开会传入空参数（如 `--ci ""`），忽略之。
+        if (k.empty()) continue;
         auto next = [&](std::string* out) -> bool {
             if (i + 1 >= argc) return false;
             *out = argv[++i];
@@ -117,6 +120,8 @@ bool ParseArgs(int argc, char** argv, Args* a) {
             a->keep = true;
         } else if (k == "--ci") {
             a->ci = true;
+        } else if (k == "--relaxed") {
+            a->relaxed = true;
         } else if (k == "--host" && next(&v)) {
             a->host = v;
             a->external = true;
@@ -137,7 +142,7 @@ bool ParseArgs(int argc, char** argv, Args* a) {
             std::printf(
                 "用法：bench_net [--rows N] [--batch K] [--ops-rows M] [--ping-samples S]\n"
                 "        [--write-samples S] [--sub-samples S] [--page-rows P] [--no-sub]\n"
-                "        [--table T] [--image FILE] [--keep] [--ci]\n"
+                "        [--table T] [--image FILE] [--keep] [--ci] [--relaxed]\n"
                 "        [--host H --port P --user U --password PW --salt S]\n");
             return false;
         } else {
@@ -181,7 +186,8 @@ bool EnvNonEmpty(const char* name) {
 }
 
 /// 消毒构建探测：CI 里 ASan/TSan/UBSan 作业设置对应环境变量；此类构建
-/// 慢 2~10×，性能断言自动放宽（仅防"完全失效"）。
+/// 慢 2~10×，性能断言自动放宽（仅防"完全失效"）。Debug/覆盖率（-O0）
+/// 构建经 `--relaxed` 显式放宽（CMake `$<CONFIG:Debug>` 传递）。
 bool SanitizerBuild() {
     const char* names[] = {"ASAN_OPTIONS", "TSAN_OPTIONS", "UBSAN_OPTIONS", "MSAN_OPTIONS"};
     for (const char* n : names) {
@@ -251,13 +257,13 @@ int main(int argc, char** argv) {
         if (a.write_samples == 200) a.write_samples = 100;
         if (a.sub_samples == 100) a.sub_samples = 50;
     }
-    const bool relaxed = SanitizerBuild();
+    const bool relaxed = a.relaxed || SanitizerBuild();
     if (a.image.empty()) a.image = "rtdb_bench_net.img";
 
     std::printf("BENCHNET config rows=%llu ops_rows=%llu batch=%u table=%s mode=%s%s\n",
                 static_cast<unsigned long long>(a.rows),
                 static_cast<unsigned long long>(a.ops_rows), a.batch, a.table.c_str(),
-                a.external ? "external" : "inproc", relaxed ? " sanitizer=relaxed" : "");
+                a.external ? "external" : "inproc", relaxed ? " relaxed=1" : "");
 
     // ---------------- 服务端（进程内）或外部端点 ----------------
     rtdb::server::Server srv;

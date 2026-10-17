@@ -213,13 +213,19 @@ ChildProcess& ChildProcess::operator=(ChildProcess&& other) noexcept {
 
 ChildProcess ChildProcess::Spawn(const std::string& exe, const std::vector<std::string>& args) {
     ChildProcess out;
+    // 多线程安全：argv 全部在 fork 前于父进程构造——fork 后子进程仅允许
+    // 异步信号安全调用（在子进程内调 malloc 可能与其他线程持有的分配器
+    // 锁死锁；混沌场景 2 正是在写线程运行中重启服务端）。字符串本体在
+    // 父进程生命周期内稳定，fork 后子进程只读。
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 2);
+    argv.push_back(const_cast<char*>(exe.c_str()));
+    for (const std::string& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+    argv.push_back(nullptr);
+
     const pid_t pid = ::fork();
     if (pid < 0) return out;
     if (pid == 0) {
-        std::vector<char*> argv;
-        argv.push_back(const_cast<char*>(exe.c_str()));
-        for (const std::string& a : args) argv.push_back(const_cast<char*>(a.c_str()));
-        argv.push_back(nullptr);
         ::execv(exe.c_str(), argv.data());
         ::_exit(127);  // exec 失败
     }

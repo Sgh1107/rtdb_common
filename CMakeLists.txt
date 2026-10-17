@@ -93,6 +93,10 @@ else()
   list(APPEND rtdb_net_sources src/platform/posix/tcp_posix.cpp)
 endif()
 add_library(rtdbnet STATIC ${rtdb_net_sources})
+# 该静态库会被链入共享库 librtdbclient.so（Linux 默认 SHARED）——静态库须
+# 带 PIC，否则链接期报 relocation R_X86_64_PC32 ... recompile with -fPIC
+# （M3 CI 首跑暴露；Windows/MSVC 无此概念，该属性为无害默认）。
+set_target_properties(rtdbnet PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(rtdbnet PUBLIC cxx_std_17)
 target_include_directories(rtdbnet
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -324,8 +328,10 @@ if(RTDB_BUILD_TOOLS)
   # 可执行同目录才可被 ctest 直接拉起（无需 PATH 注入）。
   if(RTDB_BUILD_TESTS)
     # CI 下限断言（回环 ≥50k 行/s、单条写/PING P99 ≤5ms 量级；消毒构建
-    # 经环境变量自动放宽，见 tools/bench_net/main.cpp）。规模由 --ci 收敛。
-    add_test(NAME BenchNetCi COMMAND $<TARGET_FILE:bench_net> --ci)
+    # 经环境变量、Debug 构建（覆盖率作业/本地 gcov）经 --relaxed 自动
+    # 放宽，见 tools/bench_net/main.cpp）。规模由 --ci 收敛。
+    add_test(NAME BenchNetCi COMMAND $<TARGET_FILE:bench_net> --ci
+      $<$<CONFIG:Debug>:--relaxed>)
     set_tests_properties(BenchNetCi PROPERTIES RUN_SERIAL TRUE
       WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
   endif()
