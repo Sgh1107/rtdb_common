@@ -53,13 +53,21 @@ using PrimaryIndexTree = infra::SharedBTree<8, uint64_t>;
 /// Apply——COMMIT 记录先于任何数据页变更落环，恢复时"无 COMMIT 整批作废"
 /// 或"有 COMMIT 整批重放"，两段皆原子（docs/08 §2-D3）。
 ///
-/// 生命周期约定：
+/// 生命周期约定（A2 修复后的完整不变式）：
 ///  - Stage 成功后 `allocated_vars` 中的变长块归暂存产物所有；
+///  - WAL 追加成功 → `wal_written` 置位：记录已入环，重放可能按记录内
+///    偏移重新物化行，此后本进程**不得**回收这些变长块（回收会让重放
+///    引用已空闲块，随后被再分配 = 静默损坏）；泄漏有界，随 compact 收敛
+///    （与 ReplayUpsert 对旧记录变长块的处理同策略）；
 ///  - ApplyStaged 成功 → 块所有权随记录转移进行数据，`allocated_vars` 清空，
 ///    此后**不得**再 ReleaseStaged；
-///  - ApplyStaged 失败 → 数据页已由 Apply 内部回滚，变长块与行槽保留权
-///    仍在暂存产物，调用方必须 ReleaseStaged 收尾；
-///  - ReleaseStaged 对 insert 会回退行槽保留（desc_->row_count--），
+///  - ApplyStaged 在**发布点之后**失败（行数据/主键已发布，`published` 置位）
+///    → 数据不可回滚，变长块引用仍在行记录中：`ReleaseStaged` 必须跳过块
+///    回收与行槽回退（P0-2：原实现释放被已发布行引用的块 + 行槽回退导致
+///    槽位复用，重放幂等跳过又无法修复）；
+///  - ApplyStaged 失败且未发布 → 数据页已由 Apply 内部回滚，行槽保留权
+///    仍在暂存产物；调用方必须 ReleaseStaged 收尾（块回收与否见 wal_written）；
+///  - ReleaseStaged 对未发布的 insert 会回退行槽保留（desc_->row_count--），
 ///    批量中止须按暂存逆序调用（LIFO）。
 struct StagedRowOp {
     enum class Kind : uint8_t { kInsert = 1, kUpdate = 2, kDelete = 3 };
@@ -73,6 +81,10 @@ struct StagedRowOp {
     std::vector<uint8_t> old_rec;  ///< update/delete：旧记录副本（应用成功后回收其变长块）
     std::vector<uint64_t> allocated_vars;  ///< 暂存期持有的变长块偏移
     char key[8];                ///< 主键有序编码（WAL 载荷 / 索引操作共用）
+    /// 本操作的 WAL 记录已成功入环（由引擎在 WalAppendRowOp 成功后置位）。
+    bool wal_written = false;
+    /// 行数据/主键索引已发布（不可回滚）：ApplyStaged 内部在发布点置位。
+    bool published = false;
 };
 
 /// \brief 单表行存储：格式化物理区 + 行级 CRUD + WAL 暂存/应用/重放。

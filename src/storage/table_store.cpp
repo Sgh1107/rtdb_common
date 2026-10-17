@@ -44,6 +44,34 @@ int64_t LoadInteger(const uint8_t* src, uint32_t width) noexcept {
     return v;
 }
 
+/// 值类型（ColumnValue::type()）与 schema 列类型的可写入兼容矩阵（P1-4）：
+///  - 整数族（含 bool/时间戳）内互写按值转换；
+///  - 浮点仅入浮点列；
+///  - 变长（utf8/bytes）仅入变长列。
+/// 错配返回 false：调用方拒绝写入，杜绝 as_int()/as_bytes() 直读默认值
+/// （Text 塞整数列 → 静默 0；整数塞变长列 → 静默空串）。
+bool ValueTypeCompatible(DataType value_kind, DataType column) noexcept {
+    switch (value_kind) {
+        case DataType::kInt8:
+        case DataType::kInt16:
+        case DataType::kInt32:
+        case DataType::kInt64:
+        case DataType::kBool:
+        case DataType::kUnixTsNs:
+            return column == DataType::kInt8 || column == DataType::kInt16 ||
+                   column == DataType::kInt32 || column == DataType::kInt64 ||
+                   column == DataType::kBool || column == DataType::kUnixTsNs;
+        case DataType::kFloat32:
+        case DataType::kFloat64:
+            return column == DataType::kFloat32 || column == DataType::kFloat64;
+        case DataType::kUtf8Var:
+        case DataType::kBytesVar:
+            return column == DataType::kUtf8Var || column == DataType::kBytesVar;
+        default:
+            return false;
+    }
+}
+
 /// 标量按类型+宽度写入（内联定长列与 ext 槽共用同一规则）。
 void StoreScalar(uint8_t* dst, uint32_t width, DataType t, const ColumnValue& v) noexcept {
     if (t == DataType::kFloat32) {
@@ -325,6 +353,15 @@ Err TableStore::BuildRecord(const std::vector<ColumnValue>& row, std::vector<uin
             continue;
         }
 
+        // P1-4：值类型硬校验（此前按列型直读 as_int()/as_bytes()，错配
+        // 静默取零值）。宽定长字段（len>8）按字节写入，要求变长类值。
+        if (c.len > 8 && !is_var) {
+            if (row[i].type() != DataType::kUtf8Var && row[i].type() != DataType::kBytesVar)
+                return Err::kInvalidArgument;
+        } else if (!ValueTypeCompatible(row[i].type(), t)) {
+            return Err::kInvalidArgument;
+        }
+
         if (is_var) {
             const std::string& s = row[i].as_bytes();
             uint32_t off = 0;
@@ -382,6 +419,8 @@ Err TableStore::BuildRecord(const std::vector<ColumnValue>& row, std::vector<uin
                 rec->resize(rec->size() + r->slot_bytes, 0);
                 continue;
             }
+            // P1-4：扩展列值类型同校验（StoreScalar 直读 as_real()/as_int()）。
+            if (!ValueTypeCompatible(v.type(), et)) return Err::kInvalidArgument;
             rec->push_back(kExtStatusValue);
             const size_t at = rec->size();
             rec->resize(at + r->slot_bytes, 0);
@@ -520,6 +559,8 @@ Err TableStore::StageInsert(const std::vector<ColumnValue>& row, StagedRowOp* ou
     out->row_ver = 2;  // 首次发布：0 → 1(写入中) → 2(稳定)
     out->old_rec.clear();
     out->allocated_vars.clear();
+    out->wal_written = false;
+    out->published = false;
     const Err build = BuildRecord(row, &out->rec, &out->allocated_vars);
     if (!IsOk(build)) {
         out->rec.clear();
@@ -554,6 +595,8 @@ Err TableStore::StageUpdate(const ColumnValue& key, const std::vector<ColumnValu
     out->row_no = row_no;
     out->row_ver = *VersionSlot(row_no) + 2;
     out->allocated_vars.clear();
+    out->wal_written = false;
+    out->published = false;
     const Err build = BuildRecord(row, &out->rec, &out->allocated_vars);
     if (!IsOk(build)) {
         out->rec.clear();
@@ -579,6 +622,8 @@ Err TableStore::StageRemove(const ColumnValue& key, StagedRowOp* out) noexcept {
     out->row_ver = *VersionSlot(row_no) + 2;
     out->rec.clear();
     out->allocated_vars.clear();
+    out->wal_written = false;
+    out->published = false;
     out->old_rec.assign(RowPtr(row_no), RowPtr(row_no) + desc_->rec_fixed_len);
     return Err::kOk;
 }
@@ -610,7 +655,9 @@ Err TableStore::ApplyStaged(StagedRowOp* st) noexcept {
             // 注入点：行数据已发布、主键索引未发布（docs/06 §3 "索引更新一半"）。
             failpoint::CrashPoint("wal.apply.mid");
             if (failpoint::ErrorPoint("wal.index.insert")) {
-                // 模拟索引分配失败：数据页回滚；变长块/行槽留给 ReleaseStaged。
+                // 模拟索引分配失败：数据页回滚（行槽留待 ReleaseStaged 回退）；
+                // 变长块因记录已入 WAL 由 ReleaseStaged 按 wal_written 保留
+                //（重放会按记录内偏移重新物化行，回收即埋雷）。
                 ClearExtBits(st->row_no);
                 std::memset(RowPtr(st->row_no), 0, desc_->rec_fixed_len);
                 *ver = 0;
@@ -623,10 +670,19 @@ Err TableStore::ApplyStaged(StagedRowOp* st) noexcept {
                 *ver = 0;
                 return ins;
             }
+            // ---- 发布点已过（A2）：行数据 + 主键索引均已发布，不可回滚 ----
+            // 此后任何失败上抛由调用方毒化（WAL 已先行，Open 重建自愈）；
+            // 变长块引用已进入已发布行记录——先转移所有权（published + 清空
+            // allocated_vars），ReleaseStaged 不得再回收，否则已发布行引用
+            // 空闲块（P0-2），且重放幂等跳过无法修复。
+            st->published = true;
+            st->allocated_vars.clear();  // 变长块所有权转移至行数据
             // 二级索引维护（W5-d）：主键发布后按整行当前状态建键；键含
             // row_no，同值多行自然并存（非唯一索引的自然形态）。失败上抛
             // 由调用方毒化——WAL 已先行，Open 重建自愈。
             if (HaveSecIdx()) {
+                // 注入点：发布后二级索引维护失败（A2 回归用例）。
+                if (failpoint::ErrorPoint("wal.secidx.after_publish")) return Err::kOutOfMemory;
                 std::vector<SecEntry> keys;
                 const Err ke = SecKeysOfRow(st->row_no, &keys);
                 if (!IsOk(ke)) return ke;
@@ -634,7 +690,6 @@ Err TableStore::ApplyStaged(StagedRowOp* st) noexcept {
                 if (!IsOk(ie)) return ie;
             }
             desc_->committed_row_count++;
-            st->allocated_vars.clear();  // 变长块所有权转移至行数据
             return Err::kOk;
         }
         case StagedRowOp::Kind::kUpdate: {
@@ -652,6 +707,10 @@ Err TableStore::ApplyStaged(StagedRowOp* st) noexcept {
                 if (!IsOk(ee)) return ee;  // 版本仍为奇数：读者重试；调用方毒化
             }
             *ver = st->row_ver;  // 偶数：稳定
+            // ---- 发布点已过（A2）：新行数据不可回滚 ----
+            // 此后（二级索引维护）失败上抛，变长块所有权必须已转移：
+            // ReleaseStaged 依据 published 拒绝回收（P0-2）。
+            st->published = true;
             if (HaveSecIdx()) {
                 // 新键按写入后的当前行状态取（旧句柄窄行写入时未提供的
                 // ext 列保留旧值，天然正确）；先摘旧键再插新键——并发
@@ -664,6 +723,9 @@ Err TableStore::ApplyStaged(StagedRowOp* st) noexcept {
                 if (!IsOk(ie)) return ie;  // 调用方毒化；Open 重建自愈
             }
             ReleaseRecordVars(st->old_rec.data());
+            st->allocated_vars.clear();  // 变长块所有权转移至新行数据（P1-1：
+                                         // 批回滚"已应用项已清空"的前提对
+                                         // update 同样成立）
             return Err::kOk;
         }
         case StagedRowOp::Kind::kDelete: {
@@ -676,6 +738,7 @@ Err TableStore::ApplyStaged(StagedRowOp* st) noexcept {
             *ver = st->row_ver - 1;
             SetTombstone(st->row_no, true);
             *ver = st->row_ver;
+            st->published = true;  // 墓碑已发布（删除无变长块，标志为语义一致性）
             const Err err = index_->Remove(st->key);
             if (!IsOk(err)) return err;  // 调用方毒化引擎（WAL 已先行）
             // 摘除二级索引键：读者按行号读行，墓碑即缺席（先于/后于主键
@@ -692,13 +755,22 @@ Err TableStore::ApplyStaged(StagedRowOp* st) noexcept {
 
 void TableStore::ReleaseStaged(StagedRowOp* st) noexcept {
     if (st == nullptr) return;
-    for (uint64_t off : st->allocated_vars) {
-        if (var_pool_ != nullptr) var_pool_->Deallocate(off);
+    // A2 所有权不变式：变长块在以下两种情形下不可由本进程回收——
+    //  ① wal_written：记录已入环，重放会按记录内偏移重新物化行；回收则
+    //     重放把已空闲块写进行记录，随后被再分配 = 静默损坏（泄漏有界，
+    //     随 compact 收敛，与 ReplayUpsert 对旧块的处理同策略）；
+    //  ② published：行数据已发布且不可回滚，块仍被已发布行引用。
+    if (!st->published && !st->wal_written) {
+        for (uint64_t off : st->allocated_vars) {
+            if (var_pool_ != nullptr) var_pool_->Deallocate(off);
+        }
     }
     st->allocated_vars.clear();
-    // insert 行槽保留回退：仅当该暂存是最后一次保留（LIFO）时严格成立；
-    // 否则槽位作为"保留未用"遗留（不可达、无害），随 M2 compact 收敛。
-    if (st->kind == StagedRowOp::Kind::kInsert && desc_->row_count > 0 &&
+    // insert 行槽保留回退：仅当该槽未被已发布行接管（!published）且是最后
+    // 一次保留（LIFO）时严格成立；否则槽位作为"保留未用"遗留（不可达、
+    // 无害），随 M2 compact 收敛。published 情形若回退行槽，后续插入会
+    // 复用已发布行槽 → 键/数据错位（P0-2 的另一半）。
+    if (!st->published && st->kind == StagedRowOp::Kind::kInsert && desc_->row_count > 0 &&
         st->row_no + 1 == desc_->row_count) {
         desc_->row_count--;
     }
