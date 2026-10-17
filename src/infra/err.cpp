@@ -50,6 +50,17 @@ const char* ErrorMessage(Err e) noexcept {
             return "not implemented yet";
         case Err::kNetworkError:
             return "network error";
+        case Err::kCursorOverflow:
+            return "subscription cursor overflowed (full resync required)";
+        case Err::kProtocolError:
+            return "protocol violation (bad frame or payload)";
+        case Err::kTooManySessions:
+            return "too many sessions";
+        // ---- 5xx ----
+        case Err::kAuthFailed:
+            return "authentication failed";
+        case Err::kTokenExpired:
+            return "session expired or invalid";
         default:
             break;
     }

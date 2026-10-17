@@ -42,11 +42,13 @@ if(WIN32)
   list(APPEND rtdb_core_sources
     src/platform/win32/shared_memory_file_win32.cpp
     src/platform/win32/platform_process_win32.cpp
+    src/platform/win32/ipc_wait_win32.cpp
   )
 else()
   list(APPEND rtdb_core_sources
     src/platform/posix/shared_memory_file_posix.cpp
     src/platform/posix/platform_process_posix.cpp
+    src/platform/posix/ipc_wait_posix.cpp
   )
 endif()
 
@@ -73,6 +75,38 @@ if(UNIX)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(rtdbcore PRIVATE rt)
   endif()
+endif()
+
+# ---------------------------------------------------------------
+# 网络层：rtdbnet（协议帧/值编码 + TCP 传输；M3，docs/13 §4）
+# rtdbd 与 rtdb_client 共用；引擎及核心库不引用本层。
+# ---------------------------------------------------------------
+set(rtdb_net_sources
+  src/net/wire.cpp
+  src/net/value_codec.cpp
+)
+if(WIN32)
+  list(APPEND rtdb_net_sources src/platform/win32/tcp_win32.cpp)
+else()
+  list(APPEND rtdb_net_sources src/platform/posix/tcp_posix.cpp)
+endif()
+add_library(rtdbnet STATIC ${rtdb_net_sources})
+target_compile_features(rtdbnet PUBLIC cxx_std_17)
+target_include_directories(rtdbnet
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(rtdbnet PUBLIC rtdbcore)
+if(WIN32)
+  target_link_libraries(rtdbnet PUBLIC ws2_32)
+endif()
+if(UNIX)
+  target_link_libraries(rtdbnet PUBLIC pthread)
+endif()
+if(MSVC)
+  target_compile_options(rtdbnet PRIVATE /W4 /permissive- /utf-8)
+else()
+  target_compile_options(rtdbnet PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 # ---------------------------------------------------------------
@@ -117,9 +151,12 @@ if(RTDB_BUILD_TESTS)
     tests/unit/test_record_block.cpp
     tests/unit/test_concurrency.cpp
     tests/unit/test_cabi.cpp
+    tests/unit/test_proto.cpp
+    tests/unit/test_net.cpp
+    tests/unit/test_ipc_wait.cpp
   )
   add_executable(rtdb_unit_tests ${rtdb_test_sources})
-  target_link_libraries(rtdb_unit_tests PRIVATE rtdbcore GTest::gtest_main)
+  target_link_libraries(rtdb_unit_tests PRIVATE rtdbcore rtdbnet GTest::gtest_main)
   target_include_directories(rtdb_unit_tests
     PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}

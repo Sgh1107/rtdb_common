@@ -46,6 +46,18 @@ enum class Err : int16_t {
     // ---- 4xx 服务端 ----
     kNotImplemented = 400,
     kNetworkError = 401,
+    /// 订阅游标落后于可回收窗口（ChangeLog 已被环复用覆盖，客户端
+    /// 须整表重取后重置游标，允许重复、不允许缺漏，docs/13 §3-D1/D2）。
+    kCursorOverflow = 402,
+    /// 协议帧/载荷违例（帧头非法、CRC 不符、载荷截断、字段越界等）。
+    kProtocolError = 403,
+    /// 服务端会话数达到上限，拒绝新连接（docs/13 §3-D3）。
+    kTooManySessions = 404,
+    // ---- 5xx 权限（M3 认证最小面，docs/13 §3-D6）----
+    /// 认证失败（用户不存在或凭据不符）。
+    kAuthFailed = 501,
+    /// 会话无效/过期（须重新 AUTH）。
+    kTokenExpired = 502,
     // ---- 兜底 ----
     kInternal = 999,
 };
