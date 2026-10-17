@@ -1,6 +1,7 @@
 #include "rtdb/engine.hpp"
 
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -102,6 +103,20 @@ bool PayloadTypeCompatible(DataType payload, DataType column) {
     }
 }
 
+/// 单条行操作的 WAL 记录字节数（A1 批前预留用；与 WalAppendRowOp 的
+/// 载荷选取规则同构：insert/update 载荷 = 整行记录，delete = 主键 8B）。
+uint64_t StagedWalBytes(const storage::StagedRowOp& st) noexcept {
+    switch (st.kind) {
+        case storage::StagedRowOp::Kind::kInsert:
+        case storage::StagedRowOp::Kind::kUpdate:
+            return storage::WalRing::RecordBytes(static_cast<uint32_t>(st.rec.size()));
+        case storage::StagedRowOp::Kind::kDelete:
+            return storage::WalRing::RecordBytes(8);
+        default:
+            return 0;
+    }
+}
+
 }  // namespace
 
 struct Engine::Impl {
@@ -110,11 +125,19 @@ struct Engine::Impl {
     std::unique_ptr<ShmRegion> region;
     std::unique_ptr<storage::Catalog> catalog;
     /// 表行存储句柄缓存（键 = 描述符偏移）；首次访问时按需附着。
+    /// 并发约定（P1-2 修复）：读路径（GetByKey/Scan/Upsert 校验等）在根锁
+    /// 外调用 StoreFor，故容器本身由 stores_mu 保护（首次附着的 emplace
+    /// 与并发读的 find 可发生于不同线程）。
     std::unordered_map<uint64_t, std::unique_ptr<storage::TableStore>> stores;
+    std::mutex stores_mu;
     /// 映像内 WAL 环（写侧角色挂载；Reader 恒为空）。
     std::unique_ptr<storage::WalRing> ring;
     /// 组提交协调器（写侧角色挂载）。
     std::unique_ptr<storage::GroupCommit> commit;
+    /// 批 WAL 进行中标志（A1 纵深防御）：批内 EnsureRingSpace 绝不允许
+    /// 丢弃保留记录（BEGIN 之后的前缀未提交，丢弃即破坏批原子性）。
+    /// 由 ReserveBatchWal 置位、批 WAL 段结束时复位；仅在根锁内读写。
+    bool batch_in_progress = false;
 
     // ---- M2-W2 列式批复用缓冲（UpsertBatch 专用）----
     // 根锁内串行使用（并发 UpsertBatch 由根锁串行化），容量随高水位
@@ -131,14 +154,19 @@ struct Engine::Impl {
 
     /// \brief 取（必要时附着）表行存储，并校验句柄与描述符自洽。
     Result<storage::TableStore*> StoreFor(uint64_t desc_off, int64_t expected_table_id) {
-        auto it = stores.find(desc_off);
-        if (it == stores.end()) {
-            auto attach =
-                storage::TableStore::Attach(region->base_address(), region->allocator(), desc_off);
-            if (!attach.IsOk()) return Result<storage::TableStore*>::Fail(attach.Error());
-            it = stores.emplace(desc_off, attach.TakeValue()).first;
+        storage::TableStore* store = nullptr;
+        {
+            // 仅保护容器本身（find/emplace）；attach 与后续校验不依赖容器锁。
+            std::lock_guard<std::mutex> lk(stores_mu);
+            auto it = stores.find(desc_off);
+            if (it == stores.end()) {
+                auto attach = storage::TableStore::Attach(region->base_address(),
+                                                          region->allocator(), desc_off);
+                if (!attach.IsOk()) return Result<storage::TableStore*>::Fail(attach.Error());
+                it = stores.emplace(desc_off, attach.TakeValue()).first;
+            }
+            store = it->second.get();
         }
-        storage::TableStore* store = it->second.get();
         const storage::shm_TableDescriptor* desc = store->descriptor();
         if (desc == nullptr) return Result<storage::TableStore*>::Fail(Err::kCorruption);
         if (desc->table_id != static_cast<uint64_t>(expected_table_id))
@@ -191,9 +219,17 @@ struct Engine::Impl {
 
     /// \brief 覆盖协议（docs/08 §2-D1"覆盖前先落盘"）：环空间不足时强制
     /// 全映像 flush、推进 checkpoint_seq、丢弃全部保留记录。
-    /// \return kOk / kIoError（flush 失败）/ kLimitExceeded（记录大于整环）
+    ///
+    /// A1 纵深防御：批 WAL 进行中拒绝丢弃（BEGIN 之后的前缀未提交，丢弃即
+    /// 静默破坏批原子性）。正常路径由批前预留（ReserveBatchWal）保证批内
+    /// 不触发本分支；触发即为缺陷兜底——返回 kLimitExceeded，批调用方
+    /// 毒化引擎，宁可失败不丢数据。
+    ///
+    /// \return kOk / kIoError（flush 失败）/ kLimitExceeded（记录大于整环
+    ///         或批进行中空间不足）
     Err EnsureRingSpace(uint64_t rec_bytes) noexcept {
         if (ring->HasRoomFor(rec_bytes)) return Err::kOk;
+        if (batch_in_progress) return Err::kLimitExceeded;
         uint64_t covered = 0;
         const Err fe = commit->FlushNow(&covered);
         if (!IsOk(fe)) return fe;
@@ -203,6 +239,31 @@ struct Engine::Impl {
         }
         ring->DropAllRetained();
         if (!ring->HasRoomFor(rec_bytes)) return Err::kLimitExceeded;
+        return Err::kOk;
+    }
+
+    /// \brief A1 批前 WAL 空间预留：在批的首条记录（BEGIN）之前调用。
+    ///
+    /// 计算整批所需字节（BEGIN + N×行操作 + COMMIT）：
+    ///  - 超过记录区容量 → kLimitExceeded 拒批（零 WAL 副作用，批整体
+    ///    回滚、引擎不毒化）；
+    ///  - 否则腾环（flush + 推进 checkpoint + 丢弃已覆盖记录——批前根锁
+    ///    在手、环内不存在未提交前缀，丢弃安全），此后批内追加不再触发
+    ///    覆盖协议，杜绝"环满中途丢弃未提交前缀"（P0-1）。
+    ///
+    /// 预留成功后置批进行中标志；批 WAL 段结束（无论成败）由调用方复位
+    /// （见 batch_in_progress 注释）。
+    ///
+    /// \return kOk / kPoisoned / kIoError（flush 失败）/ kLimitExceeded
+    Err ReserveBatchWal(uint64_t total_bytes) noexcept {
+        if (ring == nullptr || ring->poisoned()) return Err::kPoisoned;
+        if (total_bytes > ring->area_bytes()) return Err::kLimitExceeded;
+        const Err e = EnsureRingSpace(total_bytes);
+        if (!IsOk(e)) {
+            if (e != Err::kLimitExceeded) Poison();
+            return e;
+        }
+        batch_in_progress = true;
         return Err::kOk;
     }
 
@@ -222,7 +283,10 @@ struct Engine::Impl {
 
     /// \brief 追加一条行操作记录（payload 取自暂存产物）。
     /// 注入点：`wal.append.fail`（错误注入：模拟追加失败 → 毒化）。
-    Err WalAppendRowOp(storage::TableStore* store, const storage::StagedRowOp& st,
+    ///
+    /// 追加成功即置 `st.wal_written`（A2 所有权不变式）：记录已入环，
+    /// 重放可能按记录内偏移重新物化行——此后本进程不得回收该操作的变长块。
+    Err WalAppendRowOp(storage::TableStore* store, storage::StagedRowOp& st,
                        uint64_t* out_seq) noexcept {
         if (ring == nullptr || ring->poisoned()) return Err::kPoisoned;
         uint8_t op = storage::kWalOpInsert;
@@ -259,6 +323,7 @@ struct Engine::Impl {
         const storage::shm_TableDescriptor* desc = store->descriptor();
         const Err ae = ring->Append(op, static_cast<int64_t>(desc->table_id), st.row_no,
                                     st.row_ver, payload, payload_len, out_seq);
+        if (IsOk(ae)) st.wal_written = true;  // A2 所有权转移点（记录已入环）
         if (!IsOk(ae) && ae != Err::kLimitExceeded) Poison();
         return ae;
     }
@@ -807,11 +872,22 @@ Result<uint64_t> Engine::UpsertBatch(const RecordBlockView& block) {
         }
 
         // ---- 阶段二：WAL 三段式（BEGIN + N×op + COMMIT 先于数据页变更）----
+        // A1 批前预留（P0-1 修复）：整批字节 = BEGIN + N×行操作 + COMMIT。
+        // 环空间不足时在此一次性腾净（flush + checkpoint + 丢弃已提交段，
+        // 批前环内不存在未提交前缀，丢弃安全）；整批超过记录区容量直接
+        // 拒批（kLimitExceeded，零 WAL 副作用、批整体回滚、不毒化）。
+        uint64_t batch_wal_bytes =
+            storage::WalRing::RecordBytes(4) + storage::WalRing::RecordBytes(0);
+        for (size_t i = 0; i < staged_n; ++i) batch_wal_bytes += StagedWalBytes(staged[i]);
+        phase_err = impl_->ReserveBatchWal(batch_wal_bytes);
+
         bool begin_written = false;
         uint8_t cnt_buf[4];
         storage::EncodeU32LE(cnt_buf, static_cast<uint32_t>(staged_n));
         uint64_t begin_seq = 0;
-        phase_err = impl_->WalAppendMark(storage::kWalOpBatchBegin, cnt_buf, 4, &begin_seq);
+        if (IsOk(phase_err)) {
+            phase_err = impl_->WalAppendMark(storage::kWalOpBatchBegin, cnt_buf, 4, &begin_seq);
+        }
         if (IsOk(phase_err)) begin_written = true;
         for (size_t i = 0; IsOk(phase_err) && i < staged_n; ++i) {
             phase_err = impl_->WalAppendRowOp(store, staged[i], nullptr);
@@ -825,6 +901,7 @@ Result<uint64_t> Engine::UpsertBatch(const RecordBlockView& block) {
         if (IsOk(phase_err)) {
             phase_err = impl_->WalAppendMark(storage::kWalOpBatchCommit, nullptr, 0, &commit_seq);
         }
+        impl_->batch_in_progress = false;  // 批 WAL 段结束（无论成败）
         if (!IsOk(phase_err) && begin_written) impl_->Poison();
 
         // ---- 阶段三：应用（COMMIT 已落环 → 崩溃由重放整批收敛）----
@@ -1085,14 +1162,22 @@ Result<void> Engine::ExecuteBatch(const std::vector<Engine::BatchOp>& ops) {
         }
 
         // 阶段二：WAL 三段式（BEGIN + N×op + COMMIT 先于任何数据页变更）。
+        // A1 批前预留（P0-1 修复）：先算整批字节并一次性腾环/拒批，批内追加
+        // 不再触发覆盖协议（BEGIN 之后丢弃前缀会破坏批原子性）。
         // 注意：BEGIN 落环后若任何后续环节失败，环内将残留未决批——
         // 恢复扫描会把它之后的一切记录并入该批作废，因此必须毒化拒写。
+        uint64_t batch_wal_bytes =
+            storage::WalRing::RecordBytes(4) + storage::WalRing::RecordBytes(0);
+        for (const StagedEntry& e : staged) batch_wal_bytes += StagedWalBytes(e.st);
+        phase_err = impl_->ReserveBatchWal(batch_wal_bytes);
+
         bool begin_written = false;
         uint8_t cnt_buf[4];
         storage::EncodeU32LE(cnt_buf, static_cast<uint32_t>(ops.size()));
         uint64_t begin_seq = 0;
-        phase_err =
-            impl_->WalAppendMark(storage::kWalOpBatchBegin, cnt_buf, 4, &begin_seq);
+        if (IsOk(phase_err)) {
+            phase_err = impl_->WalAppendMark(storage::kWalOpBatchBegin, cnt_buf, 4, &begin_seq);
+        }
         if (IsOk(phase_err)) begin_written = true;
         for (size_t i = 0; IsOk(phase_err) && i < staged.size(); ++i) {
             phase_err = impl_->WalAppendRowOp(staged[i].store, staged[i].st, nullptr);
@@ -1105,6 +1190,7 @@ Result<void> Engine::ExecuteBatch(const std::vector<Engine::BatchOp>& ops) {
             phase_err =
                 impl_->WalAppendMark(storage::kWalOpBatchCommit, nullptr, 0, &commit_seq);
         }
+        impl_->batch_in_progress = false;  // 批 WAL 段结束（无论成败）
         if (!IsOk(phase_err) && begin_written) impl_->Poison();
 
         // 阶段三：应用（COMMIT 已落环 → 崩溃由重放整批收敛）。
