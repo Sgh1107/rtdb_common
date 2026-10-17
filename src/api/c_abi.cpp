@@ -29,6 +29,10 @@ struct rtdb_table {
     rtdb::TableHandle handle;
 };
 
+struct rtdb_cursor {
+    rtdb::ChangeCursor cursor;
+};
+
 namespace {
 
 using rtdb::ColumnValue;
@@ -381,6 +385,118 @@ void rtdb_abi_free_rows(rtdb_rows* rows) {
     }
     rows->rows = nullptr;
     rows->nrows = 0;
+}
+
+// ---- v2 订阅族（M3-W2，docs/13 §3-D1；只增符号）----
+
+int32_t rtdb_abi_subscribe(rtdb_engine* engine, const char* const* tables, size_t ntables,
+                           rtdb_cursor** out) {
+    if (out != nullptr) *out = nullptr;
+    if (engine == nullptr || engine->engine == nullptr || out == nullptr)
+        return RTDB_ERR_INVALID_ARGUMENT;
+    if (tables == nullptr && ntables != 0) return RTDB_ERR_INVALID_ARGUMENT;
+    for (size_t i = 0; i < ntables; ++i) {
+        if (tables[i] == nullptr) return RTDB_ERR_INVALID_ARGUMENT;
+    }
+    try {
+        std::vector<std::string> names;
+        names.reserve(ntables);
+        for (size_t i = 0; i < ntables; ++i) names.emplace_back(tables[i]);
+        auto res = engine->engine->Subscribe(names);
+        if (!res.IsOk()) return Code(res.Error());
+        auto* c = new (std::nothrow) rtdb_cursor;
+        if (c == nullptr) return RTDB_ERR_OUT_OF_MEMORY;
+        c->cursor = res.TakeValue();
+        *out = c;
+        return RTDB_OK;
+    } catch (...) {
+        return RTDB_ERR_INTERNAL;
+    }
+}
+
+int32_t rtdb_abi_cursor_next(rtdb_cursor* cursor, uint32_t timeout_ms, rtdb_batch* out) {
+    if (out != nullptr) {
+        out->changes = nullptr;
+        out->nchanges = 0;
+        out->last_seq = 0;
+    }
+    if (cursor == nullptr || out == nullptr) return RTDB_ERR_INVALID_ARGUMENT;
+    try {
+        auto res = cursor->cursor.Next(timeout_ms);
+        if (!res.IsOk()) return Code(res.Error());
+        const rtdb::ChangeBatch& batch = res.Value();
+        out->last_seq = batch.last_seq;
+        if (batch.events.empty()) return RTDB_OK;
+
+        auto* changes =
+            static_cast<rtdb_change*>(std::calloc(batch.events.size(), sizeof(rtdb_change)));
+        if (changes == nullptr) return RTDB_ERR_OUT_OF_MEMORY;
+        out->changes = changes;
+        out->nchanges = batch.events.size();
+        for (size_t i = 0; i < batch.events.size(); ++i) {
+            const rtdb::ChangeEvent& e = batch.events[i];
+            rtdb_change& c = changes[i];
+            c.kind = static_cast<int32_t>(e.kind);
+            c.table_id = e.table_id;
+            if (!e.table.empty()) {
+                auto* nb = static_cast<char*>(std::malloc(e.table.size() + 1));
+                if (nb == nullptr) {
+                    rtdb_abi_free_batch(out);
+                    return RTDB_ERR_OUT_OF_MEMORY;
+                }
+                std::memcpy(nb, e.table.data(), e.table.size());
+                nb[e.table.size()] = '\0';
+                c.table = nb;
+            }
+            c.seq = e.seq;
+            c.ts_ns = e.ts_ns;
+            c.row_no = e.row_no;
+            c.row_ver = e.row_ver;
+            const int32_t rc = FillRow(e.row, &c.row);
+            if (rc != RTDB_OK) {
+                rtdb_abi_free_batch(out);
+                return rc;
+            }
+            if (e.kind == rtdb::ChangeEvent::Kind::kDelete) {
+                c.key.type = static_cast<int32_t>(e.key.type());
+                c.key.is_null = e.key.is_null() ? 1 : 0;
+                if (!e.key.is_null()) c.key.int_value = e.key.as_int();
+            }
+        }
+        return RTDB_OK;
+    } catch (...) {
+        rtdb_abi_free_batch(out);
+        return RTDB_ERR_INTERNAL;
+    }
+}
+
+uint64_t rtdb_abi_cursor_position(rtdb_cursor* cursor) {
+    if (cursor == nullptr || !cursor->cursor.valid()) return 0;
+    return cursor->cursor.Position();
+}
+
+void rtdb_abi_cursor_reset(rtdb_cursor* cursor, uint64_t seq) {
+    if (cursor == nullptr) return;
+    cursor->cursor.ResetTo(seq);
+}
+
+void rtdb_abi_cursor_close(rtdb_cursor* cursor) { delete cursor; }
+
+void rtdb_abi_free_batch(rtdb_batch* batch) {
+    if (batch == nullptr) return;
+    if (batch->changes != nullptr) {
+        for (size_t i = 0; i < batch->nchanges; ++i) {
+            rtdb_change& c = batch->changes[i];
+            std::free(const_cast<char*>(c.table));
+            rtdb_abi_free_row(&c.row);
+            // M3 主键为整数类（无变长载荷）；防御性释放保持通用契约。
+            std::free(const_cast<char*>(c.key.bytes));
+        }
+        std::free(batch->changes);
+    }
+    batch->changes = nullptr;
+    batch->nchanges = 0;
+    batch->last_seq = 0;
 }
 
 }  // extern "C"

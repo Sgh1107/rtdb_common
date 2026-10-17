@@ -21,7 +21,7 @@ import sys
 import tempfile
 
 # ---- 与 rtdb_cabi.h 对齐的常量（防止头文件改动后脚本静默漂移）----
-RTDB_ABI_VER_EXPECT = 1
+RTDB_ABI_VER_EXPECT = 2
 RTDB_OK = 0
 RTDB_ERR_INVALID_ARGUMENT = 101
 RTDB_ERR_ALREADY_EXISTS = 103

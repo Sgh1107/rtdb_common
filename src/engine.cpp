@@ -1,5 +1,6 @@
 #include "rtdb/engine.hpp"
 
+#include <chrono>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -12,6 +13,7 @@
 #include "infra/layout.hpp"
 #include "infra/shm_mutex.hpp"
 #include "infra/shm_region.hpp"
+#include "platform/ipc_wait.hpp"
 #include "storage/alter.hpp"
 #include "storage/catalog.hpp"
 #include "storage/group_commit.hpp"
@@ -177,8 +179,12 @@ struct Engine::Impl {
     }
 
     /// \brief 提交标记：推进全局 committed_seq（写侧串行，单调）。
+    /// 同时唤醒全部订阅等待者（futex/WaitOnAddress 等待其低 32 位字；
+    /// 无等待者时无副作用，docs/13 §3-D4）。
     void MarkCommitted(uint64_t seq) noexcept {
-        layout::AsAtomicU64(&region->super_block()->committed_seq)->store(seq);
+        auto* sb = region->super_block();
+        layout::AsAtomicU64(&sb->committed_seq)->store(seq);
+        platform::WakeAll32(reinterpret_cast<uint32_t*>(&sb->committed_seq));
     }
 
     /// \brief 行宽校验（W5-b）：insert/update 的列值数须等于句柄可见
@@ -1359,6 +1365,199 @@ Result<std::vector<ColumnValue>> TableHandle::Get(const ColumnValue& key) const 
 Result<void> TableHandle::Delete(const ColumnValue& key) const {
     if (engine_ == nullptr || !IsValid()) return Result<void>::Fail(Err::kInvalidArgument);
     return engine_->DeleteByKey(*this, key);
+}
+
+// ============================================================
+// 订阅游标（M3-W2，docs/13 §3-D1）：WalRing 已提交记录 → 增量事件。
+// ============================================================
+
+struct ChangeCursor::Impl {
+    /// 所属引擎（生命周期须外于游标；Engine 移动不失效——Impl 堆地址不变）。
+    Engine::Impl* engine = nullptr;
+    /// 过滤器：空 = 全部活跃表；否则 table_id → 表名（订阅时解析快照，
+    /// 同名表删除重建后不自动跟随——M3 边界）。
+    std::unordered_map<int64_t, std::string> filter;
+    /// 已交付到的 seq（游标开区间端点）。
+    uint64_t position = 0;
+};
+
+namespace {
+
+/// 单次 Next 交付的载荷字节预算（超限提前收批，剩余由后续 Next 交付；
+/// 上限与协议载荷上限同量级，docs/13 §3-D5）。
+constexpr uint64_t kChangeBatchByteBudget = 1u << 20;  // 1 MiB
+
+/// 估算单条事件的预算占用（含行值容器与字符串的粗估）。
+uint64_t EventBudgetBytes(const ChangeEvent& ev) noexcept {
+    uint64_t bytes = 128 + ev.table.size();
+    for (const ColumnValue& v : ev.row) bytes += 32 + v.bytes_.size();
+    return bytes;
+}
+
+}  // namespace
+
+ChangeCursor::ChangeCursor() noexcept = default;
+ChangeCursor::~ChangeCursor() = default;
+ChangeCursor::ChangeCursor(ChangeCursor&&) noexcept = default;
+ChangeCursor& ChangeCursor::operator=(ChangeCursor&&) noexcept = default;
+ChangeCursor::ChangeCursor(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+
+bool ChangeCursor::valid() const noexcept { return impl_ != nullptr && impl_->engine != nullptr; }
+
+uint64_t ChangeCursor::Position() const noexcept { return impl_ != nullptr ? impl_->position : 0; }
+
+void ChangeCursor::ResetTo(uint64_t seq) noexcept {
+    if (impl_ != nullptr) impl_->position = seq;
+}
+
+Result<ChangeCursor> Engine::Subscribe(const std::vector<std::string>& tables) {
+    if (impl_ == nullptr) return Result<ChangeCursor>::Fail(Err::kInvalidArgument);
+    if (impl_->ring == nullptr) {
+        // 未挂载 WAL 环（Reader 主角色）：无订阅数据源。
+        return Result<ChangeCursor>::Fail(Err::kUnsupported);
+    }
+
+    auto cursor = std::unique_ptr<ChangeCursor::Impl>(new ChangeCursor::Impl());
+    cursor->engine = impl_.get();
+    const int64_t committed = CommittedSeq();
+    cursor->position = committed > 0 ? static_cast<uint64_t>(committed) : 0;
+
+    for (const std::string& name : tables) {
+        auto off = impl_->catalog->OpenTable(name);
+        if (!off.IsOk()) return Result<ChangeCursor>::Fail(off.Error());
+        const storage::shm_TableDescriptor* desc = impl_->catalog->Descriptor(off.Value());
+        if (desc == nullptr ||
+            desc->state != static_cast<uint32_t>(storage::TableState::kActive)) {
+            return Result<ChangeCursor>::Fail(Err::kTableNotFound);
+        }
+        cursor->filter.emplace(static_cast<int64_t>(desc->table_id), name);
+    }
+    return Result<ChangeCursor>::Ok(ChangeCursor(std::move(cursor)));
+}
+
+Result<ChangeBatch> ChangeCursor::Next(uint32_t timeout_ms) {
+    if (impl_ == nullptr || impl_->engine == nullptr) {
+        return Result<ChangeBatch>::Fail(Err::kInvalidArgument);
+    }
+    Engine::Impl* eng = impl_->engine;
+    if (eng->ring == nullptr) return Result<ChangeBatch>::Fail(Err::kUnsupported);
+
+    layout::shm_SuperBlock* sb = eng->region->super_block();
+    auto* committed = layout::AsAtomicU64(&sb->committed_seq);
+    const auto start = std::chrono::steady_clock::now();
+
+    ChangeBatch batch;
+    batch.last_seq = impl_->position;
+
+    for (;;) {
+        const uint64_t to = committed->load(std::memory_order_acquire);
+        if (to > impl_->position) {
+            // ---- 扫描窗口 (position, to]（根锁内：与覆盖丢弃互斥）----
+            struct ResolvedTable {
+                storage::TableStore* store = nullptr;
+                std::string name;  // 目录解析名（全部表模式用）
+            };
+            std::unordered_map<int64_t, ResolvedTable> cache;
+            bool overflow = false;
+            uint64_t last = impl_->position;
+            {
+                infra::ShmRootMutexGuard guard(eng->region->root_mutex(),
+                                               kEngineLockTimeoutMs);
+                if (!guard.locked()) return Result<ChangeBatch>::Fail(guard.error());
+                uint64_t budget = 0;
+                const storage::WalRing::ScanRangeFn on_record =
+                    [&](const storage::WalRecordView& v) -> bool {
+                    if (budget >= kChangeBatchByteBudget) return false;  // 预算收批
+                    const char* table_name = nullptr;
+                    if (!impl_->filter.empty()) {
+                        auto fit = impl_->filter.find(v.table_id);
+                        if (fit == impl_->filter.end()) {
+                            // 未订阅的表：跳过但推进游标（无缺漏）。
+                            budget += 64;
+                            return true;
+                        }
+                        table_name = fit->second.c_str();
+                    }
+                    auto cit = cache.find(v.table_id);
+                    if (cit == cache.end()) {
+                        ResolvedTable rt;
+                        auto off = eng->catalog->FindById(static_cast<uint64_t>(v.table_id));
+                        if (off.IsOk()) {
+                            const storage::shm_TableDescriptor* desc =
+                                eng->catalog->Descriptor(off.Value());
+                            if (desc != nullptr) rt.name = desc->name;
+                            auto st = eng->StoreFor(off.Value(), v.table_id);
+                            if (st.IsOk()) rt.store = st.Value();
+                        }
+                        cit = cache.emplace(v.table_id, std::move(rt)).first;
+                    }
+                    ResolvedTable& rt = cit->second;
+                    if (rt.store == nullptr) return true;  // 表已删除/不可附着：跳过
+                    if (table_name == nullptr) {
+                        if (rt.name.empty()) return true;  // 全部表模式且名不可解析：跳过
+                        table_name = rt.name.c_str();
+                    }
+                    ChangeEvent ev;
+                    if (v.op == storage::kWalOpInsert || v.op == storage::kWalOpUpdate) {
+                        std::vector<ColumnValue> row =
+                            rt.store->DecodeWalRow(v.payload, v.payload_len, v.row_no, v.row_ver);
+                        if (row.empty()) return true;  // 畸形记录：防御跳过
+                        ev.kind = (v.op == storage::kWalOpInsert)
+                                      ? ChangeEvent::Kind::kInsert
+                                      : ChangeEvent::Kind::kUpdate;
+                        ev.row = std::move(row);
+                    } else if (v.op == storage::kWalOpDelete) {
+                        ev.kind = ChangeEvent::Kind::kDelete;
+                        ev.key = rt.store->DecodeWalKey(v.payload);
+                    } else {
+                        budget += 64;  // DDL/批标记等：跳过（不交付）
+                        return true;
+                    }
+                    ev.table_id = v.table_id;
+                    ev.table = table_name;
+                    ev.seq = v.seq;
+                    ev.ts_ns = v.ts_ns;
+                    ev.row_no = v.row_no;
+                    ev.row_ver = v.row_ver;
+                    budget += EventBudgetBytes(ev);
+                    batch.events.push_back(std::move(ev));
+                    return true;
+                };
+                const Err se = eng->ring->ScanRange(impl_->position, to, on_record, &last);
+                if (se == Err::kCursorOverflow) {
+                    overflow = true;
+                } else if (!IsOk(se)) {
+                    return Result<ChangeBatch>::Fail(se);
+                }
+            }
+            if (overflow) {
+                // 起点已被回收：调用方须全量重取后 ResetTo。
+                return Result<ChangeBatch>::Fail(Err::kCursorOverflow);
+            }
+            impl_->position = last;
+            batch.last_seq = last;
+            if (!batch.events.empty()) return Result<ChangeBatch>::Ok(std::move(batch));
+            continue;  // 无匹配事件：复查是否有新提交
+        }
+
+        // ---- 无新提交：按剩余预算等待或超时收批 ----
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+        if (timeout_ms != kCursorWaitForever &&
+            elapsed_ms >= static_cast<long long>(timeout_ms)) {
+            return Result<ChangeBatch>::Ok(std::move(batch));
+        }
+        uint32_t remain = platform::kWaitInfiniteMs;
+        if (timeout_ms != kCursorWaitForever) {
+            remain = static_cast<uint32_t>(static_cast<long long>(timeout_ms) - elapsed_ms);
+        }
+        const uint64_t expect = committed->load(std::memory_order_acquire);
+        if (expect > impl_->position) continue;  // 等待前已推进：免一次等待
+        (void)platform::Wait32(reinterpret_cast<const uint32_t*>(&sb->committed_seq),
+                               static_cast<uint32_t>(expect), remain);
+        // 唤醒/超时后一律复查真实值（无丢失唤醒语义，docs/13 §3-D4）。
+    }
 }
 
 }  // namespace rtdb

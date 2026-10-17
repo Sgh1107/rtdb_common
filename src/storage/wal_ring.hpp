@@ -207,6 +207,26 @@ public:
     /// \param out_last_seq 可选输出：最后交付的 seq
     Err ScanValid(const RecordFn& fn, uint64_t* out_last_seq) const;
 
+    /// \brief 增量扫描交付回调（订阅路径）：返回 false = 请求正常停止，
+    /// 当前记录**不**计入交付（调用方可从该记录重扫，无缺漏）。
+    using ScanRangeFn = std::function<bool(const WalRecordView&)>;
+
+    /// \brief 从 from_seq（不含）扫描至 to_seq（含）——订阅增量读取面
+    /// （docs/13 §3-D1）。
+    ///
+    /// 调用方须持根锁（与覆盖丢弃互斥，保证扫描窗口内容稳定）。
+    /// 基础语义与 ScanValid 对齐（CRC/连续性校验、pad 跳过、撕裂尾部
+    /// 视为正常终点）；增量语义额外约定：
+    ///  - seq ≤ from_seq 的记录仅做边界/连续性校验，不交付；
+    ///  - 考察到 seq > to_seq 或回调返回 false 即停（均属正常返回）；
+    ///  - `from_seq + 1 < oldest_seq()`（区间起点已被覆盖回收）返回
+    ///    kCursorOverflow：调用方须全量重取后重置游标；
+    ///  - 空环/区间为空/起点晚于已写入上限均返回 kOk（out_last_seq =
+    ///    from_seq）。
+    /// \param out_last_seq 最后交付的 seq（fn 接受的推进；无 = from_seq）
+    Err ScanRange(uint64_t from_seq_excl, uint64_t to_seq_incl, const ScanRangeFn& fn,
+                  uint64_t* out_last_seq) const;
+
 private:
     WalRing() = default;
 

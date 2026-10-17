@@ -532,6 +532,58 @@ std::vector<ColumnValue> TableStore::DecodeRecord(const uint8_t* rec) const noex
     return out;
 }
 
+bool TableStore::IsCurrentRowVersion(uint64_t row_no, uint64_t row_ver) const noexcept {
+    if (row_no >= desc_->row_cap) return false;
+    const uint64_t* ver = VersionSlot(row_no);
+    if (ver == nullptr || *ver != row_ver) return false;
+    return !IsTombstoned(row_no);
+}
+
+std::vector<ColumnValue> TableStore::DecodeWalRow(const uint8_t* rec, uint32_t rec_len,
+                                                  uint64_t row_no, uint64_t row_ver) const noexcept {
+    if (rec == nullptr || rec_len < desc_->rec_fixed_len) return {};
+    std::vector<ColumnValue> out = DecodeRecord(rec);
+    // 变长列：池引用可能已被覆盖写回收（ReleaseRecordVars）——仅当前版本
+    // 可安全按池引用解码，其余交付 NULL（防交付串行值，docs/13 §3-W2）。
+    if (var_pool_ != nullptr && !IsCurrentRowVersion(row_no, row_ver)) {
+        for (uint32_t i = 0; i < desc_->col_count && i < out.size(); ++i) {
+            const DataType t = static_cast<DataType>(desc_->cols[i].type);
+            if (t == DataType::kUtf8Var || t == DataType::kBytesVar)
+                out[i] = ColumnValue::Null();
+        }
+    }
+    const size_t suffix_len = rec_len - desc_->rec_fixed_len;
+    if (suffix_len == 0) return out;
+
+    std::vector<shm_ExtColRegion*> regions;
+    if (!IsOk(WalkExtColumns(base_, desc_, &regions))) return out;  // 链损坏：交付内联前缀
+
+    const uint8_t* suffix = rec + desc_->rec_fixed_len;
+    size_t pos = 0;
+    for (size_t j = 0; j < regions.size() && pos < suffix_len; ++j) {
+        const shm_ExtColRegion* r = regions[j];
+        const size_t need = 1 + static_cast<size_t>(r->slot_bytes);
+        if (pos + need > suffix_len) break;  // 后缀撕裂：交付健全前缀
+        const uint8_t status = suffix[pos];
+        if (status == kExtStatusNull) {
+            out.push_back(ColumnValue::Null());
+        } else if (status == kExtStatusValue) {
+            out.push_back(
+                LoadScalar(suffix + pos + 1, r->slot_bytes, static_cast<DataType>(r->type)));
+        } else {
+            break;  // 未知状态：交付健全前缀
+        }
+        pos += need;
+    }
+    return out;
+}
+
+ColumnValue TableStore::DecodeWalKey(const uint8_t* key8) const noexcept {
+    if (key8 == nullptr || desc_->col_count == 0) return ColumnValue::Null();
+    const int64_t v = infra::DecodeOrderedInt64(reinterpret_cast<const char*>(key8));
+    return ColumnValue::IntOf(static_cast<DataType>(desc_->cols[0].type), v);
+}
+
 // ------------------ WAL 先行协议：暂存（docs/08 §2-D2）------------------
 
 Err TableStore::StageInsert(const std::vector<ColumnValue>& row, StagedRowOp* out) noexcept {

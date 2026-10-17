@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "rtdb/api_macro.hpp"
+#include "rtdb/change_cursor.hpp"
 #include "rtdb/column_value.hpp"
 #include "rtdb/err.hpp"
 #include "rtdb/options.hpp"
@@ -215,6 +216,22 @@ public:
     ///    （docs/08 §2-D2）。
     Result<void> ExecuteBatch(const std::vector<BatchOp>& ops);
 
+    // ------------------ 订阅（M3-W2，docs/13 §3-D1）------------------
+    /// \brief 订阅变更（嵌入会话增量交付，`ChangeCursor`）。
+    ///
+    /// 数据源 = WalRing 已提交记录（docs/13 §3-D1 复用决策）：交付
+    /// insert/update（整行）与 delete（主键）；DDL/批标记记录跳过。
+    /// 原子批的可见边界 = COMMIT 记录（committed_seq 一次推进），因此
+    /// 订阅不会交付未提交前缀；单次拉取允许把同一批拆成多批交付。
+    ///
+    /// \param tables 过滤表名集合（空 = 全部活跃表）；任一表名不存在
+    ///        返回 `kTableNotFound`。表名在订阅时解析为表 id 快照
+    ///        （同名表删除重建后不自动跟随，M3 边界）。
+    /// \return 增量游标：初值 = 当前 `committed_seq`（仅交付订阅之后的
+    ///         变更）；引擎未挂载 WAL 环（Reader 主角色）返回
+    ///         `kUnsupported`。
+    Result<ChangeCursor> Subscribe(const std::vector<std::string>& tables);
+
     // ------------------ 冷快照（M1-W5，docs/03 §3.2/§3.3）------------------
     /// \brief 执行冷快照：停写（根锁）→ 全映像 flush → checkpoint_seq
     /// 推进到 committed_seq → 环可回收时丢弃保留记录 → 拷贝映像副本。
@@ -299,6 +316,10 @@ public:
 
 private:
     struct Impl;
+
+    /// 订阅游标实现（src/engine.cpp）直取环/目录/描述符内部面（M3-W2）。
+    friend class ChangeCursor;
+    friend struct ChangeCursor::Impl;
 
     /// \brief 由描述符字段装配表句柄（内部；仅传递原始字段，不泄漏内部类型）。
     static TableHandle MakeHandle(int64_t table_id, const char* name, uint32_t layout_version,

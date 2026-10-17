@@ -79,18 +79,21 @@ protected:
 
     rtdb_engine* engine_ = nullptr;
     rtdb_table* table_ = nullptr;
+    rtdb_cursor* cursor_ = nullptr;
 
     void TearDownClose() {
+        if (cursor_ != nullptr) rtdb_abi_cursor_close(cursor_);
         if (table_ != nullptr) rtdb_abi_close_table(table_);
         if (engine_ != nullptr) rtdb_abi_close(engine_);
+        cursor_ = nullptr;
         table_ = nullptr;
         engine_ = nullptr;
     }
 };
 
-TEST_F(CAbiTest, VersionIsFrozenAtOne) {
-    EXPECT_EQ(rtdb_abi_version(), 1u);
-    EXPECT_EQ(RTDB_ABI_VER, 1u);
+TEST_F(CAbiTest, VersionTwoAddsSubscriptionFamily) {
+    EXPECT_EQ(rtdb_abi_version(), 2u);
+    EXPECT_EQ(RTDB_ABI_VER, 2u);
 }
 
 TEST_F(CAbiTest, NullArgumentsRejected) {
@@ -101,9 +104,15 @@ TEST_F(CAbiTest, NullArgumentsRejected) {
               RTDB_ERR_INVALID_ARGUMENT);
     EXPECT_EQ(rtdb_abi_insert(nullptr, nullptr, nullptr, 0, nullptr), RTDB_ERR_INVALID_ARGUMENT);
     EXPECT_EQ(rtdb_abi_committed_seq(nullptr), -1);
+    EXPECT_EQ(rtdb_abi_subscribe(nullptr, nullptr, 0, nullptr), RTDB_ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(rtdb_abi_cursor_next(nullptr, 0, nullptr), RTDB_ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(rtdb_abi_cursor_position(nullptr), 0u);
     // 释放函数的空指针安全。
     rtdb_abi_free_row(nullptr);
     rtdb_abi_free_rows(nullptr);
+    rtdb_abi_free_batch(nullptr);
+    rtdb_abi_cursor_reset(nullptr, 1);
+    rtdb_abi_cursor_close(nullptr);
     rtdb_abi_close(nullptr);
     rtdb_abi_close_table(nullptr);
 }
@@ -259,6 +268,79 @@ TEST_F(CAbiTest, ReopenSeesPersistedRows) {
     ASSERT_EQ(rtdb_abi_get(engine_, table_, &key, &row), RTDB_OK);
     EXPECT_EQ(std::string(row.vals[2].bytes, row.vals[2].bytes_len), "persist");
     rtdb_abi_free_row(&row);
+    TearDownClose();
+}
+
+/// v2 订阅冒烟：资源开闭顺序、空批、insert/update 事件、批释放、
+/// 重置与位置查询（溢出/并发语义由 C++ 侧用例覆盖）。
+TEST_F(CAbiTest, SubscribeCursorNextDeliversEvents) {
+    OpenWithTable();
+    ASSERT_EQ(rtdb_abi_subscribe(engine_, nullptr, 0, &cursor_), RTDB_OK);
+    ASSERT_NE(cursor_, nullptr);
+    EXPECT_EQ(rtdb_abi_cursor_position(cursor_),
+              static_cast<uint64_t>(rtdb_abi_committed_seq(engine_)));
+
+    // 无变更：立即返回空批（changes = NULL，nchanges = 0）。
+    rtdb_batch batch;
+    std::memset(&batch, 0, sizeof(batch));
+    ASSERT_EQ(rtdb_abi_cursor_next(cursor_, 0, &batch), RTDB_OK);
+    EXPECT_EQ(batch.nchanges, 0u);
+    EXPECT_EQ(batch.changes, nullptr);
+
+    // insert（行式）→ 事件交付。
+    const rtdb_value vals[3] = {Int(1), Real(1.5), Text("a")};
+    ASSERT_EQ(rtdb_abi_insert(engine_, table_, vals, 3, nullptr), RTDB_OK);
+
+    // update（列式覆盖：id=1 已存在 → 整行覆盖）。
+    const int64_t ids[1] = {1};
+    const double reals[1] = {2.5};
+    const char* tags[1] = {"b"};
+    const uint32_t tag_lens[1] = {1};
+    rtdb_column cols[3];
+    std::memset(cols, 0, sizeof(cols));
+    cols[0].name = "id";
+    cols[0].type = RTDB_T_INT64;
+    cols[0].data = ids;
+    cols[1].name = "val";
+    cols[1].type = RTDB_T_FLOAT64;
+    cols[1].data = reals;
+    cols[2].name = "tag";
+    cols[2].type = RTDB_T_UTF8VAR;
+    cols[2].data = tags;
+    cols[2].lengths = tag_lens;
+    ASSERT_EQ(rtdb_abi_upsert_block(engine_, "t", cols, 3, 1, nullptr), RTDB_OK);
+
+    ASSERT_EQ(rtdb_abi_cursor_next(cursor_, 500, &batch), RTDB_OK);
+    ASSERT_EQ(batch.nchanges, 2u);
+    const rtdb_change& c0 = batch.changes[0];
+    EXPECT_EQ(c0.kind, RTDB_CHG_INSERT);
+    EXPECT_GT(c0.table_id, 0);
+    EXPECT_EQ(std::string(c0.table), "t");
+    ASSERT_EQ(c0.row.nvals, 3u);
+    EXPECT_EQ(c0.row.vals[0].int_value, 1);
+    EXPECT_DOUBLE_EQ(c0.row.vals[1].real_value, 1.5);
+    // 变长列：插入事件已被列式覆盖写取代（池块回收）→ 交付 NULL。
+    EXPECT_EQ(c0.row.vals[2].is_null, 1);
+    const rtdb_change& c1 = batch.changes[1];
+    EXPECT_EQ(c1.kind, RTDB_CHG_UPDATE);
+    EXPECT_GT(c1.seq, c0.seq);
+    ASSERT_EQ(c1.row.nvals, 3u);
+    EXPECT_DOUBLE_EQ(c1.row.vals[1].real_value, 2.5);
+    // 覆盖事件为行当前版本 → 变长列交付真实值。
+    EXPECT_EQ(std::string(c1.row.vals[2].bytes, c1.row.vals[2].bytes_len), "b");
+    EXPECT_EQ(batch.last_seq, static_cast<uint64_t>(rtdb_abi_committed_seq(engine_)));
+    rtdb_abi_free_batch(&batch);
+    EXPECT_EQ(batch.changes, nullptr);  // 释放后清零
+    rtdb_abi_free_batch(&batch);        // 重复释放安全
+
+    // 位置查询与重置（溢出重同步路径的接口契约）。
+    rtdb_abi_cursor_reset(cursor_, static_cast<uint64_t>(rtdb_abi_committed_seq(engine_)));
+    EXPECT_EQ(rtdb_abi_cursor_position(cursor_),
+              static_cast<uint64_t>(rtdb_abi_committed_seq(engine_)));
+    std::memset(&batch, 0, sizeof(batch));
+    EXPECT_EQ(rtdb_abi_cursor_next(cursor_, 0, &batch), RTDB_OK);
+    EXPECT_EQ(batch.nchanges, 0u);
+
     TearDownClose();
 }
 

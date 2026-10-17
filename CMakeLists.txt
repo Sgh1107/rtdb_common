@@ -147,6 +147,7 @@ if(RTDB_BUILD_TESTS)
     tests/unit/test_table_store.cpp
     tests/unit/test_wal.cpp
     tests/unit/test_w5.cpp
+    tests/unit/test_subscribe.cpp
     tests/unit/test_native_api.cpp
     tests/unit/test_record_block.cpp
     tests/unit/test_concurrency.cpp

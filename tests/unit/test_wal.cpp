@@ -265,6 +265,142 @@ TEST_F(WalRingTest, LargeRecordWrapNeverOverwrites) {
     EXPECT_EQ(recs.size(), filled + 1);
 }
 
+/// ScanRange（M3-W2 订阅增量面）：窗口交付/回调停止/预算截断/空区间/
+/// 溢出判据。语义：回调返回 false → 当前记录不计入交付（可从该记录重扫）。
+TEST_F(WalRingTest, ScanRangeWindowStopAndOverflow) {
+    storage::WalRing* ring = MakeRegionAndRing();
+    ASSERT_NE(ring, nullptr);
+    uint64_t seq = 0;
+    for (int i = 1; i <= 4; ++i) {
+        const uint8_t p = static_cast<uint8_t>(i);
+        ASSERT_TRUE(IsOk(ring->Append(storage::kWalOpInsert, 1, static_cast<uint64_t>(i), 2, &p, 1,
+                                      &seq)));
+    }
+    ASSERT_EQ(seq, 4u);
+
+    std::vector<uint64_t> got;
+    const auto collect = [&got](const storage::WalRecordView& v) -> bool {
+        got.push_back(v.seq);
+        return true;
+    };
+    uint64_t last = 0;
+
+    // 窗口 (1,3]：仅交付 2/3；游标推进到 3。
+    EXPECT_TRUE(IsOk(ring->ScanRange(1, 3, collect, &last)));
+    EXPECT_EQ(got, std::vector<uint64_t>({2u, 3u}));
+    EXPECT_EQ(last, 3u);
+
+    // 接续 (3,4]：不重复交付 3。
+    got.clear();
+    EXPECT_TRUE(IsOk(ring->ScanRange(last, 4, collect, &last)));
+    EXPECT_EQ(got, std::vector<uint64_t>({4u}));
+    EXPECT_EQ(last, 4u);
+
+    // 回调 false：当前记录不计入交付（无缺漏，可重扫）。
+    last = 0;
+    EXPECT_TRUE(IsOk(ring->ScanRange(0, 4, [](const storage::WalRecordView&) { return false; },
+                                     &last)));
+    EXPECT_EQ(last, 0u);
+
+    // 预算截断：交付前 2 条后主动停 —— 剩余由下一次窗口接续。
+    got.clear();
+    last = 0;
+    EXPECT_TRUE(IsOk(ring->ScanRange(
+        0, 4,
+        [&got](const storage::WalRecordView& v) -> bool {
+            if (got.size() >= 2) return false;
+            got.push_back(v.seq);
+            return true;
+        },
+        &last)));
+    EXPECT_EQ(got, std::vector<uint64_t>({1u, 2u}));
+    EXPECT_EQ(last, 2u);
+
+    // 空区间 / 起点越过已写入上限：正常空交付（无溢出误报）。
+    got.clear();
+    last = 99;
+    EXPECT_TRUE(IsOk(ring->ScanRange(4, 4, collect, &last)));
+    EXPECT_EQ(last, 4u);
+    EXPECT_TRUE(got.empty());
+    EXPECT_TRUE(IsOk(ring->ScanRange(9, 20, collect, &last)));
+    EXPECT_TRUE(got.empty());
+
+    // 溢出判据：丢弃保留段后 from+1 < oldest_seq → kCursorOverflow。
+    ring->DropAllRetained();
+    EXPECT_EQ(ring->oldest_seq(), 5u);
+    EXPECT_EQ(ring->ScanRange(0, 4, collect, &last), Err::kCursorOverflow);
+    // 重置到最新（= oldest-1 起点不失真）：空环区间正常。
+    EXPECT_TRUE(IsOk(ring->ScanRange(4, 4, collect, &last)));
+}
+
+/// ScanRange 跨回绕：seq 连续性与窗口上界截断（回绕后仍可增量续读）。
+TEST_F(WalRingTest, ScanRangeAcrossWrapDeliversWindow) {
+    storage::WalRing* ring = MakeRegionAndRing();
+    ASSERT_NE(ring, nullptr);
+
+    uint64_t total = 0;
+    uint64_t appended = 0;
+    for (uint32_t len = 0;; len = (len + 4) % 12) {
+        const uint64_t need = storage::WalRing::RecordBytes(len);
+        if (!ring->HasRoomFor(need)) break;
+        std::vector<uint8_t> payload(len, static_cast<uint8_t>(len));
+        uint64_t seq = 0;
+        ASSERT_TRUE(IsOk(ring->Append(storage::kWalOpInsert, 1, appended, 2,
+                                      len != 0 ? payload.data() : nullptr, len, &seq)));
+        EXPECT_EQ(seq, ++total);
+        ++appended;
+    }
+    ASSERT_GT(appended, 500u);
+    const uint64_t oldest = ring->oldest_seq();
+    EXPECT_EQ(oldest, 1u);
+
+    std::vector<uint64_t> got;
+    const auto collect = [&got](const storage::WalRecordView& v) -> bool {
+        got.push_back(v.seq);
+        return true;
+    };
+    uint64_t last = 0;
+
+    // 全窗：oldest-1 → total 连续交付。
+    EXPECT_TRUE(IsOk(ring->ScanRange(oldest - 1, total, collect, &last)));
+    ASSERT_EQ(got.size(), appended);
+    for (size_t i = 0; i < got.size(); ++i) EXPECT_EQ(got[i], oldest + i);
+    EXPECT_EQ(last, total);
+
+    // 上界截断：只交付前 100 条。
+    got.clear();
+    EXPECT_TRUE(IsOk(ring->ScanRange(oldest - 1, oldest + 99, collect, &last)));
+    ASSERT_EQ(got.size(), 100u);
+    EXPECT_EQ(got.front(), oldest);
+    EXPECT_EQ(got.back(), oldest + 99);
+    EXPECT_EQ(last, oldest + 99);
+}
+
+/// ScanRange 撕裂尾：CRC 不匹配止步于其前（与 ScanValid 同语义）。
+TEST_F(WalRingTest, ScanRangeTornTailStopsCleanly) {
+    storage::WalRing* ring = MakeRegionAndRing();
+    ASSERT_NE(ring, nullptr);
+    uint64_t seq = 0;
+    for (int i = 0; i < 3; ++i) {
+        const uint8_t p[2] = {static_cast<uint8_t>(i), 0x11};
+        ASSERT_TRUE(IsOk(ring->Append(storage::kWalOpInsert, 1, 0, 2, p, 2, &seq)));
+    }
+    // 破坏第 2 条载荷首字节（记录区起点 + 首条长度 + 头长）。
+    const uint64_t rec1 = storage::WalRing::RecordBytes(2);
+    AreaBytes()[rec1 + storage::kWalRecHdrBytes] ^= 0xFF;
+
+    std::vector<uint64_t> got;
+    uint64_t last = 0;
+    EXPECT_TRUE(IsOk(ring->ScanRange(0, 3,
+                                     [&got](const storage::WalRecordView& v) -> bool {
+                                         got.push_back(v.seq);
+                                         return true;
+                                     },
+                                     &last)));
+    EXPECT_EQ(got, std::vector<uint64_t>({1u}));
+    EXPECT_EQ(last, 1u);
+}
+
 TEST_F(WalRingTest, PoisonPersistsAcrossAttach) {
     storage::WalRing* ring = MakeRegionAndRing();
     ASSERT_NE(ring, nullptr);

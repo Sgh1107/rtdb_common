@@ -215,6 +215,24 @@ public:
     /// \brief 已占用行槽数（含墓碑）。
     uint64_t used_rows() const noexcept { return desc_->row_count; }
 
+    /// \brief 增量解码：WAL insert/update 记录 → 行值（订阅/网络增量，
+    /// docs/13 §3-W2）。
+    ///
+    /// 记录 = 内联列固定区 + 扩展列后缀；输出 = 内联列 + 后缀携带的
+    /// 扩展列值（该次写入未提供的扩展列不产出——惰性默认值语义由
+    /// 消费方按 schema 补充）。撕裂/畸形输入返回空序列（调用方跳过）。
+    ///
+    /// 变长列（utf8/bytes）的字节块存于表内池（记录仅含池引用），覆盖写
+    /// 会回收旧块——仅当事件仍为行当前版本（row_no/row_ver 相同且未
+    /// 墓碑）时解码交付真实值，否则交付 NULL（消费方按需按主键重取）。
+    /// 调用方须持根锁（与写路径互斥，保证版本判定与池读取原子）。
+    std::vector<ColumnValue> DecodeWalRow(const uint8_t* rec, uint32_t rec_len, uint64_t row_no,
+                                          uint64_t row_ver) const noexcept;
+
+    /// \brief 增量解码：WAL delete 载荷（8B 有序主键编码）→ 主键值。
+    /// 载荷非法返回 Null。
+    ColumnValue DecodeWalKey(const uint8_t* key8) const noexcept;
+
     /// \brief 结构不变量校验（测试与诊断）：
     /// 索引规模 + 墓碑数 == 已用槽数，且版本数组均为稳定偶数。
     Err Validate(uint64_t* out_index_entries = nullptr) const noexcept;
@@ -230,6 +248,9 @@ private:
     uint8_t* RowPtr(uint64_t row_no) const noexcept;
     /// \brief 行版本槽。
     uint64_t* VersionSlot(uint64_t row_no) const noexcept;
+
+    /// 行是否为指定版本且未墓碑（订阅解码的池引用有效性门，M3-W2）。
+    bool IsCurrentRowVersion(uint64_t row_no, uint64_t row_ver) const noexcept;
     /// \brief 墓碑位判定。
     bool IsTombstoned(uint64_t row_no) const noexcept;
     void SetTombstone(uint64_t row_no, bool dead) const noexcept;

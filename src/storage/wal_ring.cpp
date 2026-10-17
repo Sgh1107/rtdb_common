@@ -264,6 +264,88 @@ Err WalRing::ScanValid(const RecordFn& fn, uint64_t* out_last_seq) const {
     return Err::kOk;
 }
 
+Err WalRing::ScanRange(uint64_t from_seq_excl, uint64_t to_seq_incl, const ScanRangeFn& fn,
+                       uint64_t* out_last_seq) const {
+    if (out_last_seq != nullptr) *out_last_seq = from_seq_excl;
+    if (hdr_ == nullptr || hdr_->magic != kWalRingMagic) return Err::kCorruption;
+    if (to_seq_incl <= from_seq_excl) return Err::kOk;  // 空区间：无数据需求
+    if (from_seq_excl + 1 < hdr_->tail_seq) return Err::kCursorOverflow;
+    if (hdr_->head_seq < hdr_->tail_seq) return Err::kCorruption;
+    if (hdr_->head_seq == hdr_->tail_seq) return Err::kOk;       // 空环
+    if (from_seq_excl + 1 >= hdr_->head_seq) return Err::kOk;    // 起点越过已写入上限
+
+    uint64_t pos = hdr_->tail_pos;
+    const uint64_t head_pos = hdr_->head_pos;
+    uint64_t expect_seq = hdr_->tail_seq;
+    uint64_t last = from_seq_excl;
+    // 步数上界：每条记录 ≥ kWalMinRecordBytes；回绕垫片与裸回绕额外留余量。
+    const uint64_t max_steps = area_bytes_ / kWalMinRecordBytes + 16;
+    uint64_t steps = 0;
+    bool first = true;  // 满环时 tail_pos == head_pos，仍须扫整环一圈
+
+    while (first || pos != head_pos) {
+        first = false;
+        if (++steps > max_steps) return Err::kCorruption;
+
+        const uint64_t remaining = area_bytes_ - pos;
+        if (remaining < kWalMinRecordBytes) {  // 裸回绕垫片
+            pos = 0;
+            continue;
+        }
+
+        const uint32_t total_len = DecodeU32LE(area_ + pos);
+        if (total_len < kWalMinRecordBytes || pos + total_len > area_bytes_) break;  // 撕裂尾部
+
+        const uint8_t op = area_[pos + 48];
+        const uint32_t crc_stored = DecodeU32LE(area_ + pos + total_len - kWalRecCrcBytes);
+        const uint32_t crc_calc = Crc32(area_ + pos, total_len - kWalRecCrcBytes);
+        if (crc_stored != crc_calc) {
+            // 撕裂 pad 抢救：pad 从不重放，total_len 完好即可跳过。
+            if (op == kWalOpPad) {
+                pos += total_len;
+                if (pos >= area_bytes_) pos = 0;
+                continue;
+            }
+            break;  // 撕裂尾部：有效数据终点
+        }
+
+        if (op == kWalOpPad) {
+            pos += total_len;
+            if (pos >= area_bytes_) pos = 0;
+            continue;
+        }
+
+        const uint64_t seq = DecodeU64LE(area_ + pos + 8);
+        if (seq != expect_seq) return Err::kCorruption;  // 环内不允许 seq 断档
+        const uint32_t payload_len = DecodeU32LE(area_ + pos + 4);
+        if (kWalRecHdrBytes + static_cast<uint64_t>(payload_len) + kWalRecCrcBytes > total_len)
+            return Err::kCorruption;
+
+        if (seq > to_seq_incl) break;  // 越过区间上界：正常结束
+
+        if (seq > from_seq_excl) {
+            WalRecordView view;
+            view.seq = seq;
+            view.ts_ns = DecodeU64LE(area_ + pos + 16);
+            view.row_no = DecodeU64LE(area_ + pos + 24);
+            view.row_ver = DecodeU64LE(area_ + pos + 32);
+            view.table_id = static_cast<int64_t>(DecodeU64LE(area_ + pos + 40));
+            view.op = op;
+            view.payload_len = payload_len;
+            view.payload = payload_len != 0 ? area_ + pos + kWalRecHdrBytes : nullptr;
+            const bool keep = (fn == nullptr) ? true : fn(view);
+            if (!keep) break;  // 当前记录未交付：游标停在它之前
+            last = seq;
+        }
+        expect_seq = seq + 1;
+        pos += total_len;
+        if (pos >= area_bytes_) pos = 0;
+    }
+
+    if (out_last_seq != nullptr) *out_last_seq = last;
+    return Err::kOk;
+}
+
 // ============================================================
 // 恢复重放（docs/08 §3-W4 恢复路径 v1）
 // ============================================================

@@ -19,13 +19,16 @@
  * 与 docs/04 §4 草签的差异（已在 docs/10 §2-M2-D3 记录）：
  *  - rtdb_abi_open 增补 wal_fsync 档位参数（打开时确定组提交档位）；
  *  - 句柄类型由 void* 收敛为不透明 typedef（C 侧免强制转换）；
- *  - 订阅族（rtdb_abi_subscribe 等）随 M3 会话层追加。
+ *  - 订阅族（rtdb_abi_subscribe 等）随 M3 会话层追加——已在 M3-W2
+ *    以 v2 只增符号落地（docs/13 §3-D8）。
  */
 
 #include <stddef.h>
 #include <stdint.h>
 
-#define RTDB_ABI_VER 1
+/* ABI 版本：1 = M2 基线（docs/10 §2-M2-D3）；2 = M3-W2 订阅族
+ * （只增符号，v1 语义/签名未变，docs/13 §3-D8）。 */
+#define RTDB_ABI_VER 2
 
 /* ---- 导出宏（自包含，不依赖 C++ 头 api_macro.hpp）---- */
 #if defined(_WIN32)
@@ -67,9 +70,15 @@ extern "C" {
 #define RTDB_ERR_SCHEMA_MISMATCH 304
 #define RTDB_ERR_BATCH_ABORTED 305
 #define RTDB_ERR_LIMIT_EXCEEDED 306
-/* 4xx 服务端（保留） */
+/* 4xx 服务端（M3 订阅/会话族；403/404 由 W3 rtdbd 使用） */
 #define RTDB_ERR_NOT_IMPLEMENTED 400
 #define RTDB_ERR_NETWORK 401
+#define RTDB_ERR_CURSOR_OVERFLOW 402
+#define RTDB_ERR_PROTOCOL 403
+#define RTDB_ERR_TOO_MANY_SESSIONS 404
+/* 5xx 认证（M3；由 W3 rtdbd 使用） */
+#define RTDB_ERR_AUTH_FAILED 501
+#define RTDB_ERR_TOKEN_EXPIRED 502
 /* 兜底 */
 #define RTDB_ERR_INTERNAL 999
 
@@ -144,6 +153,33 @@ typedef struct rtdb_rows {
     size_t nrows;
 } rtdb_rows;
 
+/* ---- 不透明句柄（v2 订阅族）---- */
+typedef struct rtdb_cursor rtdb_cursor;
+
+/* ---- 变更事件（v2；kind 与 rtdb::ChangeEvent::Kind 同值）---- */
+#define RTDB_CHG_INSERT 1
+#define RTDB_CHG_UPDATE 2
+#define RTDB_CHG_DELETE 3
+
+typedef struct rtdb_change {
+    int32_t kind;      /* RTDB_CHG_* */
+    int64_t table_id;  /* 表 id（订阅时解析的表名快照） */
+    const char* table; /* 表名（库内缓冲，随批结果释放） */
+    uint64_t seq;      /* WAL 序号（严格递增） */
+    uint64_t ts_ns;    /* 写入时刻（Unix 纳秒） */
+    uint64_t row_no;   /* 行槽号 */
+    uint64_t row_ver;  /* 应用后的行版本 */
+    rtdb_row row;      /* insert/update：整行（该次写入的列）；delete：空 */
+    rtdb_value key;    /* delete：被删主键；insert/update 为 NULL 值 */
+} rtdb_change;
+
+/* ---- 增量批结果（rtdb_abi_cursor_next 输出，须 rtdb_abi_free_batch 释放）---- */
+typedef struct rtdb_batch {
+    rtdb_change* changes;
+    size_t nchanges;
+    uint64_t last_seq; /* 本次推进后的游标位置（≥ 批内最后事件 seq） */
+} rtdb_batch;
+
 /* ===================== 符号集（v1）===================== */
 
 /* ABI 版本（= RTDB_ABI_VER）。 */
@@ -204,6 +240,35 @@ RTDB_CABI_API void rtdb_abi_free_row(rtdb_row* row);
 
 /* 释放多行结果（同上）。 */
 RTDB_CABI_API void rtdb_abi_free_rows(rtdb_rows* rows);
+
+/* ===================== 符号集（v2 订阅族；只增不改）===================== */
+
+/* 订阅变更（嵌入增量会话，docs/13 §3-D1）。tables/ntables 为过滤表名
+ * 集合（任一表名不存在返回 RTDB_ERR_TABLE_NOT_FOUND）；ntables = 0
+ * （tables 传 NULL）表示全部活跃表。成功时 *out 游标须
+ * rtdb_abi_cursor_close 释放；游标不拥有引擎，须先于 rtdb_abi_close
+ * 关闭。Reader 主角色（未挂载 WAL 环）返回 RTDB_ERR_UNSUPPORTED。 */
+RTDB_CABI_API int32_t rtdb_abi_subscribe(rtdb_engine* engine, const char* const* tables,
+                                         size_t ntables, rtdb_cursor** out);
+
+/* 拉取增量。有变更 → 填充批（nchanges ≥ 1，须 rtdb_abi_free_batch 释放）；
+ * 无变更 → 等待至多 timeout_ms（0 = 立即返回）后返回空批（RTDB_OK 且
+ * nchanges == 0）。游标落后于环回收窗口 → RTDB_ERR_CURSOR_OVERFLOW：
+ * 调用方须全量重取并以 rtdb_abi_cursor_reset(快照 seq) 重置游标。 */
+RTDB_CABI_API int32_t rtdb_abi_cursor_next(rtdb_cursor* cursor, uint32_t timeout_ms,
+                                           rtdb_batch* out);
+
+/* 当前游标位置（下次交付的起点；失败/空句柄返回 0）。 */
+RTDB_CABI_API uint64_t rtdb_abi_cursor_position(rtdb_cursor* cursor);
+
+/* 重置游标（溢出重同步 / 手动跳转）。 */
+RTDB_CABI_API void rtdb_abi_cursor_reset(rtdb_cursor* cursor, uint64_t seq);
+
+/* 释放游标（不释放引擎/表句柄）。 */
+RTDB_CABI_API void rtdb_abi_cursor_close(rtdb_cursor* cursor);
+
+/* 释放增量批结果（内部缓冲一并回收；可重复调用/传 NULL 安全）。 */
+RTDB_CABI_API void rtdb_abi_free_batch(rtdb_batch* batch);
 
 #ifdef __cplusplus
 } /* extern "C" */
