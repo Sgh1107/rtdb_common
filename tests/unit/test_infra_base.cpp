@@ -1,11 +1,13 @@
-/// 基础设施回归：CRC32、错误文本、Engine 生命周期全路径。
+/// 基础设施回归：CRC32、SHA-256、错误文本、Engine 生命周期全路径。
 
+#include <array>
 #include <filesystem>
 #include <fstream>
 
 #include <gtest/gtest.h>
 
 #include "infra/crc32.hpp"
+#include "infra/sha256.hpp"
 #include "rtdb/engine.hpp"
 
 namespace fs = std::filesystem;
@@ -35,6 +37,56 @@ TEST(InfraBase, Crc32IeeeKnownVector) {
 
 TEST(InfraBase, ErrorMessageKnownCode) {
     EXPECT_NE(rtdb::ErrorMessage(rtdb::Err::kBadSuperBlock), nullptr);
+}
+
+TEST(InfraBase, Sha256KnownVectors) {
+    // FIPS 180-4 / NIST 示例向量（空串、"abc"、两句拼接）。
+    EXPECT_EQ(rtdb::infra::DigestToHex(rtdb::infra::Sha256("", 0)),
+              "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    EXPECT_EQ(rtdb::infra::DigestToHex(rtdb::infra::Sha256("abc", 3)),
+              "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    const std::string two_block =
+        "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    EXPECT_EQ(rtdb::infra::DigestToHex(
+                  rtdb::infra::Sha256(two_block.data(), two_block.size())),
+              "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+    // 一百万 'a'（FIPS 长向量）——流式分块喂入，顺带覆盖多块路径。
+    {
+        const std::string chunk(1000, 'a');
+        rtdb::infra::Sha256Ctx ctx;
+        for (int i = 0; i < 1000; ++i) ctx.Update(chunk.data(), chunk.size());
+        EXPECT_EQ(rtdb::infra::DigestToHex(ctx.Final()),
+                  "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+    }
+}
+
+TEST(InfraBase, Sha256ChunkedAndHexRoundtrip) {
+    const std::string msg(1000, 'x');
+    // 分块（含 0 长度片段、跨 64B 边界）与一次性等价。
+    rtdb::infra::Sha256Ctx ctx;
+    size_t off = 0;
+    const size_t steps[] = {0, 1, 63, 64, 65, 200};
+    for (size_t s : steps) {
+        ctx.Update(msg.data() + off, s);
+        off += s;
+    }
+    ctx.Update(msg.data() + off, msg.size() - off);
+    EXPECT_EQ(rtdb::infra::DigestToHex(ctx.Final()),
+              rtdb::infra::DigestToHex(rtdb::infra::Sha256(msg.data(), msg.size())));
+
+    // 拼接摘要 == 合并字节摘要（AUTH 口令路径）。
+    EXPECT_EQ(rtdb::infra::DigestToHex(rtdb::infra::Sha256Concat("salt-", "pw")),
+              rtdb::infra::DigestToHex(rtdb::infra::Sha256("salt-pw", 7)));
+
+    // hex 往返 + 定长常量时间比较。
+    const auto d = rtdb::infra::Sha256("abc", 3);
+    std::array<uint8_t, 32> back{};
+    EXPECT_TRUE(rtdb::infra::FromHex(rtdb::infra::DigestToHex(d), back.data(), back.size()));
+    EXPECT_TRUE(rtdb::infra::ConstantTimeEqual(d.data(), back.data(), back.size()));
+    back[31] ^= 1;
+    EXPECT_FALSE(rtdb::infra::ConstantTimeEqual(d.data(), back.data(), back.size()));
+    EXPECT_FALSE(rtdb::infra::FromHex("zz", back.data(), 1));   // 非法字符
+    EXPECT_FALSE(rtdb::infra::FromHex("abc", back.data(), 1));  // 长度不符
 }
 
 class EngineLifecycleTest : public ::testing::Test {

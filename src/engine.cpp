@@ -1560,4 +1560,56 @@ Result<ChangeBatch> ChangeCursor::Next(uint32_t timeout_ms) {
     }
 }
 
+// ============================================================
+// 元数据与心跳（M3-W3，rtdbd 服务端）
+// ============================================================
+
+Result<std::vector<ColumnDef>> Engine::DescribeTable(const TableHandle& table) {
+    if (impl_ == nullptr || !table.IsValid())
+        return Result<std::vector<ColumnDef>>::Fail(Err::kInvalidArgument);
+    // 持根锁读取：与在线加列（ext 链挂接）互斥，列元数据自洽。
+    infra::ShmRootMutexGuard guard(impl_->region->root_mutex(), kEngineLockTimeoutMs);
+    if (!guard.locked()) return Result<std::vector<ColumnDef>>::Fail(guard.error());
+    const storage::shm_TableDescriptor* desc = impl_->catalog->Descriptor(table.desc_off());
+    if (desc == nullptr || desc->magic != storage::kTableDescMagic ||
+        desc->table_id != static_cast<uint64_t>(table.table_id()) ||
+        desc->state != static_cast<uint32_t>(storage::TableState::kActive)) {
+        return Result<std::vector<ColumnDef>>::Fail(Err::kTableNotFound);
+    }
+    const uint32_t visible = table.visible_column_count();
+    const uint32_t available = desc->col_count + desc->ext_col_count;
+    const uint32_t take = visible < available ? visible : available;
+    std::vector<ColInfo> meta;
+    const Err ce = CollectColumnInfo(impl_->region->base_address(), desc, take, &meta);
+    if (!IsOk(ce)) return Result<std::vector<ColumnDef>>::Fail(ce);
+
+    std::vector<ColumnDef> out;
+    out.reserve(take);
+    for (uint32_t i = 0; i < take; ++i) {
+        ColumnDef cd;
+        cd.name = meta[i].name != nullptr ? meta[i].name : "";
+        cd.type = meta[i].type;
+        // 内联列携带描述符定长覆盖；ext 列恒沿用类型固有宽度（len=0）。
+        cd.len = i < desc->col_count ? desc->cols[i].len : 0;
+        cd.nullable = meta[i].nullable;
+        out.push_back(std::move(cd));
+    }
+    return Result<std::vector<ColumnDef>>::Ok(std::move(out));
+}
+
+void Engine::RefreshWriterHeartbeat() noexcept {
+    if (impl_ == nullptr || impl_->region == nullptr) return;
+    if (impl_->region->allocator() == nullptr) return;  // Reader：只读映射不写
+    auto* hb = layout::AsAtomicU64(&impl_->region->super_block()->writer_heartbeat_ns);
+    const uint64_t now_ns = static_cast<uint64_t>(
+        std::chrono::system_clock::now().time_since_epoch().count());
+    hb->store(now_ns, std::memory_order_release);
+}
+
+int64_t Engine::WriterHeartbeatNs() const noexcept {
+    if (impl_ == nullptr || impl_->region == nullptr) return 0;
+    auto* hb = layout::AsAtomicU64(&impl_->region->super_block()->writer_heartbeat_ns);
+    return static_cast<int64_t>(hb->load(std::memory_order_acquire));
+}
+
 }  // namespace rtdb

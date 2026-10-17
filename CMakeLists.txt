@@ -26,6 +26,7 @@ set(rtdb_core_sources
   src/api/c_abi.cpp
   src/infra/err.cpp
   src/infra/failpoint.cpp
+  src/infra/sha256.cpp
   src/infra/shm_region.cpp
   src/infra/slab_allocator.cpp
   src/infra/shm_mutex.cpp
@@ -110,6 +111,35 @@ else()
 endif()
 
 # ---------------------------------------------------------------
+# 服务端：rtdbserver（rtdbd 核心，M3-W3，docs/13 §5）
+# 静态库：同进程集成测试直接持 Server 对象；rtdbd 可执行仅入口。
+# ---------------------------------------------------------------
+add_library(rtdbserver STATIC
+  src/server/config.cpp
+  src/server/server.cpp
+)
+target_compile_features(rtdbserver PUBLIC cxx_std_17)
+target_include_directories(rtdbserver
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(rtdbserver PUBLIC rtdbnet rtdbcore)
+if(MSVC)
+  target_compile_options(rtdbserver PRIVATE /W4 /permissive- /utf-8)
+else()
+  target_compile_options(rtdbserver PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(rtdbd src/server/main.cpp)
+target_include_directories(rtdbd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(rtdbd PRIVATE rtdbserver)
+if(MSVC)
+  target_compile_options(rtdbd PRIVATE /W4 /permissive- /utf-8)
+else()
+  target_compile_options(rtdbd PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# ---------------------------------------------------------------
 # 单元测试：GoogleTest 驱动
 # ---------------------------------------------------------------
 if(RTDB_BUILD_TESTS)
@@ -155,9 +185,15 @@ if(RTDB_BUILD_TESTS)
     tests/unit/test_proto.cpp
     tests/unit/test_net.cpp
     tests/unit/test_ipc_wait.cpp
+    tests/unit/test_server.cpp
   )
   add_executable(rtdb_unit_tests ${rtdb_test_sources})
-  target_link_libraries(rtdb_unit_tests PRIVATE rtdbcore rtdbnet GTest::gtest_main)
+  target_link_libraries(rtdb_unit_tests PRIVATE rtdbcore rtdbnet rtdbserver GTest::gtest_main)
+  # rtdbd 拉起烟测（test_server）：把可执行路径编进测试（生成器表达式，
+  # 单/多配置构建都指向真实产物）。
+  target_compile_definitions(rtdb_unit_tests PRIVATE
+    RTDBD_EXE_PATH="$<TARGET_FILE:rtdbd>"
+  )
   target_include_directories(rtdb_unit_tests
     PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}

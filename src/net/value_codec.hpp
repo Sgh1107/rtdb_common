@@ -42,6 +42,11 @@ void WriteValue(Writer& w, const ColumnValue& v) noexcept;
 /// 按 schema 列类型读单值；tag 与列类不相容时置 Reader 失败态。
 ColumnValue ReadValueTyped(Reader& r, DataType col_type) noexcept;
 
+/// 读自描述值（无 schema 预知）：NULL / i64 / f64 / var（UTF-8 文本）。
+/// 变更事件等流式增量场景用（服务端以 `WriteValue` 编码，见 docs/13 §5-W3）；
+/// 非法 tag 置 Reader 失败态并返回 Null。
+ColumnValue ReadValueGeneric(Reader& r) noexcept;
+
 /// 写整行（逐值；长度由 schema 决定，不写入行内长度）。
 void WriteRow(Writer& w, const std::vector<ColumnValue>& row) noexcept;
 

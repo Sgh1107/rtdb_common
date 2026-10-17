@@ -232,6 +232,26 @@ public:
     ///         `kUnsupported`。
     Result<ChangeCursor> Subscribe(const std::vector<std::string>& tables);
 
+    // ------------------ 元数据与心跳（M3-W3，rtdbd 服务端）------------------
+    /// \brief 取句柄可见列的 schema 快照（名/类型/定长字节/可空性）。
+    ///
+    /// 返回列数 = 句柄可见列数（`GetByKey` 同语义：建表列 + 句柄绑定
+    /// 时刻的扩展列）；列序与行值一致。服务端 DDL 描述、结果集头、
+    /// 批量值类型校验依赖本面（docs/13 §3-W3）。
+    ///
+    /// 持根锁读取（与在线加列互斥，扩展列链稳定）；表句柄失效/
+    /// 描述符损坏返回 `kTableNotFound` / `kInvalidArgument`。
+    Result<std::vector<ColumnDef>> DescribeTable(const TableHandle& table);
+
+    /// \brief 刷新写者心跳（`writer_heartbeat_ns` = 当前 Unix 纳秒）。
+    ///
+    /// rtdbd 心跳线程与嵌入写者均可周期调用；单字原子写，不取根锁，
+    /// Reader/无效引擎静默忽略（docs/13 §3-D7）。
+    void RefreshWriterHeartbeat() noexcept;
+
+    /// \brief 写者心跳时间戳（Unix 纳秒；0 = 未刷新过/Reader）。
+    int64_t WriterHeartbeatNs() const noexcept;
+
     // ------------------ 冷快照（M1-W5，docs/03 §3.2/§3.3）------------------
     /// \brief 执行冷快照：停写（根锁）→ 全映像 flush → checkpoint_seq
     /// 推进到 committed_seq → 环可回收时丢弃保留记录 → 拷贝映像副本。

@@ -91,6 +91,21 @@ void WriteRow(Writer& w, const std::vector<ColumnValue>& row) noexcept {
     for (const ColumnValue& v : row) WriteValue(w, v);
 }
 
+ColumnValue ReadValueGeneric(Reader& r) noexcept {
+    const uint8_t tag = r.U8();
+    if (!r.ok()) return ColumnValue::Null();
+    if (tag == RTDB_VAL_NULL) return ColumnValue::Null();
+    if (tag == RTDB_VAL_I64) return ColumnValue::Int(r.I64());
+    if (tag == RTDB_VAL_F64) return ColumnValue::Real(r.F64());
+    if (tag == RTDB_VAL_VAR) {
+        std::string s;
+        if (!r.Var(&s)) return ColumnValue::Null();
+        return ColumnValue::Text(std::move(s));
+    }
+    r.Poison();
+    return ColumnValue::Null();
+}
+
 std::vector<ColumnValue> ReadRow(Reader& r, const std::vector<DataType>& col_types) noexcept {
     std::vector<ColumnValue> row;
     row.reserve(col_types.size());
