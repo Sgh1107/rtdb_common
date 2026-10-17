@@ -156,10 +156,17 @@ typedef struct rtdb_rows {
 /* ---- 不透明句柄（v2 订阅族）---- */
 typedef struct rtdb_cursor rtdb_cursor;
 
-/* ---- 变更事件（v2；kind 与 rtdb::ChangeEvent::Kind 同值）---- */
+/* ---- 变更事件（v2；kind 与 rtdb::ChangeEvent::Kind 同值）----
+ * `#ifndef` 保护：与 C++ 侧 proto_v1.h 的同名常量共存包含时不重定义。 */
+#ifndef RTDB_CHG_INSERT
 #define RTDB_CHG_INSERT 1
+#endif
+#ifndef RTDB_CHG_UPDATE
 #define RTDB_CHG_UPDATE 2
+#endif
+#ifndef RTDB_CHG_DELETE
 #define RTDB_CHG_DELETE 3
+#endif
 
 typedef struct rtdb_change {
     int32_t kind;      /* RTDB_CHG_* */

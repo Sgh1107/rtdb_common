@@ -140,6 +140,33 @@ else()
 endif()
 
 # ---------------------------------------------------------------
+# 客户端：rtdb_client（远程客户端库，M3-W4，docs/13 §5）
+# 复用 rtdbnet（帧/值编码 + TCP）；测试与服务端进程内配对。
+# ---------------------------------------------------------------
+set(rtdb_client_sources
+  src/client/rtdb_client.cpp
+  src/client/client_c_abi.cpp
+)
+if(RTDB_COVERAGE_STATIC_CORE)
+  add_library(rtdbclient STATIC ${rtdb_client_sources})
+  target_compile_definitions(rtdbclient PUBLIC RTDB_CLIENT_STATIC)
+else()
+  add_library(rtdbclient SHARED ${rtdb_client_sources})
+  target_compile_definitions(rtdbclient PRIVATE RTDB_CLIENT_BUILDING_DLL)
+endif()
+target_compile_features(rtdbclient PUBLIC cxx_std_17)
+target_include_directories(rtdbclient
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(rtdbclient PUBLIC rtdbnet rtdbcore)
+if(MSVC)
+  target_compile_options(rtdbclient PRIVATE /W4 /permissive- /utf-8)
+else()
+  target_compile_options(rtdbclient PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# ---------------------------------------------------------------
 # 单元测试：GoogleTest 驱动
 # ---------------------------------------------------------------
 if(RTDB_BUILD_TESTS)
@@ -186,9 +213,10 @@ if(RTDB_BUILD_TESTS)
     tests/unit/test_net.cpp
     tests/unit/test_ipc_wait.cpp
     tests/unit/test_server.cpp
+    tests/unit/test_client.cpp
   )
   add_executable(rtdb_unit_tests ${rtdb_test_sources})
-  target_link_libraries(rtdb_unit_tests PRIVATE rtdbcore rtdbnet rtdbserver GTest::gtest_main)
+  target_link_libraries(rtdb_unit_tests PRIVATE rtdbcore rtdbnet rtdbserver rtdbclient GTest::gtest_main)
   # rtdbd 拉起烟测（test_server）：把可执行路径编进测试（生成器表达式，
   # 单/多配置构建都指向真实产物）。
   target_compile_definitions(rtdb_unit_tests PRIVATE
@@ -246,18 +274,25 @@ if(RTDB_BUILD_EXAMPLES)
   target_link_libraries(cabi_demo PRIVATE rtdbcore)
   set_target_properties(cabi_demo PROPERTIES
     C_STANDARD 99 C_STANDARD_REQUIRED ON)
+  # M3-W4：双端远程演示（--serve 在进程内起服务端；默认客户端订阅打印）。
+  add_executable(remote_demo examples/remote_demo/main.cpp)
+  target_link_libraries(remote_demo PRIVATE rtdbclient rtdbserver)
+  target_include_directories(remote_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   if(MSVC)
     target_compile_options(embed_demo PRIVATE /W4 /permissive- /utf-8)
     target_compile_options(api_demo PRIVATE /W4 /permissive- /utf-8)
     target_compile_options(cabi_demo PRIVATE /W4 /utf-8)
+    target_compile_options(remote_demo PRIVATE /W4 /permissive- /utf-8)
   else()
     target_compile_options(embed_demo PRIVATE -Wall -Wextra)
     target_compile_options(api_demo PRIVATE -Wall -Wextra)
     target_compile_options(cabi_demo PRIVATE -Wall -Wextra)
+    target_compile_options(remote_demo PRIVATE -Wall -Wextra)
   endif()
   set_target_properties(embed_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
   set_target_properties(api_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
   set_target_properties(cabi_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+  set_target_properties(remote_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 endif()
 
 # ---------------------------------------------------------------
