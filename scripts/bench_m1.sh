@@ -7,6 +7,8 @@
 #   主键点查 P99                                 基线 ≤ 3μs
 #   范围扫描速率                                 基线 10 万行 ≤ 30ms
 #   WAL 重放速率                                 基线 1GB 日志 ≤ 60s
+# 另跑 --rtdb-bench-block（M2-W2 列式块）：
+#   RecordBlock 批量 upsert（8 列混合，512 行块循环） 基线 ≥ 1,000,000 行/s
 # 只做量级确认（M1 不设门禁；M2 引入 bench 基线后生效，docs/06 §4）。
 #
 # 用法：scripts/bench_m1.sh [行数]     # 默认 2000（受行数据区 ≤64KB 约束）
@@ -40,6 +42,8 @@ LOG="$WORK/bench_m1_$(date +%Y%m%d_%H%M%S).log"
 echo "=== bench_m1 $(date -u +%Y-%m-%dT%H:%M:%SZ) binary=$BIN rows=$ROWS ==="
 echo "--- per_second 档（热路径无 fsync，对标 P99 ≤ 10μs 基线场景）---"
 "$BIN" --rtdb-bench "$IMG" "$ROWS"
+echo "--- 列式块 upsert（docs/05 §4 ≥1,000,000 行/s，M2-W2）---"
+"$BIN" --rtdb-bench-block "$WORK/rtdb_bench_block.rtdb" 512
 } 2>&1 | tee "$LOG" | grep -E "^BENCH|^==="
 
 echo "证据日志: $LOG"

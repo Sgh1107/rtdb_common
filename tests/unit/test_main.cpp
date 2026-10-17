@@ -42,6 +42,11 @@
 ///   单行 upsert P99（per_second/always 两档）、主键点查 P99、
 ///   原子批吞吐、范围扫描速率、WAL 重放速率（多轮重开累计）。
 ///   M1 边界：WAL 环为单块 64KB（slab 最大级），重放样本以环内容为限。
+///
+/// 用法九：rtdb_unit_tests --rtdb-bench-block <image> <rows>
+///   M2-W2 列式块 bench（docs/05 §4 RecordBlock 批量 ≥1M 行/s）：
+///   8 列混合 × 512 行块循环 upsert（首轮插入、其后覆盖更新），
+///   口径 = 总行数/墙钟（含 WAL 落环，per_second 档）。
 
 #include <algorithm>
 #include <chrono>
@@ -332,6 +337,23 @@ int RunChaosWriteChild(const std::string& file_path, const std::string& scenario
         for (int64_t i = kSeed + 1; i <= kSeed + 3; ++i) {
             if (!eng->Insert(table, row(i)).IsOk()) return 14;
         }
+    } else if (scenario == "block") {
+        // M2-W2 列式块 upsert（docs/10 §2-M2-D2）：6 新键插入 + 2 既有键
+        // 更新混合块；注入点 block.commit.before / block.apply.mid 命中
+        // 即崩溃。值与播种同构（val=id*10），验证侧前缀/撕裂不变量通用。
+        std::vector<int64_t> ids;
+        std::vector<int64_t> vals;
+        for (int64_t i = kSeed + 1; i <= kSeed + 6; ++i) {
+            ids.push_back(i);
+            vals.push_back(i * 10);
+        }
+        ids.push_back(1);
+        vals.push_back(1 * 10);  // 既有键覆盖更新路径
+        ids.push_back(2);
+        vals.push_back(2 * 10);
+        rtdb::RecordBlock blk("t", static_cast<uint32_t>(ids.size()));
+        blk.AppendColumn("id", ids).AppendColumn("val", vals);
+        if (!eng->UpsertBatch(blk).IsOk()) return 15;
     } else {
         return 2;  // 未知场景
     }
@@ -791,6 +813,119 @@ int RunBenchChild(const std::string& file_path, uint32_t rows) {
     return 0;
 }
 
+/// M2-W2 列式块 bench（docs/05 §4 `RecordBlock 批量 upsert ≥ 1,000,000 行/s`；
+/// docs/10 §2-M2-D4）：8 列混合（4×i64 + 2×f64 + 1×utf8 + 1×时间戳），
+/// 512 行块循环 upsert（首轮插入、其后覆盖更新），口径 = 总行数 / 墙钟
+/// （含 WAL 落环，per_second 档）。
+int RunBenchBlockChild(const std::string& file_path, uint32_t rows) {
+    namespace ch = std::chrono;
+    std::error_code ec;
+    std::filesystem::remove(file_path, ec);
+    std::filesystem::remove(file_path + ".snap", ec);
+
+    // 8 列约 72B/行 → 64KB 行数据区 → row_cap ≤ 910；块取 512 行。
+    constexpr uint32_t kBlockRows = 512;
+    const uint32_t n = rows < kBlockRows ? rows : kBlockRows;
+    const uint32_t iters = n > 0 ? (500000u / n > 100u ? 500000u / n : 100u) : 0;
+    if (n == 0) {
+        std::printf("BENCH_FAIL block rows=0\n");
+        return 1;
+    }
+
+    rtdb::Options opts;
+    opts.instance = "bench_block";
+    opts.path = file_path;
+    opts.initial_size_bytes = 8ull * 1024 * 1024;
+    opts.role = rtdb::Role::Standalone;
+    opts.wal_fsync = rtdb::FsyncPolicy::PerSecond;
+
+    auto open = rtdb::Engine::Open(opts);
+    if (!open.IsOk()) {
+        std::printf("BENCH_FAIL block_open: %s\n", rtdb::ErrorMessage(open.Error()));
+        return 1;
+    }
+    auto eng = open.TakeValue();
+
+    rtdb::TableDef def;
+    def.name = "tb";
+    def.row_cap = n;
+    def.columns.push_back({"id", rtdb::DataType::kInt64, 0, false, false});
+    def.columns.push_back({"a", rtdb::DataType::kInt64, 0, true, false});
+    def.columns.push_back({"b", rtdb::DataType::kInt64, 0, true, false});
+    def.columns.push_back({"c", rtdb::DataType::kInt64, 0, true, false});
+    def.columns.push_back({"x", rtdb::DataType::kFloat64, 0, true, false});
+    def.columns.push_back({"y", rtdb::DataType::kFloat64, 0, true, false});
+    def.columns.push_back({"tag", rtdb::DataType::kUtf8Var, 0, true, false});
+    def.columns.push_back({"ts", rtdb::DataType::kUnixTsNs, 0, true, false});
+    auto t_res = eng->CreateTable(def);
+    if (!t_res.IsOk()) {
+        std::printf("BENCH_FAIL block_create: %s\n", rtdb::ErrorMessage(t_res.Error()));
+        return 1;
+    }
+
+    std::printf("BENCH block_rows=%u iterations=%u image=%s\n", n, iters, file_path.c_str());
+
+    // 列数据（确定性，n 行）。
+    std::vector<int64_t> ids(n), a(n), b(n), c(n), ts(n);
+    std::vector<double> x(n), y(n);
+    std::vector<std::string> tag_store(n);
+    std::vector<std::string_view> tags(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        ids[i] = static_cast<int64_t>(i) + 1;
+        a[i] = static_cast<int64_t>(i) * 2;
+        b[i] = static_cast<int64_t>(i) * 3;
+        c[i] = static_cast<int64_t>(i) * 5;
+        x[i] = static_cast<double>(i) * 0.5;
+        y[i] = static_cast<double>(i) * 1.5;
+        ts[i] = 1700000000000000000LL + static_cast<int64_t>(i);
+        tag_store[i] = "tag_" + std::to_string(i);
+        tags[i] = tag_store[i];
+    }
+
+    const auto run_block = [&](uint32_t iterations) -> double {
+        const auto t0 = ch::steady_clock::now();
+        for (uint32_t k = 0; k < iterations; ++k) {
+            rtdb::RecordBlock blk("tb", n);
+            blk.AppendColumn("id", ids)
+                .AppendColumn("a", a)
+                .AppendColumn("b", b)
+                .AppendColumn("c", c)
+                .AppendColumn("x", x)
+                .AppendColumn("y", y)
+                .AppendColumn("tag", tags)
+                .AppendColumn("ts", ts);
+            auto res = eng->UpsertBatch(blk);
+            if (!res.IsOk()) {
+                std::printf("BENCH_FAIL block_upsert: %s\n",
+                            rtdb::ErrorMessage(res.Error()));
+                return -1.0;
+            }
+        }
+        const auto t1 = ch::steady_clock::now();
+        return static_cast<double>(ch::duration_cast<ch::nanoseconds>(t1 - t0).count()) / 1e9;
+    };
+
+    // 首轮插入（不计时，仅预热：变长池/分配器/页缓存就位）。
+    if (run_block(1) < 0.0) return 1;
+
+    // 稳态：同块循环覆盖更新（docs/05 §4 口径：批量 upsert 行速率，
+    // 含 WAL 落环；插入路径与更新路径共用 staging/apply 链，单行
+    // Insert 已在 --rtdb-bench 的 P99 项覆盖）。
+    const double upsert_secs = run_block(iters);
+    if (upsert_secs < 0.0) return 1;
+    const double upsert_rps = upsert_secs > 0.0
+                                  ? static_cast<double>(n) * static_cast<double>(iters) /
+                                        upsert_secs
+                                  : 0.0;
+    std::printf("BENCH block_upsert_rows_per_sec=%.0f (rows=%llu secs=%.4f)\n", upsert_rps,
+                static_cast<unsigned long long>(n) * iters, upsert_secs);
+
+    std::printf("BENCH_DONE\n");
+    std::filesystem::remove(file_path, ec);
+    std::filesystem::remove(file_path + ".snap", ec);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -810,6 +945,9 @@ int main(int argc, char** argv) {
         return RunChaosVerifyChild(argv[2], argv[3]);
     if (argc >= 4 && std::string(argv[1]) == "--rtdb-bench")
         return RunBenchChild(argv[2], static_cast<uint32_t>(std::strtoul(argv[3], nullptr, 10)));
+    if (argc >= 4 && std::string(argv[1]) == "--rtdb-bench-block")
+        return RunBenchBlockChild(argv[2],
+                                  static_cast<uint32_t>(std::strtoul(argv[3], nullptr, 10)));
     ::testing::InitGoogleTest(&argc, argv);
     const int rc = RUN_ALL_TESTS();
     // gcov 插桩构建（MinGW/UCRT）：libgcc 退出转储与 DLL 卸载/CRT 退出

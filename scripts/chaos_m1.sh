@@ -50,12 +50,13 @@ WORK="${RTDB_CHAOS_WORKDIR:-/tmp/rtdb_chaos}"
 mkdir -p "$WORK" || { echo "chaos_m1: 无法创建工作目录 $WORK" >&2; exit 2; }
 LOG="$WORK/chaos_m1_$(date +%Y%m%d_%H%M%S).log"
 
-# ---- 注入点 × 场景兼容矩阵（docs/06 §3 五点 + W5 三点）----
+# ---- 注入点 × 场景兼容矩阵（docs/06 §3 五点 + W5 三点 + M2 块级两点）----
 WAL_POINTS=(wal.insert.before wal.append.mid wal.apply.mid wal.commit.before)
 BATCH_POINTS=(wal.batch.wal_mid wal.batch.mid)
 DDL_POINTS=(snapshot.before_copy alter.before_link secidx.before_link)
+BLOCK_POINTS=(block.commit.before block.apply.mid)
 DURABILITY=(always per_second never)
-NOINJ_SCENARIOS=(insert batch snapshot secidx)
+NOINJ_SCENARIOS=(insert batch snapshot secidx block)
 
 rand() { echo $((RANDOM % $1)); }
 pick() {  # pick <数组名>
@@ -79,7 +80,7 @@ for ((r = 1; r <= ROUNDS; ++r)); do
     point="none"
     scenario="$(pick NOINJ_SCENARIOS)"
   else
-    case $(rand 3) in
+    case $(rand 4) in
       0) scenario="insert"; point="$(pick WAL_POINTS)";;
       1) scenario="batch";  point="$(pick BATCH_POINTS)";;
       2)
@@ -90,6 +91,7 @@ for ((r = 1; r <= ROUNDS; ++r)); do
           secidx.before_link)   scenario="secidx";;
         esac
         ;;
+      3) scenario="block"; point="$(pick BLOCK_POINTS)";;
     esac
   fi
   dur="$(pick DURABILITY)"

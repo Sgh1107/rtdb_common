@@ -11,6 +11,7 @@
 #include "rtdb/column_value.hpp"
 #include "rtdb/err.hpp"
 #include "rtdb/options.hpp"
+#include "rtdb/record_block.hpp"
 #include "rtdb/result.hpp"
 #include "rtdb/table_def.hpp"
 #include "rtdb/table_handle.hpp"
@@ -120,6 +121,28 @@ public:
     /// \param row 按列名定位的部分行（须含主键列）
     /// \return 行槽号
     Result<uint64_t> Upsert(const TableHandle& table, const Row& row);
+
+    // ------------------ 列式批量（M2-W2，docs/03 §2.3）------------------
+    /// \brief 列式块原子 upsert（docs/03 §2.3 `UpsertBatch(RecordBlockView)`）。
+    ///
+    /// 语义（与单行 `Upsert` 的**合并**不同，块为**整行覆盖**）：
+    ///  - 块内每行存在则整行覆盖（未提供列按 schema 填充：nullable →
+    ///    NULL；ext 列默认值；非空缺列 kInvalidArgument），不存在则插入；
+    ///  - 整块一个原子批（BATCH_BEGIN + N×op + BATCH_COMMIT）：任一行
+    ///    校验失败整批零副作用（WAL 不写 BEGIN）；WAL/应用阶段失败 →
+    ///    毒化引擎（kPoisoned），重启重放收敛；
+    ///  - 块内主键不得重复（kInvalidArgument）；
+    ///  - 列按列名映射到表 schema；未知列名/载荷类型与列类型不兼容 →
+    ///    kInvalidArgument；块行数受表 row_cap 约束（kOutOfMemory）。
+    ///
+    /// \param block 列式视图（零拷贝；内存须在调用期间有效）
+    /// \return 批提交序列号（committed_seq）
+    Result<uint64_t> UpsertBatch(const RecordBlockView& block);
+
+    /// \brief `RecordBlock` 便捷重载（docs/04 §3 `eng->UpsertBatch(blk)`）。
+    Result<uint64_t> UpsertBatch(const RecordBlock& block) {
+        return UpsertBatch(block.View());
+    }
 
     /// \brief 按主键读取整行（免锁乐观读，返回自持有值）。
     ///

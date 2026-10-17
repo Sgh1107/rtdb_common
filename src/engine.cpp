@@ -3,6 +3,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -26,6 +27,81 @@ namespace {
 /// 一次活性探测内完成，正常路径远快于此值。
 inline constexpr uint32_t kEngineLockTimeoutMs = 5000;
 
+/// 表列元数据（init 列 + ext 列统一视图；M2 Upsert/UpsertBatch 共用）。
+struct ColInfo {
+    const char* name = nullptr;
+    bool nullable = false;
+    bool has_default = false;
+    bool default_is_null = false;
+    uint64_t default_raw = 0;
+    DataType type = DataType::kInt64;
+};
+
+/// 收集 [0, visible) 列元数据：init 列取描述符、ext 列走区域链。
+/// 链缺环（meta 未覆盖）返回 kCorruption。
+Err CollectColumnInfo(void* base, const storage::shm_TableDescriptor* desc, uint32_t visible,
+                      std::vector<ColInfo>* out) {
+    if (desc == nullptr || out == nullptr) return Err::kInvalidArgument;
+    out->assign(visible, ColInfo{});
+    for (uint32_t i = 0; i < visible && i < desc->col_count; ++i) {
+        (*out)[i].name = desc->cols[i].name;
+        (*out)[i].nullable = desc->cols[i].nullable != 0;
+        (*out)[i].type = static_cast<DataType>(desc->cols[i].type);
+    }
+    if (visible > desc->col_count) {
+        std::vector<storage::shm_ExtColRegion*> regions;
+        if (!IsOk(storage::WalkExtColumns(base, desc, &regions))) return Err::kCorruption;
+        for (storage::shm_ExtColRegion* r : regions) {
+            if (r->col >= desc->col_count && r->col < visible) {
+                ColInfo& ci = (*out)[r->col];
+                ci.name = r->name;
+                ci.nullable = r->nullable != 0;
+                ci.has_default = r->has_default != 0;
+                ci.default_is_null = r->default_is_null != 0;
+                ci.default_raw = r->default_value;
+                ci.type = static_cast<DataType>(r->type);
+            }
+        }
+        for (uint32_t i = desc->col_count; i < visible; ++i) {
+            if ((*out)[i].name == nullptr) return Err::kCorruption;
+        }
+    }
+    return Err::kOk;
+}
+
+/// ext 列默认值逆解码（EncodeExtDefault 的逆，见 storage/alter.cpp）。
+ColumnValue DecodeExtDefault(const ColInfo& ci) {
+    if (ci.default_is_null) return ColumnValue::Null();
+    if (ci.type == DataType::kFloat32) {
+        float f = 0.0F;
+        std::memcpy(&f, &ci.default_raw, sizeof(f));
+        return ColumnValue::Real(static_cast<double>(f));
+    }
+    if (ci.type == DataType::kFloat64) {
+        double d = 0.0;
+        std::memcpy(&d, &ci.default_raw, sizeof(d));
+        return ColumnValue::Real(d);
+    }
+    return ColumnValue::Int(static_cast<int64_t>(ci.default_raw));
+}
+
+/// 列式载荷类型与 schema 列类型兼容性（M2-W2）：int64 载荷供整数类/
+/// bool/时间戳列，double 供浮点列，string_view 供变长列。
+bool PayloadTypeCompatible(DataType payload, DataType column) {
+    switch (payload) {
+        case DataType::kInt64:
+            return column == DataType::kInt8 || column == DataType::kInt16 ||
+                   column == DataType::kInt32 || column == DataType::kInt64 ||
+                   column == DataType::kBool || column == DataType::kUnixTsNs;
+        case DataType::kFloat64:
+            return column == DataType::kFloat32 || column == DataType::kFloat64;
+        case DataType::kUtf8Var:
+            return column == DataType::kUtf8Var || column == DataType::kBytesVar;
+        default:
+            return false;
+    }
+}
+
 }  // namespace
 
 struct Engine::Impl {
@@ -39,6 +115,13 @@ struct Engine::Impl {
     std::unique_ptr<storage::WalRing> ring;
     /// 组提交协调器（写侧角色挂载）。
     std::unique_ptr<storage::GroupCommit> commit;
+
+    // ---- M2-W2 列式批复用缓冲（UpsertBatch 专用）----
+    // 根锁内串行使用（并发 UpsertBatch 由根锁串行化），容量随高水位
+    // 保留：跨批次复用 StagedRowOp 的 rec/old_rec 缓冲与行值 vector，
+    // 消除每批 ~N 次小分配（百万行/s 的实测杠杆之一，docs/10 §2-M2-D2）。
+    std::vector<storage::StagedRowOp> block_staged;
+    std::vector<ColumnValue> block_vals;
 
     Impl();
     ~Impl();  // 停后台线程 + 优雅收尾全映像 flush
@@ -506,39 +589,11 @@ Result<uint64_t> Engine::Upsert(const TableHandle& table, const Row& row) {
     const storage::shm_TableDescriptor* desc = store_res.Value()->descriptor();
     const uint32_t visible = table.visible_column_count();
 
-    // ---- 可见列元数据（名 / 可空 / 默认值；init 列 + ext 列两段收集）----
-    struct ColMeta {
-        const char* name = nullptr;
-        bool nullable = false;
-        bool has_default = false;
-        bool default_is_null = false;
-        uint64_t default_raw = 0;
-        DataType type = DataType::kInt64;
-    };
-    std::vector<ColMeta> meta(visible);
-    for (uint32_t i = 0; i < visible && i < desc->col_count; ++i) {
-        meta[i].name = desc->cols[i].name;
-        meta[i].nullable = desc->cols[i].nullable != 0;
-        meta[i].type = static_cast<DataType>(desc->cols[i].type);
-    }
-    if (visible > desc->col_count) {
-        std::vector<storage::shm_ExtColRegion*> regions;
-        if (!IsOk(storage::WalkExtColumns(impl_->region->base_address(), desc, &regions)))
-            return Result<uint64_t>::Fail(Err::kCorruption);
-        for (storage::shm_ExtColRegion* r : regions) {
-            if (r->col >= desc->col_count && r->col < visible) {
-                meta[r->col].name = r->name;
-                meta[r->col].nullable = r->nullable != 0;
-                meta[r->col].has_default = r->has_default != 0;
-                meta[r->col].default_is_null = r->default_is_null != 0;
-                meta[r->col].default_raw = r->default_value;
-                meta[r->col].type = static_cast<DataType>(r->type);
-            }
-        }
-        for (uint32_t i = desc->col_count; i < visible; ++i) {
-            if (meta[i].name == nullptr) return Result<uint64_t>::Fail(Err::kCorruption);
-        }
-    }
+    // ---- 可见列元数据（名 / 可空 / 默认值；init 列 + ext 列）----
+    std::vector<ColInfo> meta;
+    const Err meta_err =
+        CollectColumnInfo(impl_->region->base_address(), desc, visible, &meta);
+    if (!IsOk(meta_err)) return Result<uint64_t>::Fail(meta_err);
 
     // ---- Row 校验：列名须在可见集内、不得重名、主键列（列 0）必给 ----
     std::vector<const ColumnValue*> provided(visible, nullptr);
@@ -590,19 +645,7 @@ Result<uint64_t> Engine::Upsert(const TableHandle& table, const Row& row) {
             continue;
         }
         if (meta[i].has_default) {
-            if (meta[i].default_is_null) {
-                full[i] = ColumnValue::Null();
-            } else if (meta[i].type == DataType::kFloat32) {
-                float f = 0.0F;
-                std::memcpy(&f, &meta[i].default_raw, sizeof(f));
-                full[i] = ColumnValue::Real(static_cast<double>(f));
-            } else if (meta[i].type == DataType::kFloat64) {
-                double d = 0.0;
-                std::memcpy(&d, &meta[i].default_raw, sizeof(d));
-                full[i] = ColumnValue::Real(d);
-            } else {
-                full[i] = ColumnValue::Int(static_cast<int64_t>(meta[i].default_raw));
-            }
+            full[i] = DecodeExtDefault(meta[i]);
         } else if (meta[i].nullable) {
             full[i] = ColumnValue::Null();
         } else {
@@ -610,6 +653,212 @@ Result<uint64_t> Engine::Upsert(const TableHandle& table, const Row& row) {
         }
     }
     return Insert(table, full);
+}
+
+// ---- M2-W2：列式块原子 upsert（docs/03 §2.3，docs/10 §2-M2-D2）----
+// 与单行 Upsert 的"按列合并"不同：块语义为**整行覆盖**（批量入口不做
+// 读-改-写，未提供列按 schema 填充）。三阶段结构同 ExecuteBatch：
+// 全量暂存（零副作用）→ WAL 三段式（COMMIT 先于数据页）→ 统一应用。
+Result<uint64_t> Engine::UpsertBatch(const RecordBlockView& block) {
+    if (!impl_ || !impl_->catalog) return Result<uint64_t>::Fail(Err::kUnsupported);
+    if (impl_->region->allocator() == nullptr) return Result<uint64_t>::Fail(Err::kReadOnlyHandle);
+    if (impl_->ring != nullptr && impl_->ring->poisoned())
+        return Result<uint64_t>::Fail(Err::kPoisoned);
+    if (block.table_name.empty() || block.columns.empty() || block.row_count == 0)
+        return Result<uint64_t>::Fail(Err::kInvalidArgument);
+
+    // ---- 视图自校验：列名非空不重名、行数一致、载荷类型合法 ----
+    for (size_t i = 0; i < block.columns.size(); ++i) {
+        const BlockColumn& c = block.columns[i];
+        if (c.name.empty() || c.data == nullptr || c.rows != block.row_count)
+            return Result<uint64_t>::Fail(Err::kInvalidArgument);
+        if (c.type != DataType::kInt64 && c.type != DataType::kFloat64 &&
+            c.type != DataType::kUtf8Var)
+            return Result<uint64_t>::Fail(Err::kInvalidArgument);
+        for (size_t j = 0; j < i; ++j) {
+            if (block.columns[j].name == c.name)
+                return Result<uint64_t>::Fail(Err::kInvalidArgument);
+        }
+    }
+
+    // ---- 解析表（按名）与列映射 ----
+    Result<uint64_t> desc_res = impl_->catalog->OpenTable(block.table_name);
+    if (!desc_res.IsOk()) return Result<uint64_t>::Fail(desc_res.Error());
+    const uint64_t desc_off = desc_res.Value();
+    const storage::shm_TableDescriptor* desc = impl_->catalog->Descriptor(desc_off);
+    if (desc == nullptr) return Result<uint64_t>::Fail(Err::kCorruption);
+    if (desc->state != static_cast<uint32_t>(storage::TableState::kActive))
+        return Result<uint64_t>::Fail(Err::kTableNotFound);
+
+    const uint32_t total_cols = desc->col_count + desc->ext_col_count;
+    if (total_cols == 0) return Result<uint64_t>::Fail(Err::kCorruption);
+    std::vector<ColInfo> meta;
+    const Err meta_err =
+        CollectColumnInfo(impl_->region->base_address(), desc, total_cols, &meta);
+    if (!IsOk(meta_err)) return Result<uint64_t>::Fail(meta_err);
+
+    std::vector<int32_t> src(total_cols, -1);  // schema 列 → block 列下标
+    for (uint32_t c = 0; c < total_cols; ++c) {
+        for (size_t b = 0; b < block.columns.size(); ++b) {
+            if (block.columns[b].name == meta[c].name) {
+                if (!PayloadTypeCompatible(block.columns[b].type, meta[c].type))
+                    return Result<uint64_t>::Fail(Err::kInvalidArgument);
+                src[c] = static_cast<int32_t>(b);
+                break;
+            }
+        }
+    }
+    for (size_t b = 0; b < block.columns.size(); ++b) {  // 块内未知列名
+        bool mapped = false;
+        for (uint32_t c = 0; c < total_cols; ++c) {
+            if (src[c] == static_cast<int32_t>(b)) {
+                mapped = true;
+                break;
+            }
+        }
+        if (!mapped) return Result<uint64_t>::Fail(Err::kInvalidArgument);
+    }
+
+    uint64_t commit_seq = 0;
+    Result<uint64_t> res = Result<uint64_t>::Fail(Err::kInternal);
+    {
+        infra::ShmRootMutexGuard guard(impl_->region->root_mutex(), kEngineLockTimeoutMs);
+        if (!guard.locked()) return Result<uint64_t>::Fail(guard.error());
+        if (impl_->ring == nullptr || impl_->ring->poisoned())
+            return Result<uint64_t>::Fail(Err::kPoisoned);
+
+        auto store_res = impl_->StoreFor(desc_off, static_cast<int64_t>(desc->table_id));
+        if (!store_res.IsOk()) return Result<uint64_t>::Fail(store_res.Error());
+        storage::TableStore* store = store_res.Value();
+
+        // ---- 阶段一：逐行解码（缓冲复用，零逐行堆分配）+ 暂存 ----
+        // 单表批：store 对整块唯一；行值与暂存缓冲跨批复用（Impl 高水位
+        // 保留，见 Impl::block_staged 注释）。
+        std::vector<ColumnValue>& vals = impl_->block_vals;
+        vals.resize(total_cols);
+        std::vector<storage::StagedRowOp>& staged = impl_->block_staged;
+        staged.resize(block.row_count);
+        size_t staged_n = 0;
+        std::unordered_set<int64_t> seen_pk;
+        seen_pk.reserve(block.row_count);
+        Err phase_err = Err::kOk;
+        for (size_t r = 0; r < block.row_count && IsOk(phase_err); ++r) {
+            for (uint32_t c = 0; c < total_cols; ++c) {
+                if (src[c] < 0) {
+                    if (meta[c].has_default) {
+                        vals[c] = DecodeExtDefault(meta[c]);
+                    } else if (meta[c].nullable) {
+                        vals[c] = ColumnValue::Null();
+                    } else {
+                        phase_err = Err::kInvalidArgument;  // 非空缺列未提供
+                        break;
+                    }
+                    continue;
+                }
+                const BlockColumn& bc = block.columns[static_cast<size_t>(src[c])];
+                if (bc.null_flags != nullptr && bc.null_flags[r] != 0) {
+                    if (!meta[c].nullable) {
+                        phase_err = Err::kInvalidArgument;  // NOT NULL 列不可空
+                        break;
+                    }
+                    vals[c] = ColumnValue::Null();
+                    continue;
+                }
+                switch (bc.type) {
+                    case DataType::kInt64:
+                        vals[c] = ColumnValue::IntOf(
+                            meta[c].type, static_cast<const int64_t*>(bc.data)[r]);
+                        break;
+                    case DataType::kFloat64:
+                        vals[c] = ColumnValue::Real(static_cast<const double*>(bc.data)[r]);
+                        break;
+                    case DataType::kUtf8Var:
+                        vals[c] = ColumnValue::Text(
+                            std::string(static_cast<const std::string_view*>(bc.data)[r]));
+                        break;
+                    default:
+                        phase_err = Err::kInvalidArgument;
+                        break;
+                }
+                if (!IsOk(phase_err)) break;
+            }
+            if (!IsOk(phase_err)) break;
+
+            // 块内主键不得重复（同批同键两次暂存语义不确定）。
+            if (!seen_pk.insert(vals[0].as_int()).second) {
+                phase_err = Err::kInvalidArgument;
+                break;
+            }
+
+            auto has = store->Contains(vals[0]);
+            if (!has.IsOk()) {
+                phase_err = has.Error();
+                break;
+            }
+            storage::StagedRowOp& st = staged[staged_n];
+            phase_err = has.Value() ? store->StageUpdate(vals[0], vals, &st)
+                                    : store->StageInsert(vals, &st);
+            if (!IsOk(phase_err)) break;
+            ++staged_n;
+        }
+        if (!IsOk(phase_err)) {
+            for (size_t j = staged_n; j > 0; --j) store->ReleaseStaged(&staged[j - 1]);
+            return Result<uint64_t>::Fail(phase_err);
+        }
+
+        // ---- 阶段二：WAL 三段式（BEGIN + N×op + COMMIT 先于数据页变更）----
+        bool begin_written = false;
+        uint8_t cnt_buf[4];
+        storage::EncodeU32LE(cnt_buf, static_cast<uint32_t>(staged_n));
+        uint64_t begin_seq = 0;
+        phase_err = impl_->WalAppendMark(storage::kWalOpBatchBegin, cnt_buf, 4, &begin_seq);
+        if (IsOk(phase_err)) begin_written = true;
+        for (size_t i = 0; IsOk(phase_err) && i < staged_n; ++i) {
+            phase_err = impl_->WalAppendRowOp(store, staged[i], nullptr);
+            if (IsOk(phase_err)) {
+                // 注入点：块 WAL 阶段中断（无 COMMIT → 恢复整批作废）。
+                failpoint::CrashPoint("wal.batch.wal_mid");
+            }
+        }
+        // 注入点：COMMIT 落环前（块级确定性变体，docs/10 §2-M2-D2）。
+        if (IsOk(phase_err)) failpoint::CrashPoint("block.commit.before");
+        if (IsOk(phase_err)) {
+            phase_err = impl_->WalAppendMark(storage::kWalOpBatchCommit, nullptr, 0, &commit_seq);
+        }
+        if (!IsOk(phase_err) && begin_written) impl_->Poison();
+
+        // ---- 阶段三：应用（COMMIT 已落环 → 崩溃由重放整批收敛）----
+        size_t applied = 0;
+        if (IsOk(phase_err)) {
+            for (; applied < staged_n; ++applied) {
+                const Err aerr = store->ApplyStaged(&staged[applied]);
+                if (!IsOk(aerr)) {
+                    phase_err = aerr;
+                    impl_->Poison();
+                    break;
+                }
+                // 注入点：块应用中途（首行已应用，其余未应用）。
+                if (applied == 0) failpoint::CrashPoint("block.apply.mid");
+            }
+        }
+
+        if (IsOk(phase_err)) {
+            failpoint::CrashPoint("wal.commit.before");
+            impl_->MarkCommitted(commit_seq);
+            res = Result<uint64_t>::Ok(commit_seq);
+        } else {
+            // 回滚未应用的暂存（已应用项 allocated_vars 已清空，跳过）。
+            for (size_t j = staged_n; j > applied; --j) store->ReleaseStaged(&staged[j - 1]);
+            res = Result<uint64_t>::Fail(phase_err);
+        }
+    }
+    // flush 在根锁之外流水线化（组提交聚合）。
+    // always 档 flush 失败/超时 = 持久化承诺破裂 → 毒化拒写。
+    if (res.IsOk() && impl_->commit != nullptr && commit_seq != 0) {
+        const Err fe = impl_->commit->OnCommit(commit_seq);
+        if (!IsOk(fe)) impl_->Poison();
+    }
+    return res;
 }
 
 Result<std::vector<ColumnValue>> Engine::GetByKey(const TableHandle& table,
