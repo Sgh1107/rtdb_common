@@ -29,23 +29,9 @@
 
 ## 当前状态（M0/M1/M2 已验收 · 2026-10-17）
 
-platform/infra 全部组件、SharedBTree、Slab 分配器完成并通过 **M0 验收**
-（验收记录见 [docs/05 §3.1](docs/05_交付清单与里程碑计划.md)，里程碑交付说明见
-[docs/07](docs/07_M0里程碑交付说明.md)），里程碑标记 `m0`。
-**M1 引擎已验收关闭（2026-10-14，单测 113 用例）**：表目录（双 B+ 树 + 建删表
-事务）、行 CRUD（主键唯一索引 + 版本乐观读 + 墓碑删除）、WAL 组提交（影像内
-WalRing + 覆盖协议 + 三档 fsync + `ExecuteBatch` 原子批 + 崩溃恢复重放 +
-failpoint 注入）、冷快照、在线加列、范围扫描、二级索引框架——出口标准两条
-（kill -9 混沌 ×100 verify 100/100 PASS、CRUD 全链路单测绿）+ 覆盖率门禁
-（95.9%/91.0%/93.9%）+ bench 五项优于基线，四构建全绿零告警，证据见
-[docs/09](docs/09_M1交付说明.md)。
-**M2 接口已验收关闭（2026-10-17，单测 150 用例）**：NativeApi 收敛（伞头
-`rtdb/rtdb.hpp`、Options 对齐 docs/04、`TableDef` 扩展、`Row`/`TableHandle::Upsert`
-便利面、`Result` operator* 与 RTDB_CHECK/RTDB_ASSIGN_OR_MOVE）、**RecordBlock 列式
-批量**（`UpsertBatch` 三阶段原子块，8 列混合稳态 1.20~1.29M 行/s ≥1M 基线）、
-**C ABI v1 冻结**（`rtdb_cabi.h`，14 个 `rtdb_abi_` 符号，C99 demo + Python ctypes
-冒烟 20 项全过）——出口标准两条（《04》示例跑通、bench 嵌入达标）+ 覆盖率门禁
-（97.2%/89.9%/94.8%），四构建全绿零告警，证据见 [docs/11](docs/11_M2交付说明.md)。
+platform/infra 全部组件、SharedBTree、Slab 分配器完成并通过 **M0 验收**（验收记录见 [docs/05 §3.1](docs/05_交付清单与里程碑计划.md)，里程碑交付说明见[docs/07](docs/07_M0里程碑交付说明.md)），里程碑标记 `m0`。
+**M1 引擎已验收关闭（2026-10-14，单测 113 用例）**：表目录（双 B+ 树 + 建删表事务）、行 CRUD（主键唯一索引 + 版本乐观读 + 墓碑删除）、WAL 组提交（影像内WalRing + 覆盖协议 + 三档 fsync + `ExecuteBatch` 原子批 + 崩溃恢复重放 +failpoint 注入）、冷快照、在线加列、范围扫描、二级索引框架——出口标准两条（kill -9 混沌 ×100 verify 100/100 PASS、CRUD 全链路单测绿）+ 覆盖率门禁（95.9%/91.0%/93.9%）+ bench 五项优于基线，四构建全绿零告警，证据见[docs/09](docs/09_M1交付说明.md)。
+**M2 接口已验收关闭（2026-10-17，单测 150 用例）**：NativeApi 收敛（伞头`rtdb/rtdb.hpp`、Options 对齐 docs/04、`TableDef` 扩展、`Row`/`TableHandle::Upsert`便利面、`Result` operator* 与 RTDB_CHECK/RTDB_ASSIGN_OR_MOVE）、**RecordBlock 列式批量**（`UpsertBatch` 三阶段原子块，8 列混合稳态 1.20~1.29M 行/s ≥1M 基线）、**C ABI v1 冻结**（`rtdb_cabi.h`，14 个 `rtdb_abi_` 符号，C99 demo + Python ctypes冒烟 20 项全过）——出口标准两条（《04》示例跑通、bench 嵌入达标）+ 覆盖率门禁（97.2%/89.9%/94.8%），四构建全绿零告警，证据见 [docs/11](docs/11_M2交付说明.md)。
 
 | 组件 | 位置 | 状态 |
 |---|---|---|
