@@ -101,6 +101,18 @@ FETCH_DELTA 请求携带 (from_seq, max_bytes)；服务端按 ChangeLog 区间�
 ```
 协议明确标注版本协商字段，为 v2 演进留空间（吸取老系统固定 4入参+3出参骨架不可演进的教训）。
 
+> **as-built 注记（M3-W5 收口，实测口径见 docs/14）**：帧头 = 20 字节
+> `[magic'RTDB'][ver u8][flags u8][session u32][func u16][payload_len u32]
+> [crc32][payload]`，CRC 覆盖头（crc 字段置零）+ 载荷，载荷硬上限 4 MiB
+> （`rtdb/proto_v1.h`）；功能号与上表一致，DDL 子码 CREATE/DROP/DESCRIBE =
+> 1/2/3，EXEC_BATCH 双模式常载（mode 0 = 操作表 / mode 1 = 列式块），
+> flags 现仅用 RESP 位（压缩为预留位、未实现）。"按 ChangeLog 区间回放"
+> 落地为 D1 决策：**复用 WalRing 扫描，无独立 ChangeLogStore**；`last_seq`
+> = 最后一条被编码变更的 seq（无变更时 = from；批标记 BEGIN/COMMIT 不产生
+> 事件 ⇒ 订阅交付水位可与 committed 相差若干记录，不能直接比齐）。会话：
+> AUTH 摘要 = SHA-256(配置盐 ‖ 口令)，token 带 TTL 与滚动续期；错误码
+> 以 `RTDB_E_*` 常量为准（101/102/107/303/400/401/402/403/404/501/502）。
+
 ## 6. 命名与工程规范
 - 代码：Google 风格基线；公共头 `include/rtdb/*.hpp`；内部头不出库；
 - 版本：semver + 共享内存 layout 版独立编号；
