@@ -145,8 +145,8 @@ int RunServe(const DemoArgs& a) {
         std::fprintf(stderr, "服务端启动失败：%s\n", rtdb::ErrorMessage(se));
         return 1;
     }
-    std::printf("rtdbd 核心已监听 127.0.0.1:%u（映像 %s）\n", static_cast<unsigned>(srv.port()),
-                a.path.c_str());
+    std::printf("rtdbd 核心已监听 %s:%u（映像 %s）\n", cfg.listen_host.c_str(),
+                static_cast<unsigned>(srv.port()), a.path.c_str());
 
     // 演示表（重跑复用）。
     auto ct = srv.engine()->CreateTable(MakeDemoTableDef());

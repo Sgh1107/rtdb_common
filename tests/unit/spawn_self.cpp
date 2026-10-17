@@ -52,6 +52,86 @@ SpawnOutcome SpawnSelf(const std::string& exe, const std::vector<std::string>& a
     return SpawnImpl(exe, args);
 }
 
+// ---------------- ChildProcess（异步硬杀；M3-W5） ----------------
+
+ChildProcess::~ChildProcess() {
+    if (spawned_ && !reaped_) {
+        Kill9();
+        (void)Wait();
+    }
+}
+
+ChildProcess::ChildProcess(ChildProcess&& other) noexcept
+    : spawned_(other.spawned_), reaped_(other.reaped_), handle_(other.handle_) {
+    other.spawned_ = false;
+    other.reaped_ = true;
+    other.handle_ = nullptr;
+}
+
+ChildProcess& ChildProcess::operator=(ChildProcess&& other) noexcept {
+    if (this != &other) {
+        if (spawned_ && !reaped_) {
+            Kill9();
+            (void)Wait();
+        }
+        spawned_ = other.spawned_;
+        reaped_ = other.reaped_;
+        handle_ = other.handle_;
+        other.spawned_ = false;
+        other.reaped_ = true;
+        other.handle_ = nullptr;
+    }
+    return *this;
+}
+
+ChildProcess ChildProcess::Spawn(const std::string& exe, const std::vector<std::string>& args) {
+    ChildProcess out;
+    std::string s = "\"" + exe + "\"";
+    for (const std::string& a : args) s += " \"" + a + "\"";
+    std::vector<char> cmdline(s.begin(), s.end());
+    cmdline.push_back('\0');
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessA(exe.c_str(), cmdline.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si,
+                       &pi) == 0) {
+        return out;
+    }
+    CloseHandle(pi.hThread);
+    out.spawned_ = true;
+    out.handle_ = pi.hProcess;
+    return out;
+}
+
+bool ChildProcess::alive() noexcept {
+    if (!spawned_ || reaped_) return false;
+    const DWORD r = WaitForSingleObject(static_cast<HANDLE>(handle_), 0);
+    if (r == WAIT_TIMEOUT) return true;
+    if (r == WAIT_OBJECT_0) {
+        (void)Wait();  // 已退出：回收
+        return false;
+    }
+    return false;
+}
+
+void ChildProcess::Kill9() noexcept {
+    if (!spawned_ || reaped_) return;
+    (void)TerminateProcess(static_cast<HANDLE>(handle_), 9);
+}
+
+int ChildProcess::Wait() noexcept {
+    if (!spawned_) return -1;
+    if (reaped_) return -1;
+    (void)WaitForSingleObject(static_cast<HANDLE>(handle_), INFINITE);
+    DWORD code = 0;
+    GetExitCodeProcess(static_cast<HANDLE>(handle_), &code);
+    CloseHandle(static_cast<HANDLE>(handle_));
+    handle_ = nullptr;
+    reaped_ = true;
+    // TerminateProcess(...,9) 返回 9；正常退出返回进程码。
+    return static_cast<int>(code);
+}
+
 }  // namespace rtdb_test
 
 #else
@@ -59,6 +139,7 @@ SpawnOutcome SpawnSelf(const std::string& exe, const std::vector<std::string>& a
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
 
@@ -96,6 +177,83 @@ SpawnOutcome SpawnSelfWithFlag(const std::string& exe, const std::string& extra_
 
 SpawnOutcome SpawnSelf(const std::string& exe, const std::vector<std::string>& args) {
     return SpawnImpl(exe, args);
+}
+
+// ---------------- ChildProcess（异步硬杀；M3-W5） ----------------
+
+ChildProcess::~ChildProcess() {
+    if (spawned_ && !reaped_) {
+        Kill9();
+        (void)Wait();
+    }
+}
+
+ChildProcess::ChildProcess(ChildProcess&& other) noexcept
+    : spawned_(other.spawned_), reaped_(other.reaped_), pid_(other.pid_) {
+    other.spawned_ = false;
+    other.reaped_ = true;
+    other.pid_ = -1;
+}
+
+ChildProcess& ChildProcess::operator=(ChildProcess&& other) noexcept {
+    if (this != &other) {
+        if (spawned_ && !reaped_) {
+            Kill9();
+            (void)Wait();
+        }
+        spawned_ = other.spawned_;
+        reaped_ = other.reaped_;
+        pid_ = other.pid_;
+        other.spawned_ = false;
+        other.reaped_ = true;
+        other.pid_ = -1;
+    }
+    return *this;
+}
+
+ChildProcess ChildProcess::Spawn(const std::string& exe, const std::vector<std::string>& args) {
+    ChildProcess out;
+    const pid_t pid = ::fork();
+    if (pid < 0) return out;
+    if (pid == 0) {
+        std::vector<char*> argv;
+        argv.push_back(const_cast<char*>(exe.c_str()));
+        for (const std::string& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+        ::execv(exe.c_str(), argv.data());
+        ::_exit(127);  // exec 失败
+    }
+    out.spawned_ = true;
+    out.pid_ = static_cast<long long>(pid);
+    return out;
+}
+
+bool ChildProcess::alive() noexcept {
+    if (!spawned_ || reaped_) return false;
+    int status = 0;
+    const pid_t r = ::waitpid(static_cast<pid_t>(pid_), &status, WNOHANG);
+    if (r == 0) return true;
+    // 已退出（或出错）：按已回收处理并丢弃退出码（Wait 已无法取值）。
+    reaped_ = true;
+    pid_ = -1;
+    return false;
+}
+
+void ChildProcess::Kill9() noexcept {
+    if (!spawned_ || reaped_) return;
+    (void)::kill(static_cast<pid_t>(pid_), SIGKILL);
+}
+
+int ChildProcess::Wait() noexcept {
+    if (!spawned_ || reaped_) return -1;
+    int status = 0;
+    const pid_t r = ::waitpid(static_cast<pid_t>(pid_), &status, 0);
+    reaped_ = true;
+    pid_ = -1;
+    if (r < 0) return -1;
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);  // SIGKILL → 137
+    return -1;
 }
 
 }  // namespace rtdb_test

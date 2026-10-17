@@ -8,6 +8,7 @@ if(RTDB_BUILD_TESTS AND NOT DEFINED RTDB_GTEST_READY)
   option(RTDB_FETCH_GTEST "Fetch GoogleTest at configure time" ON)
 endif()
 option(RTDB_BUILD_EXAMPLES "Build examples" ON)
+option(RTDB_BUILD_TOOLS "Build tools (bench_net 等)" ON)
 
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -214,6 +215,7 @@ if(RTDB_BUILD_TESTS)
     tests/unit/test_ipc_wait.cpp
     tests/unit/test_server.cpp
     tests/unit/test_client.cpp
+    tests/unit/test_chaos_net.cpp
   )
   add_executable(rtdb_unit_tests ${rtdb_test_sources})
   target_link_libraries(rtdb_unit_tests PRIVATE rtdbcore rtdbnet rtdbserver rtdbclient GTest::gtest_main)
@@ -293,6 +295,40 @@ if(RTDB_BUILD_EXAMPLES)
   set_target_properties(api_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
   set_target_properties(cabi_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
   set_target_properties(remote_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+  if(WIN32 AND NOT RTDB_COVERAGE_STATIC_CORE)
+    # Windows 无 RPATH：示例统一落在 bin/<cfg>，而 rtdbcore/rtdbclient 是
+    # DLL（默认落 <cfg> 顶层）——不拷贝则示例启动即 0xC0000135（W5 双机
+    # 演示实测）。与 bench_net "输出留在默认层"口径互补。
+    foreach(demo_tgt embed_demo api_demo cabi_demo remote_demo)
+      add_custom_command(TARGET ${demo_tgt} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:rtdbcore> $<TARGET_FILE:rtdbclient>
+                $<TARGET_FILE_DIR:${demo_tgt}>)
+    endforeach()
+  endif()
+endif()
+
+# ---------------------------------------------------------------
+# 工具：网络基准（M3-W5；docs/13 §5-W5①）
+# ---------------------------------------------------------------
+if(RTDB_BUILD_TOOLS)
+  add_executable(bench_net tools/bench_net/main.cpp)
+  target_link_libraries(bench_net PRIVATE rtdbclient rtdbserver)
+  target_include_directories(bench_net PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  if(MSVC)
+    target_compile_options(bench_net PRIVATE /W4 /permissive- /utf-8)
+  else()
+    target_compile_options(bench_net PRIVATE -Wall -Wextra)
+  endif()
+  # 输出留在默认目录（与 rtdbclient/rtdbd 同层）：Windows 下 DLL 与
+  # 可执行同目录才可被 ctest 直接拉起（无需 PATH 注入）。
+  if(RTDB_BUILD_TESTS)
+    # CI 下限断言（回环 ≥50k 行/s、单条写/PING P99 ≤5ms 量级；消毒构建
+    # 经环境变量自动放宽，见 tools/bench_net/main.cpp）。规模由 --ci 收敛。
+    add_test(NAME BenchNetCi COMMAND $<TARGET_FILE:bench_net> --ci)
+    set_tests_properties(BenchNetCi PROPERTIES RUN_SERIAL TRUE
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  endif()
 endif()
 
 # ---------------------------------------------------------------

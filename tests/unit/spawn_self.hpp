@@ -43,6 +43,44 @@ SpawnOutcome SpawnSelfWithFlag(const std::string& exe, const std::string& extra_
 /// 环境变量由父进程原样继承（崩溃注入经 RTDB_FAILPOINTS 传递）。
 SpawnOutcome SpawnSelf(const std::string& exe, const std::vector<std::string>& args);
 
+/// \brief 异步子进程句柄（M3-W5 网络混沌：运行中硬杀 kill -9）。
+///
+/// `Spawn` 立即返回（不等待）；`Kill9` 等价 kill -9 / TerminateProcess；
+/// `Wait` 阻塞回收。move-only；析构时若已启动未 Wait 则 Kill9 + Wait
+/// （防孤儿进程）。
+class ChildProcess {
+public:
+    ChildProcess() noexcept = default;
+    ~ChildProcess();
+    ChildProcess(ChildProcess&& other) noexcept;
+    ChildProcess& operator=(ChildProcess&& other) noexcept;
+    ChildProcess(const ChildProcess&) = delete;
+    ChildProcess& operator=(const ChildProcess&) = delete;
+
+    /// 启动 [exe, args...]（不等待）。
+    static ChildProcess Spawn(const std::string& exe, const std::vector<std::string>& args);
+
+    bool spawned() const noexcept { return spawned_; }
+
+    /// 进程是否仍在运行（非阻塞探测）。
+    bool alive() noexcept;
+
+    /// 硬杀（幂等；未启动为空操作）。
+    void Kill9() noexcept;
+
+    /// 阻塞等待退出并回收（幂等；返回退出码，未启动返回 -1）。
+    int Wait() noexcept;
+
+private:
+    bool spawned_ = false;
+    bool reaped_ = false;
+#if defined(_WIN32)
+    void* handle_ = nullptr;  ///< HANDLE
+#else
+    long long pid_ = -1;  ///< pid_t
+#endif
+};
+
 /// 跨平台环境变量设置（子进程注入规格传递用）。
 void SetEnvVar(const char* name, const char* value);
 void UnsetEnvVar(const char* name);
