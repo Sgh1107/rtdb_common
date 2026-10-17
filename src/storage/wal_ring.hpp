@@ -162,19 +162,28 @@ public:
     uint64_t next_seq() const noexcept { return hdr_->head_seq; }    ///< 下一个待分配 seq
     uint64_t oldest_seq() const noexcept { return hdr_->tail_seq; }  ///< 最老保留 seq
 
+    /// \brief 记录区容量（不含 64B 环头；批前预留/容量诊断用）。
+    uint64_t area_bytes() const noexcept { return area_bytes_; }
+
     /// \brief 记录占用的总字节数（含头部/CRC/8 对齐填充）。
     static uint64_t RecordBytes(uint32_t payload_len) noexcept;
 
     /// \brief 环内剩余可写空间能否容纳一条 consumed = RecordBytes(len) 的记录。
+    ///
+    /// 精确判据（P0-3 修复）：除总量足够外，还须满足回绕落位约束——当
+    /// [head_pos, area) 的连续空间不足时，写方垫片回绕后从 0 写记录，此时
+    /// 记录须整体容身 [0, tail_pos)；否则垫片回绕会覆盖 [tail_pos, head_pos)
+    /// 的环内数据。原判据只看总量，在该窗口存在静默覆盖。
     bool HasRoomFor(uint64_t rec_bytes) const noexcept;
 
     /// \brief 追加一条记录（调用方须持根锁，且此前已确认 HasRoomFor）。
     ///
-    /// 回绕处理（pad/裸回绕）内部完成。内部注入点：`wal.append.mid`
-    /// （头部已写、载荷未写 → 撕裂记录，供崩溃注入用例）。
+    /// 回绕处理（pad/裸回绕）内部完成；空间判据与 HasRoomFor 一致。
+    /// 内部注入点：`wal.append.mid`（头部已写、载荷未写 → 撕裂记录，
+    /// 供崩溃注入用例）。
     ///
     /// \param out_seq 可选输出：分配到的 seq
-    /// \return kOk / kPoisoned / kLimitExceeded（记录大于整环）
+    /// \return kOk / kPoisoned / kLimitExceeded（记录大于整环或未确认空间）
     Err Append(uint8_t op, int64_t table_id, uint64_t row_no, uint64_t row_ver,
                const uint8_t* payload, uint32_t payload_len, uint64_t* out_seq) noexcept;
 

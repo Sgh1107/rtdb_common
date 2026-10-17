@@ -44,7 +44,14 @@ uint64_t WalRing::PendingBytes() const noexcept {
 }
 
 bool WalRing::HasRoomFor(uint64_t rec_bytes) const noexcept {
-    return area_bytes_ >= rec_bytes && area_bytes_ - PendingBytes() >= rec_bytes;
+    if (area_bytes_ < rec_bytes) return false;
+    const uint64_t pending = PendingBytes();
+    if (pending == 0) return true;  // 空环：任意 ≤ 区容量的记录可写（必要时垫片回绕）
+    if (area_bytes_ - pending < rec_bytes) return false;  // 总量不足
+    // 回绕落位约束（P0-3）：[head_pos, area) 不足时记录将从 0 起写，须容身
+    // [0, tail_pos)——否则垫片回绕后覆盖 [tail_pos, head_pos) 的既有数据。
+    if (area_bytes_ - hdr_->head_pos < rec_bytes && rec_bytes > hdr_->tail_pos) return false;
+    return true;
 }
 
 Result<std::unique_ptr<WalRing>> WalRing::CreateOrAttach(void* base_addr,
@@ -132,8 +139,8 @@ Err WalRing::Append(uint8_t op, int64_t table_id, uint64_t row_no, uint64_t row_
     if (hdr_->poisoned != 0) return Err::kPoisoned;
 
     const uint64_t consumed = RecordBytes(payload_len);
-    if (consumed > area_bytes_) return Err::kLimitExceeded;
-    if (consumed > area_bytes_ - PendingBytes()) return Err::kLimitExceeded;  // 调用方未确认空间
+    // 空间判据与 HasRoomFor 保持单一事实源（含垫片回绕落位约束，P0-3）。
+    if (!HasRoomFor(consumed)) return Err::kLimitExceeded;  // 调用方未确认空间
 
     if (area_bytes_ - hdr_->head_pos < consumed) {
         const Err pe = WriteTailPadAndWrap();
