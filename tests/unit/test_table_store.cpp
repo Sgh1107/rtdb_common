@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "infra/failpoint.hpp"
 #include "infra/layout.hpp"
 #include "infra/shm_region.hpp"
 #include "infra/slab_allocator.hpp"
@@ -491,6 +492,60 @@ TEST_F(TableStoreDirectTest, ReleaseRegionsFreesPhysicalBlocks) {
     EXPECT_LT(alloc_->used_bytes(), used_before);
     // 分区已归还：再次附着必须因区域缺失而失败。
     EXPECT_FALSE(rtdb::storage::TableStore::Attach(mem_, alloc_.get(), desc_off).IsOk());
+}
+
+// ---------------------------------------------------------------------------
+// A2（P0-2/P1-1）：发布点之后的应用失败——已发布行保持可读、变长块不得被
+// 回收（重放幂等跳过无法修复，回收即引用空闲块）、行槽不得回退复用。
+// ---------------------------------------------------------------------------
+TEST_F(TableStoreDirectTest, PublishFailureKeepsVarBlocksOwnedAndSlotReserved) {
+    auto desc_res = catalog_->CreateTable(MakeRichDef("pubfail", 8));
+    ASSERT_TRUE(desc_res.IsOk()) << rtdb::ErrorMessage(desc_res.Error());
+    const uint64_t desc_off = desc_res.Value();
+    const auto* desc = catalog_->Descriptor(desc_off);
+    ASSERT_NE(desc, nullptr);
+    auto store = rtdb::storage::TableStore::Attach(mem_, alloc_.get(), desc_off).TakeValue();
+
+    // 二级索引（列 2 = count，非唯一）：使"发布点后的二级索引维护"路径可达。
+    rtdb::SecondaryIndexDef idx;
+    idx.name = "by_count";
+    idx.column_index = 2;
+    idx.unique = false;
+    ASSERT_EQ(store->CreateSecondaryIndex(idx), Err::kOk);
+
+    ASSERT_EQ(store->Insert(MakeRichRow(1, 0.0, 1, false, "hello", "A"), nullptr), Err::kOk);
+    const uint64_t used_before = PoolUsed(desc);
+
+    // 注入：行数据 + 主键索引已发布后，二级索引维护失败。
+    rtdb::failpoint::Arm("wal.secidx.after_publish", rtdb::failpoint::Mode::kError);
+    EXPECT_EQ(store->Insert(MakeRichRow(2, 0.0, 2, false, "world", "B"), nullptr),
+              Err::kOutOfMemory);
+
+    // 已发布行可读且变长内容完好（旧实现：应用失败即回收其块 → 引用空闲块）。
+    auto got = store->Get(ColumnValue::Int(2));
+    ASSERT_TRUE(got.IsOk()) << rtdb::ErrorMessage(got.Error());
+    EXPECT_EQ(got.Value()[4].as_bytes(), "world");
+    EXPECT_EQ(got.Value()[5].as_bytes(), "B");
+    // 块仍被持有：池占用含 "world"/"B" 两块（未回落到插入前水位）。
+    EXPECT_GT(PoolUsed(desc), used_before);
+
+    // 行槽未回退：后续插入必须用新槽（旧实现回退 row_count → 复用已发布槽）。
+    uint64_t row_no = 999;
+    ASSERT_EQ(store->Insert(MakeRichRow(3, 0.0, 3, false, "third", "C"), &row_no), Err::kOk);
+    EXPECT_EQ(row_no, 2u);
+
+    // 已发布行不受后续插入/池再分配影响（旧实现：块已回收 + 槽复用 → 内容被覆写）。
+    got = store->Get(ColumnValue::Int(2));
+    ASSERT_TRUE(got.IsOk());
+    EXPECT_EQ(got.Value()[0].as_int(), 2);
+    EXPECT_EQ(got.Value()[4].as_bytes(), "world");
+    got = store->Get(ColumnValue::Int(3));
+    ASSERT_TRUE(got.IsOk());
+    EXPECT_EQ(got.Value()[4].as_bytes(), "third");
+    // 后续插入的新块不来自行 2 仍持有的块（占用继续增长，无"净腾挪"）。
+    EXPECT_GT(PoolUsed(desc), used_before);
+
+    rtdb::failpoint::ClearAll();
 }
 
 }  // namespace

@@ -115,6 +115,7 @@ if(RTDB_BUILD_TESTS)
     tests/unit/test_w5.cpp
     tests/unit/test_native_api.cpp
     tests/unit/test_record_block.cpp
+    tests/unit/test_concurrency.cpp
     tests/unit/test_cabi.cpp
   )
   add_executable(rtdb_unit_tests ${rtdb_test_sources})

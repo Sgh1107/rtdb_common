@@ -24,6 +24,7 @@
 #include "infra/shm_region.hpp"
 #include "platform/platform_process.hpp"
 #include "rtdb/engine.hpp"
+#include "rtdb/record_block.hpp"
 #include "storage/group_commit.hpp"
 #include "storage/wal_ring.hpp"
 #include "tests/unit/spawn_self.hpp"
@@ -35,6 +36,7 @@ using rtdb::ColumnValue;
 using rtdb::DataType;
 using rtdb::Err;
 using rtdb::IsOk;
+using rtdb::RecordBlock;
 using rtdb::TableDef;
 using rtdb::TableHandle;
 namespace storage = rtdb::storage;
@@ -207,6 +209,60 @@ TEST_F(WalRingTest, WrapPadAndSeqContinuity) {
         ring->DropAllRetained();
         EXPECT_TRUE(ring->HasRoomFor(storage::WalRing::RecordBytes(64)));
     }
+}
+
+/// P0-3：尾垫片回绕的落位约束——记录既放不下 [head, area) 的剩余连续区，
+/// 回绕后又容身不了 [0, tail_pos) 时必须拒绝（kLimitExceeded），不得覆盖
+/// 环内既有数据（旧判据只看总量，此窗口静默覆盖 [tail_pos, head_pos)）。
+TEST_F(WalRingTest, LargeRecordWrapNeverOverwrites) {
+    storage::WalRing* ring = MakeRegionAndRing();
+    ASSERT_NE(ring, nullptr);
+    const uint64_t area = ring->area_bytes();
+    const uint64_t min_rec = storage::kWalMinRecordBytes;
+    ASSERT_EQ(storage::WalRing::RecordBytes(0), min_rec);
+    ASSERT_GT(area, 4 * min_rec);
+
+    // 造状态：两条最小记录（head = tail = 120），丢弃全部保留段。
+    uint64_t seq = 0;
+    ASSERT_TRUE(IsOk(ring->Append(storage::kWalOpInsert, 1, 0, 2, nullptr, 0, &seq)));
+    ASSERT_TRUE(IsOk(ring->Append(storage::kWalOpInsert, 1, 0, 2, nullptr, 0, &seq)));
+    ring->DropAllRetained();
+    const uint64_t tail = 2 * min_rec;
+
+    // 待写记录 consumed = 3000：要求 head 落在 (area-3000, area-3000+tail]
+    // —— 旧判据（总量 3000 ≤ area - pending）放行，垫片回绕后覆盖 [tail, head)。
+    const uint64_t big_consumed = 3000;
+    const uint64_t payload_len = static_cast<uint32_t>(big_consumed - min_rec);
+    uint64_t head = tail;
+    while (head <= area - big_consumed) head += min_rec;
+    ASSERT_GT(head, area - big_consumed);
+    ASSERT_LE(head, area - big_consumed + tail);
+    for (uint64_t h = tail; h < head; h += min_rec) {
+        ASSERT_TRUE(IsOk(ring->Append(storage::kWalOpInsert, 1, 0, 2, nullptr, 0, &seq)));
+    }
+    const uint64_t filled = (head - tail) / min_rec;
+    EXPECT_EQ(seq, 2 + filled);
+
+    std::vector<uint8_t> big(payload_len, 0x5A);
+    const uint64_t big_bytes = storage::WalRing::RecordBytes(payload_len);
+    EXPECT_EQ(big_bytes, big_consumed);
+    EXPECT_FALSE(ring->HasRoomFor(big_bytes));  // 旧判据此处为 true
+    EXPECT_EQ(ring->Append(storage::kWalOpInsert, 1, 0, 2, big.data(),
+                           static_cast<uint32_t>(payload_len), nullptr),
+              Err::kLimitExceeded);
+
+    // 环内数据完好：seq 从 3 起严格连续。
+    uint64_t last = 0;
+    std::vector<Rec> recs = ScanAll(ring, &last);
+    ASSERT_EQ(recs.size(), filled);
+    EXPECT_EQ(recs.front().seq, 3u);
+    EXPECT_EQ(last, 2 + filled);
+
+    // 连续落位可达的小记录仍可写（拒绝不扩大化）。
+    ASSERT_TRUE(IsOk(ring->Append(storage::kWalOpInsert, 1, 0, 2, nullptr, 0, &seq)));
+    EXPECT_EQ(seq, 3 + filled);
+    recs = ScanAll(ring, &last);
+    EXPECT_EQ(recs.size(), filled + 1);
 }
 
 TEST_F(WalRingTest, PoisonPersistsAcrossAttach) {
@@ -468,6 +524,140 @@ TEST_F(WalEngineTest, IndexPublishFailurePoisons) {
     EXPECT_EQ(eng->Insert(t, Row(1, 1)).Error(), Err::kOutOfMemory);
     EXPECT_EQ(eng->GetByKey(t, ColumnValue::Int(1)).Error(), Err::kNotFound);
     EXPECT_EQ(eng->Insert(t, Row(2, 2)).Error(), Err::kPoisoned);
+}
+
+/// A1（P0-1）：批前 WAL 预留——整批字节先于任何写入核对容量；
+///  - 超出记录区容量：拒批（kLimitExceeded）、零 WAL 副作用、引擎不毒化；
+///  - 环近满但批可容身：批前一次性腾环（flush + checkpoint + 丢弃已
+///    提交段），批内绝不丢弃未提交前缀。重开验证数据完整。
+///
+/// 数值：环 64KB → 记录区 65,472B；批字节 = BEGIN 64 + COMMIT 60 +
+/// N×84（2 列 i64 的行记录 24B + 记录头 60B）。N=777 → 65,392（可容）；
+/// N=778 → 65,476（超容）。
+TEST_F(WalEngineTest, BatchWalReserveBoundaryAndDrain) {
+    auto open = rtdb::Engine::Open(Opts());
+    ASSERT_TRUE(open.IsOk());
+    auto eng = open.TakeValue();
+    TableDef def = MakeDef("t");
+    def.row_cap = 2048;
+    auto t_res = eng->CreateTable(def);
+    ASSERT_TRUE(t_res.IsOk()) << rtdb::ErrorMessage(t_res.Error());
+    auto t = t_res.Value();
+
+    // RecordBlock 零拷贝：列数据须在 UpsertBatch 调用期间存活（同作用域）。
+    std::vector<int64_t> ids, vals;
+    auto fill = [&](size_t n, int64_t first) {
+        ids.resize(n);
+        vals.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            ids[i] = first + static_cast<int64_t>(i);
+            vals[i] = static_cast<int64_t>(i);
+        }
+    };
+
+    // ① 超容批：拒批、零副作用（无行、无提交推进）、后续可写（未毒化）。
+    fill(778, 1);
+    {
+        RecordBlock blk("t");
+        blk.AppendColumn("id", ids).AppendColumn("val", vals);
+        ASSERT_TRUE(blk.IsValid());
+        EXPECT_EQ(eng->UpsertBatch(blk).Error(), Err::kLimitExceeded);
+    }
+    EXPECT_TRUE(eng->ScanAll(t).Value().empty());
+    EXPECT_EQ(eng->CommittedSeq(), 1);  // 仅建表 DDL
+
+    // ② 边界内批（777 行）：成功。
+    fill(777, 1);
+    {
+        RecordBlock blk("t");
+        blk.AppendColumn("id", ids).AppendColumn("val", vals);
+        ASSERT_TRUE(eng->UpsertBatch(blk).IsOk());
+    }
+    EXPECT_EQ(eng->ScanAll(t).Value().size(), 777u);
+
+    // ③ 环已近满（② 后剩余 < 84B）：600 行批走批前腾环，成功。
+    fill(600, 778);
+    {
+        RecordBlock blk("t");
+        blk.AppendColumn("id", ids).AppendColumn("val", vals);
+        ASSERT_TRUE(eng->UpsertBatch(blk).IsOk());
+    }
+    EXPECT_EQ(eng->ScanAll(t).Value().size(), 1377u);
+
+    // 重开：腾环丢弃段由 checkpoint 兜底，批数据完整。
+    eng.reset();
+    auto open2 = rtdb::Engine::Open(Opts());
+    ASSERT_TRUE(open2.IsOk());
+    auto eng2 = open2.TakeValue();
+    auto t2_res = eng2->OpenTable("t");
+    ASSERT_TRUE(t2_res.IsOk());
+    auto t2 = t2_res.Value();
+    EXPECT_EQ(eng2->ScanAll(t2).Value().size(), 1377u);
+    auto got = eng2->GetByKey(t2, ColumnValue::Int(1377));
+    ASSERT_TRUE(got.IsOk()) << rtdb::ErrorMessage(got.Error());
+    EXPECT_EQ(got.Value()[1].as_int(), 599);
+}
+
+/// A2（P0-2）：发布点（行数据 + 主键索引）之后的应用失败——已发布行保持
+/// 可读（含变长内容、引用其变长块），引擎毒化（WAL 已先行）；重开后重放
+/// 幂等跳过已发布行、数据完好，不得因回收已发布行的变长块而损坏。
+TEST_F(WalEngineTest, SecIdxFailureAfterPublishPreservesRow) {
+    TableDef def;
+    def.name = "t";
+    def.columns.push_back({"id", DataType::kInt64, 0, false, false});
+    def.columns.push_back({"val", DataType::kInt64, 0, true, false});
+    def.columns.push_back({"note", DataType::kUtf8Var, 0, true, false});
+    def.row_cap = 64;
+    auto open = rtdb::Engine::Open(Opts());
+    ASSERT_TRUE(open.IsOk());
+    auto eng = open.TakeValue();
+    auto t_res = eng->CreateTable(def);
+    ASSERT_TRUE(t_res.IsOk()) << rtdb::ErrorMessage(t_res.Error());
+    auto t = t_res.Value();
+    rtdb::SecondaryIndexDef idx;
+    idx.name = "by_val";
+    idx.column_index = 1;
+    idx.unique = false;
+    ASSERT_TRUE(eng->CreateSecondaryIndex(t, idx).IsOk());
+    ASSERT_TRUE(eng->Insert(t, {ColumnValue::Int(1), ColumnValue::Int(10),
+                                ColumnValue::Text("hello")})
+                    .IsOk());
+
+    failpoint::Arm("wal.secidx.after_publish", failpoint::Mode::kError);
+    EXPECT_EQ(eng->Insert(t, {ColumnValue::Int(2), ColumnValue::Int(20),
+                              ColumnValue::Text("world")})
+                  .Error(),
+              Err::kOutOfMemory);
+    // 拒写保读：已发布行可读（变长内容来自其仍持有的块）。
+    auto got = eng->GetByKey(t, ColumnValue::Int(2));
+    ASSERT_TRUE(got.IsOk()) << rtdb::ErrorMessage(got.Error());
+    EXPECT_EQ(got.Value()[2].as_bytes(), "world");
+    EXPECT_EQ(eng->Insert(t, {ColumnValue::Int(3), ColumnValue::Int(30),
+                              ColumnValue::Text("x")})
+                  .Error(),
+              Err::kPoisoned);
+
+    eng.reset();
+    // 重开：行 2 数据完好、二级索引自愈重建；毒化持久（写仍被拒）。
+    auto open2 = rtdb::Engine::Open(Opts());
+    ASSERT_TRUE(open2.IsOk());
+    auto eng2 = open2.TakeValue();
+    auto t2_res = eng2->OpenTable("t");
+    ASSERT_TRUE(t2_res.IsOk());
+    auto t2 = t2_res.Value();
+    got = eng2->GetByKey(t2, ColumnValue::Int(2));
+    ASSERT_TRUE(got.IsOk()) << rtdb::ErrorMessage(got.Error());
+    EXPECT_EQ(got.Value()[1].as_int(), 20);
+    EXPECT_EQ(got.Value()[2].as_bytes(), "world");
+    EXPECT_TRUE(eng2->GetByKey(t2, ColumnValue::Int(1)).IsOk());
+    auto q = eng2->GetBySecondary(t2, "by_val", ColumnValue::Int(20));
+    ASSERT_TRUE(q.IsOk()) << rtdb::ErrorMessage(q.Error());
+    ASSERT_EQ(q.Value().size(), 1u);
+    EXPECT_EQ(q.Value()[0][0].as_int(), 2);
+    EXPECT_EQ(eng2->Insert(t2, {ColumnValue::Int(3), ColumnValue::Int(30),
+                                ColumnValue::Text("x")})
+                  .Error(),
+              Err::kPoisoned);
 }
 
 // ===========================================================================

@@ -7,8 +7,9 @@
 # 会报 could not find any instance of Visual Studio。由 CMake 自动探测
 # 镜像上最新安装的 VS 版本，跨镜像迁移更稳健。
 #
-# 辅助 job（docs/05 D2 / docs/06 §4）：
+# 辅助 job（docs/05 D2 / docs/06 §4 / docs/12 §7.2 A4）：
 #   sanitize —— Linux ASan+UBSan 插桩构建与单测（UBSan 出错即中止）；
+#   tsan     —— Linux TSan 数据竞争探测（stores 句柄缓存并发首访等）；
 #   coverage —— Linux 覆盖率度量（gcovr，仅统计 src/ 内核代码）。
 name: ci
 
@@ -84,6 +85,41 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sanitizer-log
+          path: build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+  tsan:
+    # TSan：线程数据竞争探测（docs/12 §7.2 修复冲刺 A4；MSVC 无 TSan，
+    # 故由 Linux 作业承担）。焦点是 Engine 读路径在根锁之外访问的共享
+    # 状态（stores 句柄缓存等）与新增并发回归用例
+    # （tests/unit/test_concurrency.cpp）。已知边界：TSan 不跨进程跟踪，
+    # 依赖纯跨进程同步的用例（shm 互斥的多进程侧）不在覆盖范围内。
+    name: tsan-linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (TSan)
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+          -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=thread"
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Unit tests (TSan instrumented)
+        working-directory: build
+        env:
+          TSAN_OPTIONS: halt_on_error=1:history_size=7
+        run: ctest --output-on-failure
+
+      - name: Upload TSan log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsan-log
           path: build/Testing/Temporary/LastTest.log
           if-no-files-found: ignore
 
