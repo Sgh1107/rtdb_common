@@ -54,6 +54,11 @@ public:
     Err flush(const void* addr, size_t len) noexcept override {
         if (!base_) return Err::kInternal;
         if (!FlushViewOfFile(addr, len)) return LastErrorToErr(GetLastError());
+        // P1-3：FlushViewOfFile 只把脏页写回文件缓存，不保证到盘；Always
+        // 档断电话义要求 FlushFileBuffers（需句柄带写权限，只读映射跳过）。
+        if (writable_ && file_ != nullptr && file_ != INVALID_HANDLE_VALUE) {
+            if (!FlushFileBuffers(file_)) return LastErrorToErr(GetLastError());
+        }
         return Err::kOk;
     }
 
@@ -113,6 +118,7 @@ public:
         obj->mapping_ = mapping;
         obj->base_ = base;
         obj->size_ = static_cast<uint64_t>(mbi.RegionSize);
+        obj->writable_ = !p.readonly;
         return Result<std::unique_ptr<SharedMemoryFile>>::Ok(
             std::unique_ptr<SharedMemoryFile>(obj.release()));
     }
@@ -133,6 +139,7 @@ private:
     HANDLE mapping_ = nullptr;
     void* base_ = nullptr;
     uint64_t size_ = 0;
+    bool writable_ = false;  ///< 可写映射（决定 flush 是否 FlushFileBuffers）
 };
 
 }  // namespace

@@ -12,6 +12,8 @@ namespace rtdb {
 namespace infra {
 
 inline constexpr int kSlabClassCount = 12;               ///< 32B<<i 至 64KB 共 12 级
+/// 单次分配上限（最大级容量 64KB）；超过即 kUnsupported。
+inline constexpr uint64_t kMaxAllocBytes = 32ull << (kSlabClassCount - 1);
 inline constexpr uint32_t kBlockHdrMagic = 0x4C424442u;  ///< "BDBL"
 
 /// 控制块：固定位于 kAllocCtlOffset，create 时一次性落盘。

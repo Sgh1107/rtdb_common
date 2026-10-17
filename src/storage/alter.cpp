@@ -76,6 +76,11 @@ Err AppendExtColumn(shm_TableDescriptor* desc, void* base, infra::SlabShmAllocat
     const uint32_t slot_bytes = col.len != 0 ? col.len : FixedSizeOf(t);
     const uint64_t region_bytes = ExtColRegionBytes(desc->row_cap, slot_bytes);
 
+    // P2-1 预检：区域须能作为单个 Slab 块分配（最大级容量 infra::kMaxAllocBytes，
+    // 否则分配器以 kUnsupported 失败、归因含混）。此处提前以 kLimitExceeded
+    // 拒绝（提示 row_cap 过大导致扩展列区域超过单块上限）。
+    if (region_bytes > infra::kMaxAllocBytes) return Err::kLimitExceeded;
+
     const Result<uint64_t> r = alloc->Allocate(region_bytes);
     if (!r.IsOk()) return r.Error();
     const uint64_t off = r.Value();
