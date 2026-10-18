@@ -553,6 +553,15 @@ Result<TableHandle> Engine::CreateTable(const TableDef& def) {
 Result<TableHandle> Engine::OpenTable(std::string_view name) {
     if (!impl_ || !impl_->catalog) return Result<TableHandle>::Fail(Err::kUnsupported);
 
+    // 读路径根锁（M3 TSan 加固，docs/13 §8-W5）：目录/表索引的遍历会与
+    // CreateTable/DropTable/AlterTableAddColumn 等写路径并发访问同一 B+ 树；
+    // 原"免锁近似读"在 C++ 内存模型下构成数据竞争（TSan：SharedBTree::Insert
+    // vs 读侧遍历）。写侧角色统一在根锁内读，语义从"近似"提升为"与写互斥"。
+    // Reader 角色无根锁（只读映射、跨进程读；TSan 不跨进程跟踪，见 ci.yml）。
+    infra::ShmRootMutex* root = impl_->region->root_mutex();
+    infra::ShmRootMutexGuard guard(root, kEngineLockTimeoutMs);
+    if (root != nullptr && !guard.locked()) return Result<TableHandle>::Fail(guard.error());
+
     Result<uint64_t> desc_res = impl_->catalog->OpenTable(name);
     if (!desc_res.IsOk()) return Result<TableHandle>::Fail(desc_res.Error());
     const uint64_t desc_off = desc_res.Value();
@@ -952,9 +961,17 @@ Result<std::vector<ColumnValue>> Engine::GetByKey(const TableHandle& table,
     if (!impl_) return Result<std::vector<ColumnValue>>::Fail(Err::kUnsupported);
     if (!table.IsValid()) return Result<std::vector<ColumnValue>>::Fail(Err::kInvalidArgument);
 
+    // 读路径根锁（M3 TSan 加固）：主键索引 find 与行记录读取和写路径互斥，
+    // 消除免锁遍历/行拷贝与并发插入更新的数据竞争；行版本奇偶协议保留为
+    // 锁内一致性校验（Reader 角色无根锁时仍以该协议兜底近似读）。
+    infra::ShmRootMutex* root = impl_->region->root_mutex();
+    infra::ShmRootMutexGuard guard(root, kEngineLockTimeoutMs);
+    if (root != nullptr && !guard.locked())
+        return Result<std::vector<ColumnValue>>::Fail(guard.error());
+
     auto store_res = impl_->StoreFor(table.desc_off(), table.table_id());
     if (!store_res.IsOk()) return Result<std::vector<ColumnValue>>::Fail(store_res.Error());
-    auto got = store_res.Value()->Get(key);  // 免锁乐观读（全量当前 schema）
+    auto got = store_res.Value()->Get(key);  // 根锁内读（全量当前 schema）
     if (!got.IsOk()) return Result<std::vector<ColumnValue>>::Fail(got.Error());
     std::vector<ColumnValue> values = got.TakeValue();
     // 旧句柄只看到绑定时刻的列（加列只追加，前缀截断即旧 schema 视图）。
@@ -1067,6 +1084,11 @@ Result<bool> Engine::ContainsKey(const TableHandle& table, const ColumnValue& ke
     if (!impl_) return Result<bool>::Fail(Err::kUnsupported);
     if (!table.IsValid()) return Result<bool>::Fail(Err::kInvalidArgument);
 
+    // 读路径根锁（M3 TSan 加固）：与写路径互斥读取主键索引/墓碑位图。
+    infra::ShmRootMutex* root = impl_->region->root_mutex();
+    infra::ShmRootMutexGuard guard(root, kEngineLockTimeoutMs);
+    if (root != nullptr && !guard.locked()) return Result<bool>::Fail(guard.error());
+
     auto store_res = impl_->StoreFor(table.desc_off(), table.table_id());
     if (!store_res.IsOk()) return Result<bool>::Fail(store_res.Error());
     return store_res.Value()->Contains(key);
@@ -1080,6 +1102,15 @@ Result<std::vector<std::vector<ColumnValue>>> Engine::Scan(const TableHandle& ta
                                                Err::kUnsupported);
     if (!table.IsValid())
         return Result<std::vector<std::vector<ColumnValue>>>::Fail(Err::kInvalidArgument);
+
+    // 读路径根锁（M3 TSan 加固）：范围扫描遍历主键 B+ 树叶链并逐行拷贝，
+    // 必须与写路径互斥——原免锁遍历与并发插入（ShiftEntries/SplitChild）
+    // 构成数据竞争（TSan：SharedBTree::Insert vs LoadAndCheckHi）。
+    // 单次 Scan 调用内的结果因此与写互斥（Reader 跨进程角色仍为近似视图）。
+    infra::ShmRootMutex* root = impl_->region->root_mutex();
+    infra::ShmRootMutexGuard guard(root, kEngineLockTimeoutMs);
+    if (root != nullptr && !guard.locked())
+        return Result<std::vector<std::vector<ColumnValue>>>::Fail(guard.error());
 
     auto store_res = impl_->StoreFor(table.desc_off(), table.table_id());
     if (!store_res.IsOk()) return Result<std::vector<std::vector<ColumnValue>>>::Fail(
@@ -1295,11 +1326,17 @@ Result<std::vector<std::vector<ColumnValue>>> Engine::GetBySecondary(const Table
     if (!table.IsValid())
         return Result<std::vector<std::vector<ColumnValue>>>::Fail(Err::kInvalidArgument);
 
+    // 读路径根锁（M3 TSan 加固）：二级索引 B+ 树等值遍历与写路径互斥。
+    infra::ShmRootMutex* root = impl_->region->root_mutex();
+    infra::ShmRootMutexGuard guard(root, kEngineLockTimeoutMs);
+    if (root != nullptr && !guard.locked())
+        return Result<std::vector<std::vector<ColumnValue>>>::Fail(guard.error());
+
     auto store_res = impl_->StoreFor(table.desc_off(), table.table_id());
     if (!store_res.IsOk())
         return Result<std::vector<std::vector<ColumnValue>>>::Fail(store_res.Error());
 
-    // 免锁近似读（同 Scan/GetByKey 的读协议）。
+    // 根锁内等值查（行记录仍按版本协议拷贝）。
     auto res = store_res.Value()->GetBySecondary(index_name, key);
     if (!res.IsOk()) return Result<std::vector<std::vector<ColumnValue>>>::Fail(res.Error());
 
@@ -1422,6 +1459,13 @@ Result<ChangeCursor> Engine::Subscribe(const std::vector<std::string>& tables) {
 
     auto cursor = std::unique_ptr<ChangeCursor::Impl>(new ChangeCursor::Impl());
     cursor->engine = impl_.get();
+
+    // 读路径根锁（M3 TSan 加固）：订阅时解析表名需遍历目录 B+ 树，
+    // 与 CreateTable/DropTable 互斥。
+    infra::ShmRootMutex* root = impl_->region->root_mutex();
+    infra::ShmRootMutexGuard guard(root, kEngineLockTimeoutMs);
+    if (root != nullptr && !guard.locked()) return Result<ChangeCursor>::Fail(guard.error());
+
     const int64_t committed = CommittedSeq();
     cursor->position = committed > 0 ? static_cast<uint64_t>(committed) : 0;
 

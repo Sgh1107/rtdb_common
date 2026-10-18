@@ -44,7 +44,11 @@ class ShmRootMutex;
 ///   - M1-W5（当前）：冷快照 `CreateSnapshot`、在线加列、范围扫描、
 ///     二级索引框架（docs/08 §3-W5）。
 ///
-/// 线程安全：同一实例可被多线程使用；写操作内部经根互斥锁串行化。
+/// 线程安全：同一实例可被多线程使用；读写操作内部均经根互斥锁串行化
+/// （M3 TSan 加固：读路径原为免锁近似读，与写并发访问 B+ 树/行记录构成
+/// 数据竞争，现与写路径同取根锁；Reader 只读角色无根锁、维持跨进程
+/// 免锁乐观读，见 docs/13 §8-W5）。读路径等待根锁超时（默认 5s）返回
+/// `kTimeout`。
 /// 不同进程通过同一映像文件挂载共享数据（docs/02 §2）。
 class RTDB_API Engine {
 public:
@@ -145,7 +149,10 @@ public:
         return UpsertBatch(block.View());
     }
 
-    /// \brief 按主键读取整行（免锁乐观读，返回自持有值）。
+    /// \brief 按主键读取整行（返回自持有值）。
+    ///
+    /// 写侧角色在根锁内读取（与写互斥，单次调用结果自洽）；Reader 只读
+    /// 角色无根锁，维持免锁乐观读（行版本奇偶协议，近似视图）。
     ///
     /// 返回列数 = 句柄可见列数（建表列 + 句柄绑定时刻的扩展列）；
     /// 句柄发放后新增的列对本句柄不可见（docs/02 §3 要点 3）。
@@ -178,9 +185,11 @@ public:
     /// \brief 主键范围扫描（物化返回；游标/流式 API 归 M2）。
     ///
     /// 行按主键升序返回，每行列数 = 句柄可见列数（同 GetByKey 的截断
-    /// 语义）。语义边界（M1）：
-    ///  - 结果为**近似视图**：并发插入可能缺席、并发更新中的行重试若干
-    ///    次后跳过、并发删除的行直接缺席——不承诺快照隔离；
+    /// 语义）。语义边界：
+    ///  - 写侧角色在根锁内扫描：单次调用与写互斥（原免锁遍历与并发插入
+    ///    构成数据竞争，见 docs/13 §8-W5）；Reader 只读角色无根锁，仍为
+    ///    **近似视图**：并发插入可能缺席、更新中的行重试若干次后跳过、
+    ///    删除的行直接缺席——不承诺跨进程快照隔离；
     ///  - 只读角色（Reader）可扫描；
     ///  - 边界不可编码（非整数类主键/空值越界）返回 `kInvalidArgument`。
     Result<std::vector<std::vector<ColumnValue>>> Scan(const TableHandle& table,
@@ -314,7 +323,8 @@ public:
     ///         `kPoisoned` / `kOutOfMemory`
     Result<void> CreateSecondaryIndex(const TableHandle& table, const SecondaryIndexDef& idx);
 
-    /// \brief 按二级索引等值查询（免锁近似读，语义边界同 `Scan`）。
+    /// \brief 按二级索引等值查询（语义边界同 `Scan`；写侧角色根锁内读，
+    /// Reader 角色免锁近似读）。
     ///
     /// 返回行按 row_no 升序，每行列数 = 句柄可见列数（同 GetByKey 截断）；
     /// 索引不存在返回 `kTableNotFound`；空值键返回 `kInvalidArgument`。
@@ -326,6 +336,10 @@ public:
     // ------------------ 写侧全局锁与内存管理（M0 直通句柄）------------------
     /// 获取根互斥锁（保护分配器 freelist 与未来目录树的全局变更；
     /// 可恢复持有者崩溃后的残留死锁）。timeout_ms==0 表示纯尝试。
+    ///
+    /// **不可重入**：持锁期间调用任何会取根锁的 Engine API（M3 TSan 加固后
+    /// 写操作与写侧读操作均取根锁，见类注释）将等到 `kEngineLockTimeoutMs`
+    /// 后返回 `kTimeout`；持锁期间只应调用本类之外的存储/平台原语。
     Err LockRoot(uint32_t timeout_ms) noexcept;
     void UnlockRoot() noexcept;
 
