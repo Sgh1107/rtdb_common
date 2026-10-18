@@ -106,11 +106,19 @@ Result<std::unique_ptr<ShmRegion>> ShmRegion::Open(const ShmRegionParams& p) {
     region->super_block_ = layout::SuperBlockAt(region->base_);
 
     shm_SuperBlock* sb = region->super_block_;
-    // 仅当头部完全为零（真正的新建空文件）才初始化；一旦存在任何
+    // 仅当头部稳定字段区为零（真正的新建空文件）才初始化；一旦存在任何
     // 非零内容而 magic 非法，说明是损坏/外来的映像，必须拒绝挂载，
     // 绝不能静默重建覆盖既有数据。
+    //
+    // 只比较稳定字段前缀（kStableFieldsBytes），不得整块 memcmp：运行时
+    // 字段（committed_seq/checkpoint_seq/flushed_seq/writer_heartbeat_ns/
+    // session_count）由其他线程/进程以原子视角并发写，plain 的整块比较会
+    // 与这些原子写混用 → C++ 数据竞争（TSan 报点）。判据等价：合法映像的
+    // magic 必在稳定前缀内（非零）；InitSuperBlock 先 memset 整个结构再写
+    // 稳定字段，故运行时字段不会脱离稳定前缀单独非零。
     static const char kZeroHeader[sizeof(shm_SuperBlock)] = {0};
-    const bool header_all_zero = std::memcmp(sb, kZeroHeader, sizeof(shm_SuperBlock)) == 0;
+    const bool header_all_zero =
+        std::memcmp(sb, kZeroHeader, layout::kStableFieldsBytes) == 0;
 
     if (header_all_zero) {
         int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(

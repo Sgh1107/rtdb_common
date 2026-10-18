@@ -79,7 +79,8 @@ Result<std::unique_ptr<WalRing>> WalRing::CreateOrAttach(void* base_addr,
         hdr->tail_seq = 1;
         hdr->head_pos = 0;
         hdr->tail_pos = 0;
-        hdr->poisoned = 0;
+        // 与运行期一致走原子视角（此处虽为单线程建环，统一访问方式即可）。
+        AsAtomicU32(&hdr->poisoned)->store(0);
         sb->wal_ring_off = off;
         sb->wal_ring_bytes = kDefaultWalRingBytes;
         layout::RefreshLayoutCrc(sb);
@@ -102,8 +103,10 @@ Result<std::unique_ptr<WalRing>> WalRing::CreateOrAttach(void* base_addr,
     if (hdr->head_pos >= hdr->area_bytes || hdr->tail_pos >= hdr->area_bytes)
         return Result<std::unique_ptr<WalRing>>::Fail(Err::kCorruption);
     // 覆盖协议不变量：(checkpoint_seq, committed_seq] 重放区间必须完整在环内，
-    // 故环内最老保留 seq 不得越过 checkpoint + 1。
-    if (hdr->tail_seq > sb->checkpoint_seq + 1)
+    // 故环内最老保留 seq 不得越过 checkpoint + 1。checkpoint_seq 由引擎/快照/
+    // 组提交以原子视角写（AsAtomicU64），这里必须原子读，避免混用访问竞争。
+    const uint64_t ckpt = layout::AsAtomicU64(&sb->checkpoint_seq)->load();
+    if (hdr->tail_seq > ckpt + 1)
         return Result<std::unique_ptr<WalRing>>::Fail(Err::kCorruption);
 
     ring->hdr_ = hdr;
@@ -136,7 +139,7 @@ Err WalRing::Append(uint8_t op, int64_t table_id, uint64_t row_no, uint64_t row_
                     const uint8_t* payload, uint32_t payload_len, uint64_t* out_seq) noexcept {
     if (hdr_ == nullptr) return Err::kUnsupported;
     if (hdr_->magic != kWalRingMagic) return Err::kCorruption;
-    if (hdr_->poisoned != 0) return Err::kPoisoned;
+    if (AsAtomicU32(&hdr_->poisoned)->load() != 0) return Err::kPoisoned;
 
     const uint64_t consumed = RecordBytes(payload_len);
     // 空间判据与 HasRoomFor 保持单一事实源（含垫片回绕落位约束，P0-3）。
@@ -185,6 +188,35 @@ Err WalRing::AppendMark(uint8_t op, const uint8_t* payload, uint32_t payload_len
 void WalRing::DropAllRetained() noexcept {
     hdr_->tail_pos = hdr_->head_pos;
     hdr_->tail_seq = hdr_->head_seq;
+}
+
+// 恢复期写头回绕（单线程恢复路径专用，见头文件文档）。
+// 语义：把 head 退回“最后一条有效/已提交记录之后”，使下一次 Append 的 seq
+// 紧接有效前缀（seq 连续），从而 committed_seq 永不跨过从未 COMMIT 的区间。
+//
+// 边界说明：
+//  - 回退可使环逻辑为空（next_seq == tail_seq）：PendingBytes() 以
+//    head_seq == tail_seq 判空（返回 0），HasRoomFor() 随后按满容量放行，
+//    位置字段（head_pos/tail_pos 可能不等）在该判空语义下不参与计算；
+//  - 回退后 head_pos 为“有效前缀末记录的归一化结束位置”，若恰为区尾则
+//    已归一化为 0，与 Append 写路径的 head_pos 归一化一致（可继续回绕写）；
+//  - 回退只允许在当前保留窗口内（tail_seq ≤ next_seq ≤ head_seq），越界
+//    视为恢复期自洽性破坏（kCorruption），绝不静默截断/前移。
+Err WalRing::RewindHeadAfterReplay(uint64_t next_seq, uint64_t next_pos) noexcept {
+    if (hdr_ == nullptr) return Err::kUnsupported;
+    if (hdr_->magic != kWalRingMagic) return Err::kCorruption;
+    // 只允许在当前保留窗口内回退（不得越过 tail，也不得前移越过 head）。
+    if (next_seq < hdr_->tail_seq || next_seq > hdr_->head_seq) return Err::kCorruption;
+    if (next_pos >= area_bytes_) return Err::kCorruption;
+    hdr_->head_seq = next_seq;
+    hdr_->head_pos = next_pos;
+    return Err::kOk;
+}
+
+void WalRing::RewindHeadToTail() noexcept {
+    if (hdr_ == nullptr) return;
+    hdr_->head_seq = hdr_->tail_seq;
+    hdr_->head_pos = hdr_->tail_pos;
 }
 
 Err WalRing::ScanValid(const RecordFn& fn, uint64_t* out_last_seq) const {
@@ -249,6 +281,9 @@ Err WalRing::ScanValid(const RecordFn& fn, uint64_t* out_last_seq) const {
         view.op = op;
         view.payload_len = payload_len;
         view.payload = payload_len != 0 ? area_ + pos + kWalRecHdrBytes : nullptr;
+        // 归一化结束位置（== area_bytes 归一化为 0，与 hdr.head_pos 同语义；
+        // 上面的 pos + total_len > area_bytes_ 已排除越界）。
+        view.end_pos = (pos + total_len >= area_bytes_) ? 0 : (pos + total_len);
 
         if (fn != nullptr) {
             const Err fe = fn(view);
@@ -333,6 +368,8 @@ Err WalRing::ScanRange(uint64_t from_seq_excl, uint64_t to_seq_incl, const ScanR
             view.op = op;
             view.payload_len = payload_len;
             view.payload = payload_len != 0 ? area_ + pos + kWalRecHdrBytes : nullptr;
+            // 归一化结束位置（同 ScanValid 语义）。
+            view.end_pos = (pos + total_len >= area_bytes_) ? 0 : (pos + total_len);
             const bool keep = (fn == nullptr) ? true : fn(view);
             if (!keep) break;  // 当前记录未交付：游标停在它之前
             last = seq;
@@ -356,7 +393,9 @@ Err ReplayWal(Catalog* catalog, void* base_addr, infra::SlabShmAllocator* alloc,
         return Err::kInvalidArgument;
 
     ReplayStats st;
-    const uint64_t ckpt = sb->checkpoint_seq;
+    // checkpoint_seq 由引擎/快照/组提交以原子视角写（AsAtomicU64），重放读取
+    // 亦须原子，避免与后台 flush 线程混用访问方式（TSan 数据竞争）。
+    const uint64_t ckpt = layout::AsAtomicU64(&sb->checkpoint_seq)->load();
 
     // 重放触及的表存储缓存（table_id → store；按需附着）。
     std::unordered_map<uint64_t, TableStore*> touched;
@@ -412,8 +451,15 @@ Err ReplayWal(Catalog* catalog, void* base_addr, infra::SlabShmAllocator* alloc,
 
     std::vector<WalRecordView> batch_buf;  // 未决批记录视图（指向环内，扫描期有效）
     bool in_batch = false;
+    // 有效前缀（= 已完整落环且批语义已 COMMIT 的记录序列）的末记录：
+    // seq + 归一化结束位置。commit/非批记录应用成功后推进。
     uint64_t valid_end = 0;                // 可发布的最后 seq
+    uint64_t valid_end_pos = 0;            // 该记录之后的 head_pos 候选
+    bool valid_prefix_exists = false;      // 环内是否存在任何有效前缀
+    // 进入当前批时刻的有效前缀快照：扫描结束仍在批内 → 回滚到该快照。
     uint64_t valid_end_before_batch = 0;
+    uint64_t pos_before_batch = 0;
+    bool had_before_batch = false;
 
     Err scan_err = ring->ScanValid(
         [&](const WalRecordView& r) -> Err {
@@ -422,6 +468,8 @@ Err ReplayWal(Catalog* catalog, void* base_addr, infra::SlabShmAllocator* alloc,
                 in_batch = true;
                 batch_buf.clear();
                 valid_end_before_batch = valid_end;
+                pos_before_batch = valid_end_pos;
+                had_before_batch = valid_prefix_exists;
                 return Err::kOk;
             }
             if (r.op == kWalOpBatchCommit) {
@@ -432,6 +480,8 @@ Err ReplayWal(Catalog* catalog, void* base_addr, infra::SlabShmAllocator* alloc,
                 batch_buf.clear();
                 in_batch = false;
                 valid_end = r.seq;
+                valid_end_pos = r.end_pos;
+                valid_prefix_exists = true;
                 return Err::kOk;
             }
             if (in_batch) {
@@ -441,6 +491,8 @@ Err ReplayWal(Catalog* catalog, void* base_addr, infra::SlabShmAllocator* alloc,
             const Err e = apply_one(r);
             if (!IsOk(e)) return e;
             valid_end = r.seq;
+            valid_end_pos = r.end_pos;
+            valid_prefix_exists = true;
             return Err::kOk;
         },
         nullptr);
@@ -450,6 +502,29 @@ Err ReplayWal(Catalog* catalog, void* base_addr, infra::SlabShmAllocator* alloc,
     if (in_batch) {
         st.batches_discarded = 1;
         valid_end = valid_end_before_batch;
+        valid_end_pos = pos_before_batch;
+        valid_prefix_exists = had_before_batch;
+    }
+
+    // ---- 写头回绕（崩溃遗留的未提交后缀）----
+    // 崩溃时 Append 可能已为未提交批分配并完整落环了若干 seq（BEGIN 与 COMMIT
+    // 之间，CRC 有效），但写头 head 停在它们之后。若只发布 committed_seq 而不
+    // 回退写头，下一次 Append 会拿到 valid_end + 2（跳过被丢弃的 valid_end+1），
+    // 提交后 committed_seq 跨过从未 COMMIT 的 seq 区间 → ScanRange/ChangeCursor
+    // 把作废批内的记录当变更事件交付（幻影变更，违 docs/13 §3-D1）。
+    // 恢复唯一写者语义下把写头退到有效前缀末记录的 end_pos，恢复 seq 连续性：
+    // 下一次 Append 的 seq == valid_end + 1，与 committed_seq 无缝衔接。
+    //  - 有有效前缀：head := (valid_end+1, valid_end_pos)；
+    //  - 无有效前缀（崩溃批是环内全部内容）：head := tail（逻辑空环）。
+    if (ring->next_seq() > valid_end + 1) {
+        const uint64_t head_seq_before = ring->next_seq();
+        if (valid_prefix_exists) {
+            const Err rew = ring->RewindHeadAfterReplay(valid_end + 1, valid_end_pos);
+            if (!IsOk(rew)) return rew;  // kCorruption：恢复窗口自洽性被破坏
+        } else {
+            ring->RewindHeadToTail();
+        }
+        st.head_rewound = (ring->next_seq() != head_seq_before);
     }
 
     // 触及表重建提交计数账本（committed_row_count = 索引规模）。
@@ -459,10 +534,19 @@ Err ReplayWal(Catalog* catalog, void* base_addr, infra::SlabShmAllocator* alloc,
     }
 
     // 发布 committed_seq（重放完成，引擎进入 READY）。
-    // 不变量：committed_seq ≥ checkpoint_seq 恒成立——快照回收环后重放
+    // 不变量 1：committed_seq ≥ checkpoint_seq 恒成立——快照回收环后重放
     // 区间为空（valid_end = 0 < checkpoint），此时发布 checkpoint 而非 0，
     // 否则已提交序号将回退（W5-a 冷快照重启闭环修复：环被
     // DropAllRetained 后重开，committed 曾被误发布为 0）。
+    // 不变量 2（写头回绕后仍成立）：回退后 head_seq = valid_end+1（无有效
+    // 前缀时 = tail_seq），恒 > publish_seq，故下一次 Append 分配的 seq 严格
+    // 大于发布值，committed_seq 只前进不回退：
+    //  - 有有效前缀：publish = max(valid_end, ckpt)，head = valid_end+1。实际恒有
+    //    valid_end ≥ ckpt——若 tail_seq ≤ ckpt，则 seq = ckpt 的已提交记录必在
+    //    保留窗口内且 CRC 有效；若 tail_seq > ckpt，则 tail_seq = ckpt+1 ≤
+    //    valid_end（保留窗口内最老记录 seq）；max 仅为异常镜像的防御性写法；
+    //  - 无有效前缀 → publish = ckpt，head = tail_seq = ckpt+1（若 tail_seq ≤ ckpt，
+    //    则 seq = tail_seq 的已提交记录必为有效前缀，与前提矛盾）。
     const uint64_t publish_seq = (valid_end > ckpt) ? valid_end : ckpt;
     layout::AsAtomicU64(&sb->committed_seq)->store(publish_seq);
     st.recovered_to_seq = publish_seq;

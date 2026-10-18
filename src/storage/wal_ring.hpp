@@ -45,6 +45,7 @@
 /// 并发约定：全部变更须持 ShmRootMutex（单写者）；扫描仅在打开恢复路径
 /// （无并发写者）执行。
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -110,7 +111,14 @@ inline uint64_t DecodeU64LE(const uint8_t* src) noexcept {
     return v;
 }
 
-/// 环头（64B 定长，标准布局；全部字段单写者访问，无需原子）。
+/// 环头（64B 定长，标准布局）。
+///
+/// 并发访问约定：
+///  - magic/area_bytes/head_seq/tail_seq/head_pos/tail_pos：单写者（持
+///    ShmRootMutex 的写线程）变更，恢复路径（无并发写者）经诊断方法读写，
+///    无需原子；
+///  - poisoned：写线程置位、业务线程在根锁之外读取（拒写判定）→ 必须走
+///    原子视角（AsAtomicU32），否则构成数据竞争（TSan 报告）。
 struct shm_WalRingHeader {
     uint64_t magic;      ///< 固定 kWalRingMagic
     uint64_t area_bytes; ///< 记录区容量（不含本头）
@@ -118,12 +126,21 @@ struct shm_WalRingHeader {
     uint64_t tail_seq;   ///< 环内最老保留记录的 seq（空环 = head_seq）
     uint64_t head_pos;   ///< 下一条记录写入位置（记录区内偏移，< area_bytes）
     uint64_t tail_pos;   ///< 最老保留记录位置
-    uint32_t poisoned;   ///< 0/1：毒化后拒写保读
+    uint32_t poisoned;   ///< 0/1：毒化后拒写保读（原子访问：AsAtomicU32）
     uint32_t reserved0;
     uint64_t reserved[1];
 };
 static_assert(sizeof(shm_WalRingHeader) == 64, "环头必须恰好 64 字节");
 static_assert(std::is_standard_layout<shm_WalRingHeader>::value, "环头必须是标准布局");
+
+// ---- 共享内存运行时字段的原子视角 helper（C++17 无 atomic_ref，reinterpret_cast
+//      到等宽 atomic 的惯用法；与 layout::AsAtomicU64 同款）。----
+static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t), "需要无锁 32 位原子支持");
+
+/// poisoned 字段（写线程置位、其他线程无根锁读取）的原子视图。
+inline std::atomic<uint32_t>* AsAtomicU32(uint32_t* p) noexcept {
+    return reinterpret_cast<std::atomic<uint32_t>*>(p);
+}
 
 /// \brief 扫描交付的记录只读视图（载荷指针指向环内，扫描期间有效）。
 struct WalRecordView {
@@ -135,6 +152,10 @@ struct WalRecordView {
     uint8_t op;
     const uint8_t* payload;  ///< 不为空时长度 payload_len（可为 0）
     uint32_t payload_len;
+    /// 记录在记录区内的归一化结束位置：记录字节末尾，恰为区尾时归一化为 0
+    /// （与 hdr.head_pos 同语义）。仅恢复路径（ReplayWal）用于回绕写头——
+    /// 有效前缀的最后一条记录结束后即“下一次 Append 应写的 head_pos”。
+    uint64_t end_pos;
 };
 
 /// \brief 映像内环形 WAL。
@@ -155,9 +176,11 @@ public:
                                                            layout::shm_SuperBlock* sb,
                                                            bool* out_created = nullptr);
 
-    bool poisoned() const noexcept { return hdr_->poisoned != 0; }
+    bool poisoned() const noexcept {
+        return AsAtomicU32(&hdr_->poisoned)->load() != 0;
+    }
     /// 毒化（持久化；拒写保读的开关，docs/08 §2-D2）。
-    void MarkPoisoned() noexcept { hdr_->poisoned = 1; }
+    void MarkPoisoned() noexcept { AsAtomicU32(&hdr_->poisoned)->store(1); }
 
     uint64_t next_seq() const noexcept { return hdr_->head_seq; }    ///< 下一个待分配 seq
     uint64_t oldest_seq() const noexcept { return hdr_->tail_seq; }  ///< 最老保留 seq
@@ -196,6 +219,30 @@ public:
     /// 前置条件（调用方保证）：checkpoint_seq ≥ 全部保留记录的 seq，
     /// 即被丢弃记录已全部应用且落盘，重放不再需要它们。
     void DropAllRetained() noexcept;
+
+    /// \brief 恢复期回绕写头（**仅** ReplayWal 单线程恢复路径调用：不得持
+    /// 根锁、不得有并发写者/扫描者）。
+    ///
+    /// 崩溃可能把写头留在“已分配但未 COMMIT”的后缀之后（撕裂批：BEGIN 已
+    /// 落环、COMMIT 未落环）。若恢复只发布 committed_seq 而不回退写头，
+    /// 下一次 Append 会从旧的 head_seq 继续分配，跳过的 seq 区间（被丢弃
+    /// 批内记录）此前已完整落环且 CRC 有效；一旦新记录提交、committed_seq
+    /// 跨过该区间，ScanRange/ChangeCursor 就会把从未 COMMIT 的记录当作变更
+    /// 事件交付（违 docs/13 §3-D1“seq ≤ committed 的记录所在批必已 COMMIT”）。
+    /// 本方法把写头精确回退到有效前缀末尾，使 seq 连续：下一次 Append 分配
+    /// 到的 seq == next_seq，不会产生幻影区间。
+    ///
+    /// 允许把环退回逻辑空环（next_seq == tail_seq），也可缩小 PendingBytes。
+    ///
+    /// \param next_seq 回退后的 hdr.head_seq（须 tail_seq ≤ next_seq ≤ head_seq）
+    /// \param next_pos 回退后的 hdr.head_pos（有效前缀末记录的归一化 end_pos，
+    ///                 须 < area_bytes）
+    /// \return kOk / kUnsupported（未附着）/ kCorruption（参数越界）
+    Err RewindHeadAfterReplay(uint64_t next_seq, uint64_t next_pos) noexcept;
+
+    /// \brief 空环回退：hdr.head := hdr.tail（恢复扫描未发现任何有效前缀时用；
+    /// 同样仅限 ReplayWal 单线程恢复路径）。
+    void RewindHeadToTail() noexcept;
 
     /// \brief 从 tail_pos 起顺序扫描有效记录（CRC + seq 连续性校验）。
     ///
@@ -250,9 +297,12 @@ struct ReplayStats {
     uint64_t records_applied = 0;   ///< 实际重放应用的记录数（seq > checkpoint）
     uint64_t batches_discarded = 0; ///< 因无 COMMIT 而整批作废的批数（0/1）
     uint64_t recovered_to_seq = 0;  ///< 重放后发布的 committed_seq
+    /// 是否回绕了写头（丢弃未提交后缀；head_seq 实际发生变化时为 true）。
+    /// 崩溃撕裂批/半批后应恒为 true，正常重开为 false。
+    bool head_rewound = false;
 };
 
-/// \brief 恢复路径 v1（docs/08 §3-W4）：扫描 → 批过滤 → 幂等重放 → 发布。
+/// \brief 恢复路径 v1（docs/08 §3-W4）：扫描 → 批过滤 → 幂等重放 → 回绕写头 → 发布。
 ///
 /// 在 Engine::Open（写侧角色）上执行，root 锁**未持有**（打开路径无并发
 /// 写者）：
@@ -263,7 +313,12 @@ struct ReplayStats {
 ///     row_no + row_ver 判重后整行重写并补发布索引；Delete 补墓碑并摘键；
 ///     DDL 记录（Create/DropTable）v1 跳过（目录重建归 W5/M2）；
 ///  3. 触及表重建 committed_row_count（= 索引规模）；
-///  4. 发布 committed_seq = 最后一条完整记录 seq（未提交批之前）。
+///  4. **回绕写头**：若 head_seq 越过有效前缀末尾（崩溃遗留未提交后缀），
+///     把写头退到有效前缀末记录的 end_pos（无有效前缀时退到 tail）；此后
+///     next Append 的 seq == 有效前缀末 seq + 1，恢复 seq 连续，杜绝
+///     “committed_seq 跳过从未 COMMIT 的 seq 区间”的幻影变更交付；
+///  5. 发布 committed_seq = max(最后一条完整记录 seq（未提交批之前）,
+///     checkpoint_seq)。
 ///
 /// \param out_stats 可选输出
 /// \return kOk / kCorruption / kOutOfMemory（重放申请空间失败）

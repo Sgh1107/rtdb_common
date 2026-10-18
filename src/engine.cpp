@@ -450,7 +450,10 @@ int64_t Engine::CheckpointSeq() const noexcept {
 }
 
 int64_t Engine::SessionCount() const noexcept {
-    return impl_ ? impl_->region->super_block()->session_count : -1;
+    // session_count 由 ShmRegion::Open 以原子 fetch_add 推进（并发 Open /
+    // 多挂载者），此处必须走同一原子视角：plain 读与 atomic 写混用即
+    // C++ 数据竞争（TSan 报点；与 FlushedSeq/CheckpointSeq 同款写法）。
+    return impl_ ? layout::AsAtomicI64(&impl_->region->super_block()->session_count)->load() : -1;
 }
 
 TableHandle Engine::MakeHandle(int64_t table_id, const char* name, uint32_t layout_version,

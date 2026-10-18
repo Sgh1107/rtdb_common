@@ -939,4 +939,57 @@ TEST_F(WalCrashRecoveryTest, CrashBatchMidApplyRedoesAll) {
     EXPECT_EQ(eng->CommittedSeq(), 14);  // DDL + 5 行 + BEGIN + 6 op + COMMIT
 }
 
+/// 注入点"批 WAL 阶段中断"后的写头回退（恢复期修复）：
+/// 恢复丢弃无 COMMIT 的整批后，写头须回退到 seq 6 之后，新记录从 7 起连续
+/// 分配——否则写头停在 14（下一个待分配 seq），新记录为 seq 14 并使
+/// committed 跳到 14；且订阅会把"从未提交"的批内记录（seq 8..13、行
+/// 100..105）当作幻影变更交付。
+TEST_F(WalCrashRecoveryTest, CrashBatchWalMidRewindHeadNoPhantomChanges) {
+    RunChildToCrash("wal.batch.wal_mid=crash");
+    {
+        auto open = rtdb::Engine::Open(Opts());
+        ASSERT_TRUE(open.IsOk()) << rtdb::ErrorMessage(open.Error());
+        auto eng = open.TakeValue();
+        auto t_res = eng->OpenTable("t");
+        ASSERT_TRUE(t_res.IsOk()) << rtdb::ErrorMessage(t_res.Error());
+        auto t = t_res.Value();
+
+        // 整批作废：DDL(seq1) + 5 行(seq2..6)，committed 停在 6。
+        EXPECT_EQ(eng->CommittedSeq(), 6);
+
+        auto sub = eng->Subscribe({"t"});
+        ASSERT_TRUE(sub.IsOk()) << rtdb::ErrorMessage(sub.Error());
+        rtdb::ChangeCursor cur = sub.TakeValue();
+        EXPECT_EQ(cur.Position(), 6u);
+
+        ASSERT_TRUE(eng->Insert(t, Row(200, 1)).IsOk());
+        // 关键断言：写头回退后新记录 seq 紧接 6（未修复时为 14）。
+        EXPECT_EQ(eng->CommittedSeq(), 7);
+
+        auto b = cur.Next(0);
+        ASSERT_TRUE(b.IsOk()) << rtdb::ErrorMessage(b.Error());
+        // 关键断言：只交付行 200（seq 7），不得额外交付作废批的 100..105。
+        ASSERT_EQ(b.Value().events.size(), 1u);
+        EXPECT_EQ(b.Value().events[0].kind, rtdb::ChangeEvent::Kind::kInsert);
+        EXPECT_EQ(b.Value().events[0].seq, 7u);
+        ASSERT_FALSE(b.Value().events[0].row.empty());
+        EXPECT_EQ(b.Value().events[0].row[0].as_int(), 200);
+        EXPECT_EQ(b.Value().last_seq, 7u);
+        for (int64_t i = 100; i <= 105; ++i)
+            EXPECT_EQ(eng->GetByKey(t, ColumnValue::Int(i)).Error(), Err::kNotFound) << i;
+    }
+    // 第二次重开：重放 (0,7] 幂等，committed 仍为 7、行 200 可读。
+    {
+        auto open2 = rtdb::Engine::Open(Opts());
+        ASSERT_TRUE(open2.IsOk()) << rtdb::ErrorMessage(open2.Error());
+        auto eng2 = open2.TakeValue();
+        EXPECT_EQ(eng2->CommittedSeq(), 7);
+        auto t2_res = eng2->OpenTable("t");
+        ASSERT_TRUE(t2_res.IsOk()) << rtdb::ErrorMessage(t2_res.Error());
+        auto got = eng2->GetByKey(t2_res.Value(), ColumnValue::Int(200));
+        ASSERT_TRUE(got.IsOk()) << rtdb::ErrorMessage(got.Error());
+        EXPECT_EQ(got.Value()[1].as_int(), 1);
+    }
+}
+
 }  // namespace
