@@ -14,7 +14,17 @@
 /// 提交数据**（M1 chaos 同结论：kill -9 后 committed_seq 一致、无半截记
 /// 录），故重启后游标连续、交付允许重复但不允许缺漏；场景 1 按最强判据
 /// 断言"无缺漏 + seq 严格递增 + 重启后心跳前进"，场景 2 按"acked ⊆ 交付"
-/// 断言（记录数刻意远小于环容量，越窗视为场景失配即失败）。
+/// 断言。
+///
+/// 但该强判据只在**订阅窗口内**成立：订阅数据源是 WAL 环，窗口 = 环容量
+/// （64KB，docs/13 §3-D1）；环满回收会把 tail 前移到 head（覆盖协议
+/// "覆盖前先落盘"：engine.cpp `EnsureRingSpace` → wal_ring.cpp
+/// `DropAllRetained`），此后客户端游标若早于 tail 即 402 溢出，按契约（docs/13
+/// §1.2、docs/14 §8.4/§9.4）只能整表重取 + `ResetTo`——重扫每键仅见
+/// **最新**值，历史事件不再可交付。因此场景 2 的写入总量按环容量预算
+/// 封顶（见阶段 B 注释与 static_assert），把"无溢出"做成构造性前提；否则
+/// Linux 真 2ms 节流产生的写量会把回收点撞进泵重连窗口，判据本身失效
+/// （W6 修复）。
 ///
 /// 仅在编入 `RTDBD_EXE_PATH`（测试目标已提供，指向真实 rtdbd 产物）时启用。
 
@@ -23,6 +33,8 @@
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -345,11 +357,42 @@ TEST(NetChaos, KillDuringWriteBurstSustainsDelivery) {
     ASSERT_TRUE(sink.WaitCol0Prefix(kPool, 10000)) << "预置键交付缺漏";
 
     // ---- 阶段 B：写线程对既有键持续 update（tag 唯一标记交付比对）----
-    // 节流 2ms（Windows 定时器粒度实际 ~15.6ms）；写类请求不自动重发，
+    // 写总量按 WAL 环窗口封顶（W6 修复，Linux CI 首跑回归）：
+    //  - 单条 update 经 EXEC_BATCH 落 3 条 WAL 记录：BEGIN 64B + 行记录
+    //    (56B 头 + rec_fixed_len 24B + 4B CRC) + COMMIT 60B = 208B
+    //    （rec_fixed_len=24：2×int64 + 1B null 位图后按 8 字节对齐，
+    //    schema.hpp `PlanRowLayout`）；
+    //  - WAL 环记录区 = 64KiB-64B（`kDefaultWalRingBytes`，docs/13 §3-D1），
+    //    故窗口 ≈ 300 条单批写。
+    // 原风暴未封顶：Windows 的 `sleep_for(2ms)` 受 ~15.6ms 定时器粒度约束
+    // （docs/14 §7.1 实测 attempts=93/2973ms ≈ 32ms/次），写量 ≈32KB < 64KB
+    // 从不回绕；Linux 为真 2ms（CI 实测 attempts=888/1913ms）→ acked 713 条
+    // ≈148KB ≈ 2.3 个环（含预置共 ≈2.5 个环），环满回收恰好落在"杀后泵
+    // 断线重连"窗口内 → `ScanRange` 返回 402 → 客户端整表重扫（每键仅剩
+    // 最新 tag）→ "acked ⊆ 交付" 前提失效；缺口 18 条即断线窗口内被回收
+    // 点丢弃、重扫不可复原的历史 acked tag。
+    // 修复：acked 总量封顶 + 逐轮闸门放行，构造性保证全程 WAL 用量 < 环
+    // 容量（下方 static_assert）⇒ 环永不回绕 ⇒ 不可能溢出，强判据成立。
+    // 节流 2ms 保持不变（本用例的写压力口径不降级）；写类请求不自动重发，
     // 杀中断时该次调用失败计入 failed，后续调用自动重连继续。
+    constexpr int kRounds = 3;
+    constexpr uint64_t kAckedBudget = 120;                  // 全程应答写上限
+    constexpr uint64_t kPerRound = kAckedBudget / kRounds;  // 40 条/轮
+    constexpr uint64_t kInFlightMargin = 3;                 // 杀点前预留的在飞写
+    static_assert(kAckedBudget % kRounds == 0, "预算须按轮整除（否则尾窗追不平）");
+    // 构造性预算校验：最坏估算（rec_fixed_len 取 32 上限而非实测 24；
+    // 预置 64 批 + 全程写批 + 每轮在飞/已提交未应答记录 + DDL 记录）。
+    constexpr uint64_t kRingAreaBytes = 64 * 1024 - 64;  // 环记录区容量
+    constexpr uint64_t kMaxBatchWalBytes = 64 + (56 + 32 + 4) + 60;
+    static_assert((64 + kAckedBudget + kInFlightMargin * kRounds) * kMaxBatchWalBytes + 128 <
+                       kRingAreaBytes,
+                  "场景 2 写入总量必须落在 64KB WAL 环窗口内，否则溢出会使 acked 判据失效");
+
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> failed{0};
     std::atomic<uint64_t> attempts{0};
+    std::atomic<uint64_t> acked_count{0};
+    std::atomic<uint64_t> budget{kPerRound};  // 累计放行上界（主线程逐轮抬升）
     std::mutex fmu;
     std::map<std::string, uint64_t> failed_msgs;  // 失败错误分类（诊断）
     std::vector<int64_t> acked;  // 仅写线程写、join 后主线程读
@@ -358,6 +401,10 @@ TEST(NetChaos, KillDuringWriteBurstSustainsDelivery) {
         int64_t tag = kPool;
         int64_t step = 0;
         while (!stop.load()) {
+            if (acked_count.load() >= budget.load()) {  // 本轮预算用尽：等主线程放行
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
             ++tag;
             ++step;
             ++attempts;
@@ -369,6 +416,7 @@ TEST(NetChaos, KillDuringWriteBurstSustainsDelivery) {
             auto r = c->ExecuteBatch({op});
             if (r.IsOk()) {
                 acked.push_back(tag);
+                acked_count.fetch_add(1);
             } else {
                 failed.fetch_add(1);
                 std::lock_guard<std::mutex> lk(fmu);
@@ -378,10 +426,19 @@ TEST(NetChaos, KillDuringWriteBurstSustainsDelivery) {
         }
     });
 
-    // ---- 随机时机硬杀 ×3（写路径在飞行中被打断）----
-    constexpr int kRounds = 3;
+    // ---- 写流中硬杀 ×3（杀点落在写线程仍在出写的窗口内）----
+    // 每轮放行 kPerRound 条预算；累计达 target-kInFlightMargin 即杀（余量
+    // 留给杀点在飞的写，其失败计入 failed；写类不自动重发，重启后下一次
+    // 写自动重连续跑）。重启→等泵重连→再抬升下一轮预算，尾批由下一轮
+    // 等待追平。
     for (int r = 0; r < kRounds; ++r) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        const uint64_t target = static_cast<uint64_t>(r + 1) * kPerRound;
+        const auto acks_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (acked_count.load() + kInFlightMargin < target &&
+               std::chrono::steady_clock::now() < acks_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
         srv.Kill9();
         const int rc = srv.Wait();
         EXPECT_TRUE(rc == 9 || rc == 137) << "硬杀退出码异常：" << rc;
@@ -390,9 +447,18 @@ TEST(NetChaos, KillDuringWriteBurstSustainsDelivery) {
         ASSERT_TRUE(srv.spawned());
         ASSERT_TRUE(WaitConnected(sub, 10000))
             << "第 " << r << " 轮重启后泵未重连：err=" << sub->last_error();
+        // 抬升下一轮预算（最后一轮不再抬升，尾窗由下面的 stop 收尾）。
+        if (r + 1 < kRounds) budget.store(static_cast<uint64_t>(r + 2) * kPerRound);
     }
-    // 尾窗：最后一轮重启后再放行一段写流，保证场景含"重启后正常写入"。
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // 尾窗：最后一轮重启后放行剩余写预算，保证场景含"重启后正常写入"。
+    {
+        const auto tail_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (acked_count.load() < kAckedBudget &&
+               std::chrono::steady_clock::now() < tail_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
 
     stop.store(true);
     writer.join();
@@ -470,15 +536,21 @@ TEST(NetChaos, KillDuringWriteBurstSustainsDelivery) {
     for (const int64_t tag : acked) {
         if (seen_tags.count(tag) == 0) {
             if (missing < 5) {
-                ADD_FAILURE() << "acked tag=" << tag << " 未交付";
+                ADD_FAILURE() << "acked tag=" << tag
+                              << " 未交付（无环回绕前提下已应答写入必达）";
             }
             ++missing;
         }
     }
     EXPECT_EQ(missing, 0u) << "acked 写入缺交付共 " << missing << " 条";
-    EXPECT_FALSE(sink.overflow.load());
-    std::printf("NetChaos burst：acked=%zu failed=%llu 交付 unique_tags=%zu\n", acked.size(),
-                static_cast<unsigned long long>(failed.load()), seen_tags.size());
+    // 溢出即说明写总量/断线时长超出 64KB 环窗口预算（阶段 B static_assert
+    // 已封顶）。此断言失败表示场景预算失效或环回收行为回归，不是"允许的
+    // 历史事件缺失"——acked 判据以无溢出为前提，故必须同时为假。
+    EXPECT_FALSE(sink.overflow.load())
+        << "订阅发生 402 越窗：写总量/断线窗口超出 WAL 环 64KB 预算";
+    std::printf("NetChaos burst：acked=%zu failed=%llu 交付 unique_tags=%zu overflow=%d\n",
+                acked.size(), static_cast<unsigned long long>(failed.load()), seen_tags.size(),
+                sink.overflow.load() ? 1 : 0);
 
     sub->Close();
     c->Close();

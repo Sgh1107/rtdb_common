@@ -160,12 +160,18 @@ struct Server::Impl {
     }
 
     /// 会话/拒绝线程退出登记（is_session 决定是否归还会话名额）。
+    ///
+    /// 通知必须在 conn_mu 临界区内完成：这是"线程已完成对 Impl 的访问"与
+    /// Stop 观察 live_threads == 0 之间的唯一同步点。若 notify 放在解锁之后，
+    /// Stop 的谓词检查（或虚假唤醒）可能在解锁与 notify 之间先观察到 0 并
+    /// 析构 Impl/conn_cv，随后本线程再对已析构条件变量广播 → UB（TSan:
+    /// pthread_cond_destroy vs pthread_cond_broadcast）。临界区内 notify 使
+    /// 解锁严格早于 Stop 的加锁，构成 happens-before；解锁后本线程不再触碰
+    /// Impl 任何成员，故 Stop 在观察到 0 之后析构是安全的。
     void ConnReleased(bool is_session) {
-        {
-            std::lock_guard<std::mutex> lk(conn_mu);
-            if (live_threads > 0) --live_threads;
-            if (is_session && live_sessions > 0) --live_sessions;
-        }
+        std::lock_guard<std::mutex> lk(conn_mu);
+        if (live_threads > 0) --live_threads;
+        if (is_session && live_sessions > 0) --live_sessions;
         conn_cv.notify_all();
     }
 
@@ -246,6 +252,8 @@ void Server::Impl::HeartbeatLoop() {
 }
 
 void Server::Impl::SessionLoop(platform::TcpSocket sock) {
+    // 生命周期契约：Guard 必须最先声明（故最后析构）——ConnReleased 之后本线程
+    // 不得再触碰 Impl 任何成员；Stop 观察到 live_threads == 0 即可能析构 Impl。
     struct Guard {
         Impl* im;
         ~Guard() { im->ConnReleased(true); }
@@ -306,6 +314,7 @@ void Server::Impl::SessionLoop(platform::TcpSocket sock) {
 }
 
 void Server::Impl::RejectLoop(platform::TcpSocket sock) {
+    // 生命周期契约同 SessionLoop：Guard 最先声明/最后析构，之后不再访问 Impl。
     struct Guard {
         Impl* im;
         ~Guard() { im->ConnReleased(false); }
@@ -446,9 +455,10 @@ Err Server::Impl::DoDdl(net::Reader& r, std::vector<uint8_t>* body) {
         std::string name;
         if (!r.Str(&name)) return Err::kProtocolError;
         if (!r.Finish()) return Err::kProtocolError;
-        const Err e = engine->DropTable(name).Error();
-        if (IsOk(e)) return Err::kOk;
-        return e;
+        // Result<void>::Error() 的契约是 !IsOk()（Debug/ASan 下断言），不可对
+        // 成功结果调用；此处显式判成功，语义与 Release（err_ == kOk）一致。
+        const auto drop_res = engine->DropTable(name);
+        return drop_res.IsOk() ? Err::kOk : drop_res.Error();
     }
     if (sub == RTDB_DDL_DESCRIBE_TABLE) {
         std::string name;
@@ -520,8 +530,8 @@ Err Server::Impl::DoExecBatch(net::Reader& r, std::vector<uint8_t>* body) {
         if (!r.Finish()) return Err::kProtocolError;
         if (ops.empty()) return Err::kInvalidArgument;
 
-        const Err e = engine->ExecuteBatch(ops).Error();
-        if (!IsOk(e)) return e;
+        const auto exec_res = engine->ExecuteBatch(ops);
+        if (!exec_res.IsOk()) return exec_res.Error();
         net::Writer w(body);
         w.I64(engine->CommittedSeq());
         return Err::kOk;
@@ -531,8 +541,8 @@ Err Server::Impl::DoExecBatch(net::Reader& r, std::vector<uint8_t>* body) {
         auto blk = net::ReadBlock(r);
         if (!blk.IsOk()) return blk.Error();
         if (!r.Finish()) return Err::kProtocolError;
-        const Err e = engine->UpsertBatch(blk.Value().View()).Error();
-        if (!IsOk(e)) return e;
+        const auto upsert_res = engine->UpsertBatch(blk.Value().View());
+        if (!upsert_res.IsOk()) return upsert_res.Error();
         net::Writer w(body);
         w.I64(engine->CommittedSeq());
         return Err::kOk;
@@ -803,6 +813,9 @@ Err Server::Impl::DoUnregister(SessionState& st, net::Reader& r) {
 Server::Server() noexcept = default;
 
 Server::~Server() {
+    // Stop 的契约：要么排空全部会话线程（可安全析构 Impl），要么整体泄漏 Impl
+    // （impl_ 置空，残留线程仍持有有效内存）。因此此处销毁 impl_ 不会与
+    // 已分离会话线程的 conn_mu/conn_cv 访问竞争。
     if (impl_ != nullptr && impl_->running) Stop(5000);
 }
 
@@ -857,17 +870,25 @@ void Server::Stop(uint32_t timeout_ms) {
     Impl& im = *impl_;
     im.stop.store(true);
 
+    // 先收敛接受/心跳线程：此后不再登记新的会话线程，live_threads 只减不增。
     if (im.accept_thread.joinable()) im.accept_thread.join();
     if (im.heartbeat_thread.joinable()) im.heartbeat_thread.join();
     im.listener.Close();
 
+    // 排空判据必须在 conn_mu 内读取：会话线程的退出登记与 notify 在同一临界区
+    // （见 ConnReleased），故"观察到 live_threads == 0"意味着所有会话/拒绝线程
+    // 对 Impl 的访问均已完成，并经 conn_mu 的解锁→加锁与本线程建立 happens-before。
+    bool drained = false;
     {
         std::unique_lock<std::mutex> lk(im.conn_mu);
-        im.conn_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
-                            [&im] { return im.live_threads == 0; });
+        drained = im.conn_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+                                      [&im] { return im.live_threads == 0; });
     }
 
-    if (im.live_threads == 0) {
+    im.running = false;
+    im.bound_port.store(0);
+
+    if (drained) {
         if (im.cfg.snapshot_on_exit && im.engine != nullptr) {
             auto s = im.engine->CreateSnapshot();
             if (!s.IsOk()) {
@@ -876,13 +897,14 @@ void Server::Stop(uint32_t timeout_ms) {
         }
         im.engine.reset();  // 关引擎：最终 flush（docs/13 §3-D7）
     } else {
-        // 极端情形：会话线程未在预算内收敛（对端卡死/平台异常）。
-        // 保安全不析构引擎（会话线程仍可能持有引用），进程退出统一回收。
-        im.SetError("stop timeout: live sessions remain; engine leaked to avoid UAF");
-        (void)im.engine.release();
+        // 极端情形：会话线程未在预算内收敛（对端卡死/平台异常）。此时既不能
+        // join（可能无界阻塞）也不能析构 Impl：残留线程仍会访问 conn_mu/conn_cv
+        // 与（经会话状态的）引擎。整体泄漏 Impl（含引擎，同原"进程退出统一回收"
+        // 口径）以保安全；泄漏后本 Server 不再可用（impl_ == nullptr，API 退化
+        // 为未运行态），进程退出由操作系统统一回收。
+        im.SetError("stop timeout: live sessions remain; Impl leaked to avoid UAF");
+        (void)impl_.release();
     }
-    im.running = false;
-    im.bound_port.store(0);
 }
 
 bool Server::running() const noexcept { return impl_ != nullptr && impl_->running; }
