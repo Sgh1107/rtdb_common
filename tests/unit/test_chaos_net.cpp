@@ -219,6 +219,33 @@ bool WaitConnected(const std::unique_ptr<rtdb::Subscription>& sub, uint32_t budg
     return sub->connected();
 }
 
+/// \brief 杀前/预置"确定性主键 insert"的幂等重试（CI loopback 偶发瞬断，
+/// docs/13 §3-D2 写类不自动重发的测试侧补充）。
+///
+/// 写类请求按协议不自动重发（避免"已提交、应答丢失"的重复写）；但本用例在
+/// 击杀前用固定主键插入，按同一主键重试是幂等的：若上次实际已提交、仅应答
+/// 丢失，服务端返回 `kAlreadyExists` —— 按"已提交"处理并推进即可。
+/// 目的：吸收 CI/ASan 下偶发的连接级瞬断（含半帧超时后的会话重建），不让
+/// setup 阶段的传输抖动被误判为混沌语义回归；引擎故障（kPoisoned/
+/// kCorruption/kLimitExceeded 等）仍会在重试耗尽后显式失败并打印错误码。
+bool InsertWithRetry(rtdb::Client& c, const char* table, int64_t key, int64_t val,
+                     rtdb::Err* last_err, int attempts = 5) {
+    for (int i = 0; i < attempts; ++i) {
+        rtdb::ClientBatchOp op;
+        op.type = rtdb::ClientBatchOp::Type::kInsert;
+        op.table = table;
+        op.row = {rtdb::ColumnValue::Int(key), rtdb::ColumnValue::Int(val)};
+        auto r = c.ExecuteBatch({op});
+        if (r.IsOk()) return true;
+        if (last_err != nullptr) *last_err = r.Error();
+        // i>0 的 kAlreadyExists 说明本函数前一次尝试实际已提交（仅应答丢失）；
+        // 首次即冲突属于数据异常，按失败上报而不掩盖。
+        if (i > 0 && r.Error() == rtdb::Err::kAlreadyExists) return true;
+        if (i + 1 < attempts) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
+}
+
 }  // namespace
 
 TEST(NetChaos, Kill9RestartResumesDelivery) {
@@ -248,14 +275,10 @@ TEST(NetChaos, Kill9RestartResumesDelivery) {
     const uint64_t hb_before = ping.Value().writer_heartbeat_ns;
 
     int64_t next_id = 1;
+    rtdb::Err last_write_err = rtdb::Err::kOk;
     auto write_one = [&]() -> int64_t {
         if (next_id > 1000000) return -1;
-        rtdb::ClientBatchOp op;
-        op.type = rtdb::ClientBatchOp::Type::kInsert;
-        op.table = kTable;
-        op.row = {rtdb::ColumnValue::Int(next_id), rtdb::ColumnValue::Int(next_id * 10)};
-        auto r = c->ExecuteBatch({op});
-        if (!r.IsOk()) return -1;
+        if (!InsertWithRetry(*c, kTable, next_id, next_id * 10, &last_write_err)) return -1;
         return next_id++;
     };
 
@@ -264,7 +287,12 @@ TEST(NetChaos, Kill9RestartResumesDelivery) {
     for (int r = 0; r < kRounds; ++r) {
         // ---- 写一批 + 等交付（写路径在 kill 前已提交）----
         for (int i = 0; i < kRowsPerRound; ++i) {
-            ASSERT_GT(write_one(), 0) << "第 " << r << " 轮第 " << i << " 条写入失败";
+            const int64_t written = write_one();
+            ASSERT_GT(written, 0)
+                << "第 " << r << " 轮第 " << i << " 条写入失败（幂等重试耗尽）："
+                << rtdb::ErrorMessage(last_write_err) << "；srv_alive="
+                << (srv.alive() ? 1 : 0) << " conn=" << (c->connected() ? 1 : 0)
+                << " sub_err=" << sub->last_error();
         }
         const int64_t top = next_id - 1;
         ASSERT_TRUE(sink.WaitCol0Prefix(top, 10000))
@@ -347,12 +375,10 @@ TEST(NetChaos, KillDuringWriteBurstSustainsDelivery) {
     // ---- 阶段 A：预置 64 键（先建行，风暴全部走 update 不依赖键存在性）----
     constexpr int64_t kPool = 64;
     for (int64_t id = 1; id <= kPool; ++id) {
-        rtdb::ClientBatchOp op;
-        op.type = rtdb::ClientBatchOp::Type::kInsert;
-        op.table = kTable;
-        op.row = {rtdb::ColumnValue::Int(id), rtdb::ColumnValue::Int(id)};
-        auto r = c->ExecuteBatch({op});
-        ASSERT_TRUE(r.IsOk()) << "预置键 id=" << id << " 失败：" << rtdb::ErrorMessage(r.Error());
+        rtdb::Err preset_err = rtdb::Err::kOk;
+        ASSERT_TRUE(InsertWithRetry(*c, kTable, id, id, &preset_err))
+            << "预置键 id=" << id
+            << " 失败（幂等重试耗尽）：" << rtdb::ErrorMessage(preset_err);
     }
     ASSERT_TRUE(sink.WaitCol0Prefix(kPool, 10000)) << "预置键交付缺漏";
 

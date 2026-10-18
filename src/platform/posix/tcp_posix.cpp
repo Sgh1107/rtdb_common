@@ -147,7 +147,11 @@ Err TcpSocket::SendAll(const void* data, size_t len) noexcept {
         if (rc == 0) return Err::kNetworkError;
         if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            if (timeout_ms_ != 0) return Err::kTimeout;
+            if (timeout_ms_ != 0) {
+                // 部分发送后超时：流已含半帧，调用方不能按"未发送"重试，
+                // 必须按连接失效处理（否则后续帧边界错位）。
+                return sent > 0 ? Err::kNetworkError : Err::kTimeout;
+            }
             continue;
         }
         return Err::kNetworkError;
@@ -169,7 +173,12 @@ Err TcpSocket::RecvExact(void* buf, size_t len) noexcept {
         if (rc == 0) return Err::kNetworkError;  // 对端关闭
         if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            if (timeout_ms_ != 0) return Err::kTimeout;
+            if (timeout_ms_ != 0) {
+                // 部分接收后超时：已消费的字节无法回退，若按 kTimeout 上报，
+                // 上层（服务端会话循环）会当作"空闲无请求"继续读，导致后续
+                // 帧边界错位/连接被迫关闭。半帧一律按连接失效处理。
+                return got > 0 ? Err::kNetworkError : Err::kTimeout;
+            }
             continue;
         }
         return Err::kNetworkError;

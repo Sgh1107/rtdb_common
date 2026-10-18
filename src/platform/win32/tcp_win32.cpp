@@ -171,10 +171,11 @@ Err TcpSocket::SendAll(const void* data, size_t len) noexcept {
         const int e = WSAGetLastError();
         if (e == WSAEINTR) continue;
         if (e == WSAEWOULDBLOCK) {
-            if (timeout_ms_ != 0) return Err::kTimeout;
+            // 部分发送后超时：流已含半帧，调用方不能按"未发送"重试。
+            if (timeout_ms_ != 0) return sent > 0 ? Err::kNetworkError : Err::kTimeout;
             continue;
         }
-        if (e == WSAETIMEDOUT) return Err::kTimeout;
+        if (e == WSAETIMEDOUT) return sent > 0 ? Err::kNetworkError : Err::kTimeout;
         return Err::kNetworkError;
     }
     return Err::kOk;
@@ -195,10 +196,12 @@ Err TcpSocket::RecvExact(void* buf, size_t len) noexcept {
         const int e = WSAGetLastError();
         if (e == WSAEINTR) continue;
         if (e == WSAEWOULDBLOCK) {
-            if (timeout_ms_ != 0) return Err::kTimeout;
+            // 部分接收后超时：已消费字节无法回退，半帧一律按连接失效处理，
+            // 避免上层把超时当"空闲"而帧边界错位。
+            if (timeout_ms_ != 0) return got > 0 ? Err::kNetworkError : Err::kTimeout;
             continue;
         }
-        if (e == WSAETIMEDOUT) return Err::kTimeout;
+        if (e == WSAETIMEDOUT) return got > 0 ? Err::kNetworkError : Err::kTimeout;
         return Err::kNetworkError;
     }
     return Err::kOk;
