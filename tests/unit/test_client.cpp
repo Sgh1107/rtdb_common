@@ -715,21 +715,23 @@ TEST_F(ClientTest, CApiConnectScanSubscribe) {
     };
     CbState st;
     rtdb_client_sub* sub = nullptr;
-    ASSERT_EQ(rtdb_client_subscribe(
-                  cc, nullptr, 0,
-                  [](const rtdb_change* chg, void* user) {
-                      auto* s = static_cast<CbState*>(user);
-                      s->count.fetch_add(1);
-                      if (chg->kind == RTDB_CHG_INSERT && chg->row.nvals > 0) {
-                          s->last_id.store(chg->row.vals[0].int_value);
-                      }
-                      if (chg->table != nullptr) {
-                          std::lock_guard<std::mutex> lk(s->mu);
-                          s->last_table = chg->table;
-                      }
-                  },
-                  [](void* user) { static_cast<CbState*>(user)->overflows.fetch_add(1); },
-                  nullptr, &st, &sub),
+    // MSVC 19.44（/permissive-、C++17）在 ASSERT_EQ 宏的未求值上下文中
+    // 不接受直接内联的 lambda（C3477），先落成函数指针再传入。
+    const rtdb_client_change_fn on_change = [](const rtdb_change* chg, void* user) {
+        auto* s = static_cast<CbState*>(user);
+        s->count.fetch_add(1);
+        if (chg->kind == RTDB_CHG_INSERT && chg->row.nvals > 0) {
+            s->last_id.store(chg->row.vals[0].int_value);
+        }
+        if (chg->table != nullptr) {
+            std::lock_guard<std::mutex> lk(s->mu);
+            s->last_table = chg->table;
+        }
+    };
+    const rtdb_client_overflow_fn on_overflow = [](void* user) {
+        static_cast<CbState*>(user)->overflows.fetch_add(1);
+    };
+    ASSERT_EQ(rtdb_client_subscribe(cc, nullptr, 0, on_change, on_overflow, nullptr, &st, &sub),
               RTDB_OK);
     ASSERT_TRUE(sub != nullptr);
 

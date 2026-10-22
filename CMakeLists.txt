@@ -176,7 +176,23 @@ endif()
 # ---------------------------------------------------------------
 if(RTDB_BUILD_TESTS)
   enable_testing()
-  if(RTDB_FETCH_GTEST)
+  if(DEFINED RTDB_GTEST_ROOT)
+    # 离线构建：使用本地预编译 GoogleTest（CACHE 变量指向包含
+    # gtest/gtest.h 与 gtest.lib 的包根目录），避免配置期访问 GitHub。
+    # 目录约定：<root>/include/gtest/gtest.h、<root>/lib/gtest.lib。
+    include(GoogleTest)
+    get_filename_component(RTDB_GTEST_ROOT "${RTDB_GTEST_ROOT}" ABSOLUTE
+      BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_library(GTest::gtest STATIC IMPORTED)
+    add_library(GTest::gtest_main STATIC IMPORTED)
+    set_target_properties(GTest::gtest PROPERTIES
+      INTERFACE_INCLUDE_DIRECTORIES "${RTDB_GTEST_ROOT}/include"
+      IMPORTED_LOCATION "${RTDB_GTEST_ROOT}/lib/gtest.lib")
+    set_target_properties(GTest::gtest_main PROPERTIES
+      INTERFACE_INCLUDE_DIRECTORIES "${RTDB_GTEST_ROOT}/include"
+      INTERFACE_LINK_LIBRARIES GTest::gtest
+      IMPORTED_LOCATION "${RTDB_GTEST_ROOT}/lib/gtest_main.lib")
+  elseif(RTDB_FETCH_GTEST)
     include(FetchContent)
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
     set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
