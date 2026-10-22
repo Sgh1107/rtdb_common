@@ -70,7 +70,8 @@ protected:
     void TearDown() override { RemoveFile(kImage); }
 
     /// 打开独立区域并创建新环（环所有权由 ring_ 持有）。
-    storage::WalRing* MakeRegionAndRing() {
+    /// requested_bytes = 0 → 默认 64KB；否则按配置容量创建（P0-5）。
+    storage::WalRing* MakeRegionAndRing(uint64_t requested_bytes = 0) {
         rtdb::ShmRegionParams rp;
         rp.map_name = "walring_test";
         rp.file_path = kImage;
@@ -83,17 +84,19 @@ protected:
         bool created = false;
         auto ring_res = storage::WalRing::CreateOrAttach(region_->base_address(),
                                                          region_->allocator(),
-                                                         region_->super_block(), &created);
+                                                         region_->super_block(), &created,
+                                                         requested_bytes);
         if (!ring_res.IsOk() || !created) return nullptr;
         ring_ = ring_res.TakeValue();
         return ring_.get();
     }
 
     /// 重新附着既有环（不新建）。
-    storage::WalRing* ReattachRing(bool* out_created) {
+    storage::WalRing* ReattachRing(bool* out_created, uint64_t requested_bytes = 0) {
         auto ring_res = storage::WalRing::CreateOrAttach(region_->base_address(),
                                                          region_->allocator(),
-                                                         region_->super_block(), out_created);
+                                                         region_->super_block(), out_created,
+                                                         requested_bytes);
         if (!ring_res.IsOk()) return nullptr;
         ring_ = ring_res.TakeValue();
         return ring_.get();
@@ -399,6 +402,146 @@ TEST_F(WalRingTest, ScanRangeTornTailStopsCleanly) {
                                      &last)));
     EXPECT_EQ(got, std::vector<uint64_t>({1u}));
     EXPECT_EQ(last, 1u);
+}
+
+/// P0-5：环容量可配——新建时按 requested_bytes 定格并写入 SuperBlock；
+/// 既有映像以 SuperBlock 为准（重附请求不改变容量）。>64KB 走永久区预留，
+/// 单圈可容纳超过旧 64KB 上限的未回收记录。
+TEST_F(WalRingTest, ConfigurableCapacityAndExistingImageWins) {
+    const uint64_t bytes = 256ull * 1024;
+    storage::WalRing* ring = MakeRegionAndRing(bytes);
+    ASSERT_NE(ring, nullptr);
+    EXPECT_EQ(region_->super_block()->wal_ring_bytes, bytes);
+    EXPECT_EQ(ring->area_bytes(), bytes - sizeof(storage::shm_WalRingHeader));
+
+    // 写入 >64KB 的记录量且不做任何回收（旧固定 64KB 环不可能容纳）。
+    const uint32_t payload_len = 512;
+    const uint64_t rec = storage::WalRing::RecordBytes(payload_len);
+    const uint64_t count = 200;  // 200×572 ≈ 114KB
+    std::vector<uint8_t> payload(payload_len, 0x3C);
+    uint64_t seq = 0;
+    for (uint64_t i = 0; i < count; ++i) {
+        ASSERT_TRUE(IsOk(ring->Append(storage::kWalOpInsert, 7, i, 2, payload.data(),
+                                      payload_len, &seq)));
+        ASSERT_TRUE(ring->HasRoomFor(rec));
+    }
+    EXPECT_EQ(seq, count);
+    uint64_t last = 0;
+    std::vector<Rec> recs = ScanAll(ring, &last);
+    ASSERT_EQ(recs.size(), count);
+    EXPECT_EQ(last, count);
+
+    // 既有映像：带不同请求容量重附，容量/内容均不变。
+    bool created = true;
+    storage::WalRing* again = ReattachRing(&created, 128ull * 1024);
+    ASSERT_NE(again, nullptr);
+    EXPECT_FALSE(created);
+    EXPECT_EQ(again->area_bytes(), bytes - sizeof(storage::shm_WalRingHeader));
+    EXPECT_EQ(region_->super_block()->wal_ring_bytes, bytes);
+    recs = ScanAll(again, &last);
+    ASSERT_EQ(recs.size(), count);
+    EXPECT_EQ(last, count);
+}
+
+/// P0-5：容量配置边界——低于结构下限 kInvalidArgument、超过硬上限
+/// kLimitExceeded；下限值本身可创建。
+TEST_F(WalRingTest, RejectInvalidConfiguredCapacity) {
+    ASSERT_EQ(MakeRegionAndRing(storage::kMinWalRingBytes - 1), nullptr);
+
+    bool created = false;
+    auto too_big = storage::WalRing::CreateOrAttach(
+        region_->base_address(), region_->allocator(), region_->super_block(), &created,
+        storage::kMaxWalRingBytes + 1);
+    ASSERT_FALSE(too_big.IsOk());
+    EXPECT_EQ(too_big.Error(), Err::kLimitExceeded);
+    EXPECT_FALSE(created);
+    EXPECT_EQ(region_->super_block()->wal_ring_off, 0u);
+
+    auto ok = storage::WalRing::CreateOrAttach(
+        region_->base_address(), region_->allocator(), region_->super_block(), &created,
+        storage::kMinWalRingBytes);
+    ASSERT_TRUE(ok.IsOk()) << rtdb::ErrorMessage(ok.Error());
+    EXPECT_TRUE(created);
+    EXPECT_EQ(ok.Value()->area_bytes(),
+              storage::kMinWalRingBytes - sizeof(storage::shm_WalRingHeader));
+}
+
+/// P0-5：按需回收保留水位——只丢到“刚好够写”，保留最新后缀；安全水位
+/// 之外的记录绝不回收（尚未 flush 的重放数据不可丢）。
+TEST_F(WalRingTest, ReclaimKeepsNewestSuffixAndStopsAtSafeWatermark) {
+    storage::WalRing* ring = MakeRegionAndRing();
+    ASSERT_NE(ring, nullptr);
+
+    const uint64_t need = storage::WalRing::RecordBytes(0);
+    uint64_t seq = 0;
+    while (ring->HasRoomFor(need)) {
+        ASSERT_TRUE(IsOk(ring->Append(storage::kWalOpInsert, 1, seq, 2, nullptr, 0, &seq)));
+    }
+    const uint64_t oldest = ring->oldest_seq();
+    const uint64_t head = ring->next_seq();
+    ASSERT_GT(head, oldest);
+    ASSERT_FALSE(ring->HasRoomFor(1000));
+
+    // 安全水位在 oldest 之前：一条都不能丢。
+    EXPECT_EQ(ring->ReclaimForRecord(1000, oldest - 1), Err::kLimitExceeded);
+    EXPECT_EQ(ring->oldest_seq(), oldest);
+
+    // 允许丢弃前 100 条：只推进到够写 1000B 的位置，保留大部分后缀。
+    const uint64_t safe = oldest + 100;
+    ASSERT_EQ(ring->ReclaimForRecord(1000, safe), Err::kOk);
+    EXPECT_TRUE(ring->HasRoomFor(1000));
+    const uint64_t newest = ring->oldest_seq();
+    EXPECT_GT(newest, oldest);
+    EXPECT_LE(newest, safe + 1);
+
+    uint64_t last = 0;
+    std::vector<Rec> recs = ScanAll(ring, &last);
+    ASSERT_FALSE(recs.empty());
+    EXPECT_EQ(recs.front().seq, newest);
+    EXPECT_EQ(last, head - 1);
+    EXPECT_EQ(recs.size(), head - newest);  // pad 不计入，seq 记录连续
+
+    // 回收后仍可继续追加并扫描。
+    std::vector<uint8_t> payload(1000 - storage::kWalMinRecordBytes, 0x7E);
+    ASSERT_TRUE(IsOk(ring->Append(storage::kWalOpInsert, 1, 0, 2, payload.data(),
+                                  static_cast<uint32_t>(payload.size()), &seq)));
+    EXPECT_EQ(seq, head);
+    recs = ScanAll(ring, &last);
+    EXPECT_EQ(last, head);
+    EXPECT_EQ(recs.size(), head - newest + 1);
+}
+
+/// P0-5：回绕垫片（kOpPad 无 seq）可安全回收；可一直推进到近乎空环，
+/// 随后大记录仍可写入，seq 保持连续。
+TEST_F(WalRingTest, ReclaimSkipsPadAndDrainsRing) {
+    storage::WalRing* ring = MakeRegionAndRing();
+    ASSERT_NE(ring, nullptr);
+
+    uint64_t seq = 0;
+    for (uint32_t len = 0;; len = (len + 4) % 12) {
+        const uint64_t need = storage::WalRing::RecordBytes(len);
+        if (!ring->HasRoomFor(need)) break;
+        std::vector<uint8_t> payload(len, static_cast<uint8_t>(len));
+        ASSERT_TRUE(IsOk(ring->Append(storage::kWalOpInsert, 1, seq, 2,
+                                      len != 0 ? payload.data() : nullptr, len, &seq)));
+    }
+    ASSERT_GT(seq, 500u);
+    const uint64_t target = ring->area_bytes() - 200;
+    ASSERT_FALSE(ring->HasRoomFor(target));
+
+    ASSERT_EQ(ring->ReclaimForRecord(target, ring->next_seq() - 1), Err::kOk);
+    EXPECT_TRUE(ring->HasRoomFor(target));
+    EXPECT_LT(ring->next_seq() - ring->oldest_seq(), 10u);  // 已几乎清空（含 pad 遍历）
+
+    std::vector<uint8_t> payload(static_cast<size_t>(target) - storage::kWalMinRecordBytes,
+                                 0x6D);
+    ASSERT_TRUE(IsOk(ring->Append(storage::kWalOpInsert, 1, 0, 2, payload.data(),
+                                  static_cast<uint32_t>(payload.size()), &seq)));
+    uint64_t last = 0;
+    std::vector<Rec> recs = ScanAll(ring, &last);
+    ASSERT_FALSE(recs.empty());
+    EXPECT_EQ(recs.back().seq, seq);
+    EXPECT_EQ(last, seq);
 }
 
 TEST_F(WalRingTest, PoisonPersistsAcrossAttach) {
@@ -732,6 +875,58 @@ TEST_F(WalEngineTest, BatchWalReserveBoundaryAndDrain) {
     auto got = eng2->GetByKey(t2, ColumnValue::Int(1377));
     ASSERT_TRUE(got.IsOk()) << rtdb::ErrorMessage(got.Error());
     EXPECT_EQ(got.Value()[1].as_int(), 599);
+}
+
+/// P0-5：Options.wal_ring_bytes 扩容——256KB 环可一次容纳 >64KB 的批
+/// （旧固定 64KB 环会 kLimitExceeded），且重开重放完整。
+TEST_F(WalEngineTest, ConfigurableRingAllowsBatchBeyond64KB) {
+    rtdb::Options opts = Opts();
+    opts.wal_ring_bytes = 256ull * 1024;
+
+    auto open = rtdb::Engine::Open(opts);
+    ASSERT_TRUE(open.IsOk()) << rtdb::ErrorMessage(open.Error());
+    auto eng = open.TakeValue();
+    TableDef def = MakeDef("t");
+    def.row_cap = 2048;
+    auto t_res = eng->CreateTable(def);
+    ASSERT_TRUE(t_res.IsOk()) << rtdb::ErrorMessage(t_res.Error());
+    const TableHandle t = t_res.Value();
+
+    constexpr size_t kRows = 2000;  // 2000×84B ≈ 164KB，超过 64KB 记录区
+    std::vector<int64_t> ids(kRows), vals(kRows);
+    for (size_t i = 0; i < kRows; ++i) {
+        ids[i] = static_cast<int64_t>(i + 1);
+        vals[i] = static_cast<int64_t>(i);
+    }
+    {
+        RecordBlock blk("t");
+        blk.AppendColumn("id", ids).AppendColumn("val", vals);
+        ASSERT_TRUE(blk.IsValid());
+        const auto rb = eng->UpsertBatch(blk);
+        ASSERT_TRUE(rb.IsOk()) << rtdb::ErrorMessage(rb.Error());
+    }
+    EXPECT_EQ(eng->ScanAll(t).Value().size(), kRows);
+
+    // 重开：256KB 环内记录完整重放（既有映像以 SuperBlock 容量为准）。
+    eng.reset();
+    auto open2 = rtdb::Engine::Open(opts);
+    ASSERT_TRUE(open2.IsOk()) << rtdb::ErrorMessage(open2.Error());
+    auto eng2 = open2.TakeValue();
+    auto t2_res = eng2->OpenTable("t");
+    ASSERT_TRUE(t2_res.IsOk());
+    EXPECT_EQ(eng2->ScanAll(t2_res.Value()).Value().size(), kRows);
+    auto got = eng2->GetByKey(t2_res.Value(), ColumnValue::Int(2000));
+    ASSERT_TRUE(got.IsOk()) << rtdb::ErrorMessage(got.Error());
+    EXPECT_EQ(got.Value()[1].as_int(), 1999);
+}
+
+/// P0-5：非法环容量配置在 Open 前拒绝（不静默回退默认）。
+TEST_F(WalEngineTest, RejectInvalidRingCapacityOption) {
+    rtdb::Options opts = Opts();
+    opts.wal_ring_bytes = storage::kMinWalRingBytes - 1;
+    EXPECT_EQ(rtdb::Engine::Open(opts).Error(), Err::kInvalidArgument);
+    opts.wal_ring_bytes = storage::kMaxWalRingBytes + 1;
+    EXPECT_EQ(rtdb::Engine::Open(opts).Error(), Err::kInvalidArgument);
 }
 
 /// A2（P0-2）：发布点（行数据 + 主键索引）之后的应用失败——已发布行保持

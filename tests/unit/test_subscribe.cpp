@@ -284,6 +284,90 @@ TEST_F(SubscribeTest, CursorOverflowAndResync) {
     EXPECT_EQ(after->events[0].row[0].as_int(), 9001);
 }
 
+/// P0-5：冷快照只推进 checkpoint，不主动清空 WAL 环——活跃订阅游标
+/// 不会仅因抓快照而溢出，仍可继续增量读取。
+TEST_F(SubscribeTest, SnapshotDoesNotEvictActiveCursor) {
+    auto open = Engine::Open(Opts());
+    ASSERT_TRUE(open.IsOk()) << rtdb::ErrorMessage(open.Error());
+    auto eng = open.TakeValue();
+    auto t = eng->CreateTable(MakeDef("t"));
+    ASSERT_TRUE(t.IsOk());
+    const TableHandle table = t.Value();
+
+    auto sub = eng->Subscribe({"t"});
+    ASSERT_TRUE(sub.IsOk());
+    ChangeCursor cur = sub.TakeValue();
+    const uint64_t base = cur.Position();
+
+    for (int64_t i = 1; i <= 100; ++i)
+        ASSERT_TRUE(eng->Insert(table, Row(i, i * 10)).IsOk());
+
+    auto snap = eng->CreateSnapshot();
+    ASSERT_TRUE(snap.IsOk()) << rtdb::ErrorMessage(snap.Error());
+
+    // 旧行为（DropAllRetained）会在此返回 kCursorOverflow；新保留策略下
+    // tail 仍在游标之后，100 条变更完整交付。
+    auto batch = cur.Next(0);
+    ASSERT_TRUE(batch.IsOk()) << rtdb::ErrorMessage(batch.Error());
+    ASSERT_EQ(batch->events.size(), 100u);
+    EXPECT_EQ(batch->events.front().seq, base + 1);
+    EXPECT_EQ(batch->events.back().row[0].as_int(), 100);
+
+    std::error_code ec;
+    std::filesystem::remove(snap.Value(), ec);
+}
+
+/// P0-5：环写满时的回收只推进“刚好够写”的水位，保留最新后缀——落后
+/// 但仍在保留窗口内的订阅游标可继续增量读取，不必整表重取。
+TEST_F(SubscribeTest, RingPressureKeepsRecentWindowForLaggingCursor) {
+    auto open = Engine::Open(Opts());
+    ASSERT_TRUE(open.IsOk()) << rtdb::ErrorMessage(open.Error());
+    auto eng = open.TakeValue();
+    TableDef def = MakeDef("t");
+    def.row_cap = 2048;
+    auto t = eng->CreateTable(def);
+    ASSERT_TRUE(t.IsOk());
+    const TableHandle table = t.Value();
+
+    auto sub = eng->Subscribe({"t"});
+    ASSERT_TRUE(sub.IsOk());
+    ChangeCursor cur = sub.TakeValue();
+
+    auto run_batch = [&](int64_t first, int n) {
+        std::vector<Engine::BatchOp> ops;
+        ops.reserve(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            Engine::BatchOp op;
+            op.type = Engine::BatchOp::Type::kInsert;
+            op.table = table;
+            op.row = Row(first + i, (first + i) * 10);
+            ops.push_back(std::move(op));
+        }
+        const auto rb = eng->ExecuteBatch(ops);
+        ASSERT_TRUE(rb.IsOk()) << rtdb::ErrorMessage(rb.Error());
+    };
+
+    // 先写 100 行并消费，游标停在“已交付 100 行”的位置。
+    run_batch(1, 100);
+    auto b1 = cur.Next(0);
+    ASSERT_TRUE(b1.IsOk()) << rtdb::ErrorMessage(b1.Error());
+    ASSERT_EQ(b1->events.size(), 100u);
+    const uint64_t pos_after_first = cur.Position();
+
+    // 再写 600 行（环接近满），游标保持滞后；随后 100 行批强制触发
+    // 覆盖回收。旧 DropAllRetained 会把 tail 推到 head，使 pos_after_first
+    // 落入已回收区；新策略只丢最老一小段，游标仍在窗口内。
+    run_batch(101, 600);
+    run_batch(701, 100);
+
+    auto b2 = cur.Next(0);
+    ASSERT_TRUE(b2.IsOk()) << rtdb::ErrorMessage(b2.Error());
+    ASSERT_EQ(b2->events.size(), 700u);  // 101..800，无缺漏
+    EXPECT_EQ(b2->events.front().row[0].as_int(), 101);
+    EXPECT_EQ(b2->events.back().row[0].as_int(), 800);
+    EXPECT_GT(cur.Position(), pos_after_first);
+}
+
 /// 并发写：跨线程写入经平台唤醒逐条交付 —— 顺序、无丢失、无重复。
 TEST_F(SubscribeTest, ConcurrentWriterNoLossNoDuplicate) {
     auto open = Engine::Open(Opts());

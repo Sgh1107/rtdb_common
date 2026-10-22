@@ -977,6 +977,7 @@ TEST(ServerConfig, ParseTextListenAndValidation) {
         "path = d:/data/x.rtdb\n"
         "listen = 0.0.0.0:7878\n"
         "size_mb = 128\n"
+        "wal_ring_kb = 512\n"
         "fsync = always\n"
         "auth_salt = salty\n"
         "user = admin " + digest + "\n"
@@ -995,6 +996,7 @@ TEST(ServerConfig, ParseTextListenAndValidation) {
     EXPECT_EQ(cfg.listen_host, "0.0.0.0");
     EXPECT_EQ(cfg.listen_port, 7878);
     EXPECT_EQ(cfg.initial_size_mb, 128u);
+    EXPECT_EQ(cfg.wal_ring_kb, 512u);
     EXPECT_EQ(cfg.fsync, rtdb::FsyncPolicy::Always);
     EXPECT_EQ(cfg.auth_salt, "salty");
     ASSERT_EQ(cfg.users.size(), 1u);
@@ -1013,6 +1015,9 @@ TEST(ServerConfig, ParseTextListenAndValidation) {
     EXPECT_FALSE(rtdb::server::ParseConfigText("user = admin zz").IsOk());
     EXPECT_FALSE(rtdb::server::ParseConfigText("listen = nope").IsOk());
     EXPECT_FALSE(rtdb::server::ParseConfigText("size_mb = 0").IsOk());
+    EXPECT_FALSE(rtdb::server::ParseConfigText("wal_ring_kb = 32").IsOk());
+    EXPECT_FALSE(rtdb::server::ParseConfigText("wal_ring_kb = 65537").IsOk());
+    EXPECT_TRUE(rtdb::server::ParseConfigText("wal_ring_kb = 0").IsOk());
     EXPECT_FALSE(rtdb::server::ParseConfigText("max_auth_failures = 0").IsOk());
     EXPECT_FALSE(rtdb::server::ParseConfigText("handshake_timeout_ms = 3600001").IsOk());
     EXPECT_FALSE(rtdb::server::ParseConfigText("auth_backoff_ms = 60001").IsOk());

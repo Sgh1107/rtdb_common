@@ -138,4 +138,31 @@ TEST_F(SlabTest, UsedBytesAccountsFreelist) {
     EXPECT_EQ(a.Value()->used_bytes(), 0u);  // 全回收归零
 }
 
+/// P0-5：>64KB 的永久区预留（WAL 环扩容）绕过 Slab 级上限，且不可回收。
+TEST_F(SlabTest, ReservePermanentBypassesClassLimit) {
+    auto a = Attach(true);
+    ASSERT_TRUE(a.IsOk());
+
+    const uint64_t bytes = 128ull * 1024;
+    auto p = a.Value()->ReservePermanent(bytes);
+    ASSERT_TRUE(p.IsOk()) << rtdb::ErrorMessage(p.Error());
+    EXPECT_EQ(p.Value() % 4096, 0u);
+    EXPECT_GE(a.Value()->used_bytes(), bytes);
+
+    // 永久区可正常读写。
+    std::memset(a.Value()->OffsetToPtr(p.Value()), 0x5A, static_cast<size_t>(bytes));
+    EXPECT_EQ(*reinterpret_cast<const uint8_t*>(a.Value()->OffsetToPtr(p.Value())), 0x5A);
+
+    // 不可归还（class 标记越界 → kInternal）。
+    EXPECT_EQ(a.Value()->Deallocate(p.Value()), rtdb::Err::kInternal);
+
+    // 永久区之后的普通 Slab 分配仍可用且不重叠。
+    auto s = a.Value()->Allocate(4096);
+    ASSERT_TRUE(s.IsOk());
+    EXPECT_GE(s.Value(), p.Value() + bytes);
+
+    EXPECT_EQ(a.Value()->ReservePermanent(0).Error(), rtdb::Err::kInvalidArgument);
+    EXPECT_EQ(a.Value()->ReservePermanent(kRegionBytes).Error(), rtdb::Err::kOutOfMemory);
+}
+
 }  // namespace

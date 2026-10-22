@@ -217,9 +217,12 @@ TEST_F(W5SnapshotTest, ReaderCannotSnapshot) {
     EXPECT_EQ(eng->CommittedSeq(), 2);
 }
 
-/// 白盒验证活映像状态字与环回收（引擎关闭后直连区域，docs/06 §1
+/// 白盒验证活映像状态字与保留策略（引擎关闭后直连区域，docs/06 §1
 /// "组件测试落真实 tmpdir 映像"）。
-TEST_F(W5SnapshotTest, SnapshotDropsRingAndAdvancesCheckpoint) {
+///
+/// P0-5：冷快照只推进 checkpoint，不主动清空 WAL 环；保留水位仍停在
+/// 最老记录（在线订阅者可继续增量读取），且 tail ≤ checkpoint + 1。
+TEST_F(W5SnapshotTest, SnapshotAdvancesCheckpointKeepsRingHistory) {
     {
         auto s = Seed(3);
         ASSERT_NE(s.eng, nullptr);
@@ -245,9 +248,10 @@ TEST_F(W5SnapshotTest, SnapshotDropsRingAndAdvancesCheckpoint) {
     ASSERT_TRUE(ring_res.IsOk()) << rtdb::ErrorMessage(ring_res.Error());
     EXPECT_FALSE(created);
     auto ring = ring_res.TakeValue();
-    // 覆盖协议不变量仍成立（tail ≤ checkpoint + 1），且保留段已整体回收。
+    // 覆盖协议不变量仍成立（tail ≤ checkpoint + 1）；记录仍在环内。
     EXPECT_LE(ring->oldest_seq(), sb->checkpoint_seq + 1);
-    EXPECT_EQ(ring->oldest_seq(), ring->next_seq());  // 空环
+    EXPECT_EQ(ring->oldest_seq(), 1u);
+    EXPECT_EQ(ring->next_seq(), 5u);
 }
 
 /// 重复快照幂等（无新写入时 checkpoint 不前移、副本可重复覆盖）。
