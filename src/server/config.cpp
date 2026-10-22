@@ -126,6 +126,26 @@ Result<Config> ParseConfigText(std::string_view text) {
             if (!ParseU64(val, &v) || v == 0 || v > 1024)
                 return Result<Config>::Fail(Err::kInvalidArgument);
             cfg.max_sessions = static_cast<uint32_t>(v);
+        } else if (key == "handshake_timeout_ms") {
+            uint64_t v = 0;
+            if (!ParseU64(val, &v) || v > 3600000u)
+                return Result<Config>::Fail(Err::kInvalidArgument);
+            cfg.handshake_timeout_ms = static_cast<uint32_t>(v);
+        } else if (key == "idle_timeout_ms") {
+            uint64_t v = 0;
+            if (!ParseU64(val, &v) || v > 86400000u)
+                return Result<Config>::Fail(Err::kInvalidArgument);
+            cfg.idle_timeout_ms = static_cast<uint32_t>(v);
+        } else if (key == "max_auth_failures") {
+            uint64_t v = 0;
+            if (!ParseU64(val, &v) || v == 0 || v > 1000)
+                return Result<Config>::Fail(Err::kInvalidArgument);
+            cfg.max_auth_failures = static_cast<uint32_t>(v);
+        } else if (key == "auth_backoff_ms") {
+            uint64_t v = 0;
+            if (!ParseU64(val, &v) || v > 60000)
+                return Result<Config>::Fail(Err::kInvalidArgument);
+            cfg.auth_backoff_ms = static_cast<uint32_t>(v);
         } else if (key == "max_payload_kb") {
             uint64_t v = 0;
             if (!ParseU64(val, &v) || v == 0 || v > 65536)

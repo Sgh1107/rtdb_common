@@ -900,6 +900,44 @@ TEST_F(ShortTtlTest, SessionExpiresThenReauth) {
     EXPECT_EQ(c.Call(RTDB_PF_PING, {}, nullptr), Err::kOk);
 }
 
+class AuthLimitTest : public ServerTest {
+protected:
+    void Configure(rtdb::server::Config& cfg) override {
+        cfg.max_auth_failures = 2;
+        cfg.auth_backoff_ms = 0;  // 测试不做退避等待
+    }
+};
+
+TEST_F(AuthLimitTest, ConsecutiveFailuresCloseConnection) {
+    Client c;
+    ASSERT_TRUE(c.Connect(port));
+    EXPECT_EQ(c.Auth(kSalt, kUser, "wrong-1"), Err::kAuthFailed);
+    // 第二次失败仍回 501，随后服务端主动断开。
+    EXPECT_EQ(c.Auth(kSalt, kUser, "wrong-2"), Err::kAuthFailed);
+    EXPECT_EQ(c.Auth(kSalt, kUser, kPassword), Err::kNetworkError);
+
+    // 计数随连接销毁：新连接可正常认证。
+    Client c2;
+    ASSERT_TRUE(c2.Connect(port));
+    EXPECT_EQ(c2.Auth(kSalt, kUser, kPassword), Err::kOk);
+}
+
+class HandshakeTimeoutTest : public ServerTest {
+protected:
+    void Configure(rtdb::server::Config& cfg) override {
+        cfg.handshake_timeout_ms = 100;
+        cfg.idle_timeout_ms = 0;
+    }
+};
+
+TEST_F(HandshakeTimeoutTest, SilentConnectionClosed) {
+    Client c;
+    ASSERT_TRUE(c.Connect(port));
+    // 不发送任何帧：静默连接在握手窗口（100ms）过后被服务端关闭。
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+    EXPECT_EQ(c.Call(RTDB_PF_PING, {}, nullptr), Err::kNetworkError);
+}
+
 // ---------------- 优雅退出 ----------------
 
 TEST_F(ServerTest, GracefulStopFlushesAndClosesSessions) {
@@ -944,6 +982,10 @@ TEST(ServerConfig, ParseTextListenAndValidation) {
         "user = admin " + digest + "\n"
         "session_ttl_ms = 1000\n"
         "max_sessions = 8\n"
+        "handshake_timeout_ms = 1234\n"
+        "idle_timeout_ms = 0\n"
+        "max_auth_failures = 3\n"
+        "auth_backoff_ms = 50\n"
         "snapshot_on_exit = true\n";
     auto r = rtdb::server::ParseConfigText(text);
     ASSERT_TRUE(r.IsOk());
@@ -960,6 +1002,10 @@ TEST(ServerConfig, ParseTextListenAndValidation) {
     EXPECT_EQ(rtdb::server::DigestHex(cfg.users[0].digest), digest);
     EXPECT_EQ(cfg.session_ttl_ms, 1000u);
     EXPECT_EQ(cfg.max_sessions, 8u);
+    EXPECT_EQ(cfg.handshake_timeout_ms, 1234u);
+    EXPECT_EQ(cfg.idle_timeout_ms, 0u);  // 0 = 不限制空闲
+    EXPECT_EQ(cfg.max_auth_failures, 3u);
+    EXPECT_EQ(cfg.auth_backoff_ms, 50u);
     EXPECT_TRUE(cfg.snapshot_on_exit);
 
     // 未知键/畸形行拒绝
@@ -967,6 +1013,9 @@ TEST(ServerConfig, ParseTextListenAndValidation) {
     EXPECT_FALSE(rtdb::server::ParseConfigText("user = admin zz").IsOk());
     EXPECT_FALSE(rtdb::server::ParseConfigText("listen = nope").IsOk());
     EXPECT_FALSE(rtdb::server::ParseConfigText("size_mb = 0").IsOk());
+    EXPECT_FALSE(rtdb::server::ParseConfigText("max_auth_failures = 0").IsOk());
+    EXPECT_FALSE(rtdb::server::ParseConfigText("handshake_timeout_ms = 3600001").IsOk());
+    EXPECT_FALSE(rtdb::server::ParseConfigText("auth_backoff_ms = 60001").IsOk());
 
     std::string host;
     uint16_t port = 0;

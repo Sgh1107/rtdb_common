@@ -74,6 +74,7 @@ struct SessionState {
     uint32_t next_sub_id = 0;
     uint64_t last_acked_seq = 0;     ///< 客户端 ACK 水位（诊断账本）
     uint64_t next_page_id = 0;
+    uint32_t auth_failures = 0;      ///< 本连接累计 AUTH 失败次数（P1-7 限速）
     std::unique_ptr<ChangeCursor> cursor;
     std::map<uint64_t, Page> pages;
 };
@@ -261,12 +262,29 @@ void Server::Impl::SessionLoop(platform::TcpSocket sock) {
 
     sock.SetTimeout(kSessionPollMs);
     SessionState st;
+    const uint64_t connected_ns = SteadyNowNs();
+    uint64_t last_rx_ns = connected_ns;
     std::vector<uint8_t> payload;
     std::vector<uint8_t> body;
     std::vector<uint8_t> resp;
 
     for (;;) {
         if (stop.load(std::memory_order_relaxed)) break;
+
+        // P1-7：握手/空闲超时。每连接一个线程，静默连接若不设上限会
+        // 长期占用 max_sessions 名额（线程栈 + 会话槽），构成低成本 DoS。
+        const uint64_t now = SteadyNowNs();
+        if (st.id == 0 && cfg.handshake_timeout_ms != 0 &&
+            now - connected_ns >
+                static_cast<uint64_t>(cfg.handshake_timeout_ms) * 1000000ull) {
+            stat_frame_errors++;
+            break;
+        }
+        if (cfg.idle_timeout_ms != 0 &&
+            now - last_rx_ns > static_cast<uint64_t>(cfg.idle_timeout_ms) * 1000000ull) {
+            stat_frame_errors++;
+            break;
+        }
 
         net::FrameHeader h;
         payload.clear();
@@ -276,6 +294,7 @@ void Server::Impl::SessionLoop(platform::TcpSocket sock) {
             stat_frame_errors++;  // 帧级违例/EOF：流不可再信任，关闭连接
             break;
         }
+        last_rx_ns = SteadyNowNs();
         if (h.flags != 0) {
             stat_frame_errors++;  // 请求帧不得携带应答位
             break;
@@ -285,6 +304,20 @@ void Server::Impl::SessionLoop(platform::TcpSocket sock) {
         body.clear();
         const Err re = Dispatch(st, h, payload.data(), payload.size(), &body);
         if (!IsOk(re)) stat_payload_errors++;
+        bool close_after = false;
+        uint64_t auth_delay_ms = 0;
+        if (re == Err::kAuthFailed) {
+            // P1-7：失败计数 + 线性退避，抬高在线暴力猜解成本；达到上限
+            // 先回完本次 501 再断连（客户端需重新建连）。
+            if (st.auth_failures >= cfg.max_auth_failures) {
+                stat_frame_errors++;
+                close_after = true;
+            } else {
+                uint64_t delay = static_cast<uint64_t>(cfg.auth_backoff_ms) * st.auth_failures;
+                if (delay > 2000) delay = 2000;
+                auth_delay_ms = delay;
+            }
+        }
 
         resp.clear();
         {
@@ -309,6 +342,10 @@ void Server::Impl::SessionLoop(platform::TcpSocket sock) {
         rh.func = h.func;
         rh.payload_len = static_cast<uint32_t>(resp.size());
         if (!IsOk(net::WriteFrame(sock, rh, resp.data()))) break;
+        if (close_after) break;
+        // 退避在应答之后：客户端已收到本次 501，重试间隔被拉长。
+        if (auth_delay_ms != 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(auth_delay_ms));
     }
     sock.Close();
 }
@@ -408,10 +445,12 @@ Err Server::Impl::DoAuth(SessionState& st, net::Reader& r, std::vector<uint8_t>*
         expect, reinterpret_cast<const uint8_t*>(digest.data()), infra::kSha256DigestBytes);
     if (!ok) {
         stat_auth_fail++;
+        if (st.auth_failures < UINT32_MAX) ++st.auth_failures;
         return Err::kAuthFailed;  // 501：凭据错误（连接保留，可重试）
     }
 
     stat_auth_ok++;
+    st.auth_failures = 0;
     st.id = NextSessionId();
     st.last_active_ns = SteadyNowNs();
     st.cursor.reset();  // 重新认证：旧订阅/分页随身份重建
@@ -599,15 +638,15 @@ Err Server::Impl::FetchPageSlice(SessionState::Page& p,
         range.lo = p.next_lo;
         range.lo_inclusive = false;
     }
-    auto res = engine->Scan(p.handle, range);
+    bool more = false;
+    auto res = engine->ScanLimited(p.handle, range, p.page_rows, &more);
     if (!res.IsOk()) return res.Error();
 
     const std::vector<std::vector<ColumnValue>>& all = res.Value();
-    const size_t take = all.size() < p.page_rows ? all.size() : p.page_rows;
-    rows->assign(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(take));
-    *done = all.size() <= p.page_rows;
-    if (take > 0 && !(*rows)[take - 1].empty()) {
-        p.next_lo = (*rows)[take - 1][0];  // 主键 = 列 0（建表约束）
+    rows->assign(all.begin(), all.end());
+    *done = !more;
+    if (!rows->empty() && !(*rows)[rows->size() - 1].empty()) {
+        p.next_lo = (*rows)[rows->size() - 1][0];  // 主键 = 列 0（建表约束）
         p.has_lo = true;
     }
     return Err::kOk;

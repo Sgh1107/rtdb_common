@@ -42,6 +42,15 @@ struct Config {
     std::vector<UserEntry> users;      ///< 空 = 拒绝全部 AUTH（501）
     uint32_t session_ttl_ms = 30u * 60u * 1000u;  ///< 会话 TTL（滚动续期）
     uint32_t max_sessions = 64;                   ///< 并发会话上限（404）
+    /// 未认证连接的握手窗口：超时关闭，防止静默连接长期占用会话名额
+    /// （P1-7：每连接一线程，连接洪泛即线程/名额耗尽）。
+    uint32_t handshake_timeout_ms = 10000;
+    /// 已认证连接的空闲上限（0 = 不限制；滚动刷新）。订阅长轮询 ≤ 25s，
+    /// 默认 5 分钟留足余量。
+    uint32_t idle_timeout_ms = 5u * 60u * 1000u;
+    /// 单连接 AUTH 失败上限（达到即断连）与线性退避基数（毫秒）。
+    uint32_t max_auth_failures = 5;
+    uint32_t auth_backoff_ms = 200;
     uint32_t max_payload_bytes = 4u << 20;        ///< 帧载荷上限（4 MiB）
     uint32_t heartbeat_ms = 1000;                 ///< 写者心跳周期
     bool snapshot_on_exit = false;                ///< 优雅退出时抓冷快照
