@@ -57,7 +57,8 @@ bool WalRing::HasRoomFor(uint64_t rec_bytes) const noexcept {
 Result<std::unique_ptr<WalRing>> WalRing::CreateOrAttach(void* base_addr,
                                                          infra::SlabShmAllocator* alloc,
                                                          layout::shm_SuperBlock* sb,
-                                                         bool* out_created) {
+                                                         bool* out_created,
+                                                         uint64_t requested_bytes) {
     if (out_created != nullptr) *out_created = false;
     if (base_addr == nullptr || sb == nullptr)
         return Result<std::unique_ptr<WalRing>>::Fail(Err::kInvalidArgument);
@@ -65,16 +66,28 @@ Result<std::unique_ptr<WalRing>> WalRing::CreateOrAttach(void* base_addr,
     auto ring = std::unique_ptr<WalRing>(new WalRing());
 
     if (sb->wal_ring_off == 0) {
-        // 新建：单块 Slab 分配（默认 64KB = slab 最大级），整块清零。
-        if (alloc == nullptr) return Result<std::unique_ptr<WalRing>>::Fail(Err::kInvalidArgument);
-        Result<uint64_t> r = alloc->Allocate(kDefaultWalRingBytes);
+        // 新建：容量由调用方配置（0 = 默认 64KB），创建时定格并写入
+        // SuperBlock.wal_ring_bytes。≤64KB 走 Slab（与既有映像一致），
+        // 更大容量走永久区预留（Slab 单块上限 64KB）。
+        const uint64_t ring_bytes =
+            requested_bytes == 0 ? kDefaultWalRingBytes : requested_bytes;
+        if (ring_bytes < kMinWalRingBytes)
+            return Result<std::unique_ptr<WalRing>>::Fail(Err::kInvalidArgument);
+        if (ring_bytes > kMaxWalRingBytes)
+            return Result<std::unique_ptr<WalRing>>::Fail(Err::kLimitExceeded);
+        if (alloc == nullptr)
+            return Result<std::unique_ptr<WalRing>>::Fail(Err::kInvalidArgument);
+        Result<uint64_t> r =
+            ring_bytes <= infra::kMaxAllocBytes
+                ? alloc->Allocate(ring_bytes)
+                : alloc->ReservePermanent(ring_bytes);
         if (!r.IsOk()) return Result<std::unique_ptr<WalRing>>::Fail(r.Error());
         const uint64_t off = r.Value();
         auto* block = static_cast<uint8_t*>(alloc->OffsetToPtr(off));
-        std::memset(block, 0, static_cast<size_t>(kDefaultWalRingBytes));
+        std::memset(block, 0, static_cast<size_t>(ring_bytes));
         auto* hdr = reinterpret_cast<shm_WalRingHeader*>(block);
         hdr->magic = kWalRingMagic;
-        hdr->area_bytes = kDefaultWalRingBytes - sizeof(shm_WalRingHeader);
+        hdr->area_bytes = ring_bytes - sizeof(shm_WalRingHeader);
         hdr->head_seq = 1;
         hdr->tail_seq = 1;
         hdr->head_pos = 0;
@@ -82,7 +95,7 @@ Result<std::unique_ptr<WalRing>> WalRing::CreateOrAttach(void* base_addr,
         // 与运行期一致走原子视角（此处虽为单线程建环，统一访问方式即可）。
         AsAtomicU32(&hdr->poisoned)->store(0);
         sb->wal_ring_off = off;
-        sb->wal_ring_bytes = kDefaultWalRingBytes;
+        sb->wal_ring_bytes = ring_bytes;
         layout::RefreshLayoutCrc(sb);
         ring->hdr_ = hdr;
         ring->area_ = block + sizeof(shm_WalRingHeader);
@@ -92,7 +105,8 @@ Result<std::unique_ptr<WalRing>> WalRing::CreateOrAttach(void* base_addr,
     }
 
     // 附着既有环。
-    if (sb->wal_ring_bytes < sizeof(shm_WalRingHeader) + kMinWalAreaBytes)
+    if (sb->wal_ring_bytes < sizeof(shm_WalRingHeader) + kMinWalAreaBytes ||
+        sb->wal_ring_bytes > kMaxWalRingBytes)
         return Result<std::unique_ptr<WalRing>>::Fail(Err::kCorruption);
     auto* hdr =
         reinterpret_cast<shm_WalRingHeader*>(static_cast<char*>(base_addr) + sb->wal_ring_off);
@@ -188,6 +202,43 @@ Err WalRing::AppendMark(uint8_t op, const uint8_t* payload, uint32_t payload_len
 void WalRing::DropAllRetained() noexcept {
     hdr_->tail_pos = hdr_->head_pos;
     hdr_->tail_seq = hdr_->head_seq;
+}
+
+Err WalRing::ReclaimForRecord(uint64_t rec_bytes, uint64_t safe_through_seq) noexcept {
+    if (hdr_ == nullptr) return Err::kUnsupported;
+    if (hdr_->magic != kWalRingMagic) return Err::kCorruption;
+    if (HasRoomFor(rec_bytes)) return Err::kOk;
+
+    // 逐条推进保留水位，直到 HasRoomFor 成立。只回收 seq ≤ safe_through_seq
+    // 的普通记录（调用方已 flush + 推进 checkpoint）；pad 无 seq 可直接回收。
+    // 每次循环严格推进 tail_pos，不会死循环；框架异常按 kCorruption 上抛，
+    // 由 Engine 毒化（拒写保读），绝不静默丢弃不可重放数据。
+    while (!HasRoomFor(rec_bytes)) {
+        if (hdr_->head_seq == hdr_->tail_seq) {
+            // 环已空仍放不下：单条记录本身大于记录区容量。
+            return Err::kLimitExceeded;
+        }
+        const uint64_t remaining = area_bytes_ - hdr_->tail_pos;
+        if (remaining < kWalMinRecordBytes) {
+            // 裸回绕垫片：写方保证此处无记录起始，直接跳到区首。
+            hdr_->tail_pos = 0;
+            continue;
+        }
+        const uint32_t total_len = DecodeU32LE(area_ + hdr_->tail_pos);
+        if (total_len < kWalMinRecordBytes || total_len > remaining)
+            return Err::kCorruption;  // 保留段框架不自洽
+        const uint8_t op = area_[hdr_->tail_pos + 48];
+        if (op != kWalOpPad) {
+            // 普通记录：seq 必须与 tail_seq 连续；超出安全水位则不可回收。
+            const uint64_t seq = DecodeU64LE(area_ + hdr_->tail_pos + 8);
+            if (seq != hdr_->tail_seq) return Err::kCorruption;
+            if (hdr_->tail_seq > safe_through_seq) return Err::kLimitExceeded;
+            ++hdr_->tail_seq;
+        }
+        hdr_->tail_pos += total_len;
+        if (hdr_->tail_pos >= area_bytes_) hdr_->tail_pos = 0;
+    }
+    return Err::kOk;
 }
 
 // 恢复期写头回绕（单线程恢复路径专用，见头文件文档）。

@@ -43,6 +43,15 @@ struct Options {
     /// WAL 持久化档位（默认 per_second：写入页缓存即返回，后台节流 flush；
     /// 进程崩溃零丢失，断电丢最近 ≤1s 窗口。见 docs/08 §2-D1 三档表）。
     FsyncPolicy wal_fsync = FsyncPolicy::PerSecond;
+
+    /// 新建映像的 WAL 环容量（含 64B 环头；0 = 默认 64KB）。
+    ///
+    /// 只在环首次布局（SuperBlock.wal_ring_off == 0）时生效；既有映像以
+    /// SuperBlock.wal_ring_bytes 为准，本字段被忽略。允许范围
+    /// [4160B, 64MB]（约 [4KB, 64MB]，含环头）；大于 64KB 时由分配器以
+    /// 永久区预留方式切出。增大环可显著降低高频写 + 订阅断线场景的溢出
+    /// 重取频率，代价是映像内常驻空间增加。
+    uint64_t wal_ring_bytes = 0;
 };
 
 }  // namespace rtdb

@@ -224,7 +224,11 @@ struct Engine::Impl {
     }
 
     /// \brief 覆盖协议（docs/08 §2-D1"覆盖前先落盘"）：环空间不足时强制
-    /// 全映像 flush、推进 checkpoint_seq、丢弃全部保留记录。
+    /// 全映像 flush、推进 checkpoint_seq，再按需回收最老记录（P0-5）。
+    ///
+    /// 只丢弃 seq ≤ 本次 flush 覆盖水位的记录，并只推进到刚好容纳 rec_bytes；
+    /// 保留最新后缀供订阅游标继续增量读取。若仍放不下（记录超过区容量或
+    /// 可回收段耗尽），返回 kLimitExceeded。
     ///
     /// A1 纵深防御：批 WAL 进行中拒绝丢弃（BEGIN 之后的前缀未提交，丢弃即
     /// 静默破坏批原子性）。正常路径由批前预留（ReserveBatchWal）保证批内
@@ -232,7 +236,7 @@ struct Engine::Impl {
     /// 毒化引擎，宁可失败不丢数据。
     ///
     /// \return kOk / kIoError（flush 失败）/ kLimitExceeded（记录大于整环
-    ///         或批进行中空间不足）
+    ///         或批进行中空间不足）/ kCorruption（保留段框架异常）
     Err EnsureRingSpace(uint64_t rec_bytes) noexcept {
         if (ring->HasRoomFor(rec_bytes)) return Err::kOk;
         if (batch_in_progress) return Err::kLimitExceeded;
@@ -243,8 +247,14 @@ struct Engine::Impl {
         uint64_t cur = ck->load();
         while (cur < covered && !ck->compare_exchange_weak(cur, covered)) {
         }
-        ring->DropAllRetained();
-        if (!ring->HasRoomFor(rec_bytes)) return Err::kLimitExceeded;
+        // 回收上限 = 已落盘覆盖水位（cur 已是 CAS 后的当前值；若原 checkpoint
+        // 更高则保守取高者，绝不回收未 flush 记录）。
+        const uint64_t safe = cur > covered ? cur : covered;
+        const Err re = ring->ReclaimForRecord(rec_bytes, safe);
+        if (!IsOk(re)) {
+            if (re != Err::kLimitExceeded) Poison();
+            return re;
+        }
         return Err::kOk;
     }
 
@@ -253,9 +263,9 @@ struct Engine::Impl {
     /// 计算整批所需字节（BEGIN + N×行操作 + COMMIT）：
     ///  - 超过记录区容量 → kLimitExceeded 拒批（零 WAL 副作用，批整体
     ///    回滚、引擎不毒化）；
-    ///  - 否则腾环（flush + 推进 checkpoint + 丢弃已覆盖记录——批前根锁
-    ///    在手、环内不存在未提交前缀，丢弃安全），此后批内追加不再触发
-    ///    覆盖协议，杜绝"环满中途丢弃未提交前缀"（P0-1）。
+    ///  - 否则按需腾环（flush + 推进 checkpoint + 只回收最老已覆盖记录，
+    ///    直到整批可写——批前根锁在手、环内不存在未提交前缀，回收安全），
+    ///    此后批内追加不再触发覆盖协议，杜绝"环满中途丢弃未提交前缀"（P0-1）。
     ///
     /// 预留成功后置批进行中标志；批 WAL 段结束（无论成败）由调用方复位
     /// （见 batch_in_progress 注释）。
@@ -367,6 +377,14 @@ Result<std::unique_ptr<Engine>> Engine::Open(const Options& opts) {
     if (opts.initial_size_bytes < static_cast<uint64_t>(layout::kDataStartOffset) + 4096)
         return Result<std::unique_ptr<Engine>>::Fail(Err::kIncompatibleLayout);
 
+    // 新建映像时按 opts.wal_ring_bytes 布局 WAL 环（0 = 默认 64KB）。
+    // 既有映像忽略该值（以 SuperBlock.wal_ring_bytes 为准）；非法配置在
+    // 打开前拒绝，避免“看似生效实则回退默认”的静默行为。
+    if (opts.wal_ring_bytes != 0 &&
+        (opts.wal_ring_bytes < storage::kMinWalRingBytes ||
+         opts.wal_ring_bytes > storage::kMaxWalRingBytes))
+        return Result<std::unique_ptr<Engine>>::Fail(Err::kInvalidArgument);
+
     ShmRegionParams rp;
     rp.map_name = "rtdb_" + opts.instance;
     rp.file_path = opts.path;
@@ -407,7 +425,8 @@ Result<std::unique_ptr<Engine>> Engine::Open(const Options& opts) {
     if (region->allocator() != nullptr) {
         bool created = false;
         auto ring_res = storage::WalRing::CreateOrAttach(region->base_address(),
-                                                         region->allocator(), sb, &created);
+                                                         region->allocator(), sb, &created,
+                                                         opts.wal_ring_bytes);
         if (!ring_res.IsOk()) return Result<std::unique_ptr<Engine>>::Fail(ring_res.Error());
         engine->impl_->ring = ring_res.TakeValue();
 
@@ -935,9 +954,10 @@ Result<uint64_t> Engine::UpsertBatch(const RecordBlockView& block) {
 
         // ---- 阶段二：WAL 三段式（BEGIN + N×op + COMMIT 先于数据页变更）----
         // A1 批前预留（P0-1 修复）：整批字节 = BEGIN + N×行操作 + COMMIT。
-        // 环空间不足时在此一次性腾净（flush + checkpoint + 丢弃已提交段，
-        // 批前环内不存在未提交前缀，丢弃安全）；整批超过记录区容量直接
-        // 拒批（kLimitExceeded，零 WAL 副作用、批整体回滚、不毒化）。
+        // 环空间不足时在此按需回收最老已提交段（flush + 推进 checkpoint，
+        // 批前环内不存在未提交前缀，回收安全），只为整批腾出所需空间；
+        // 整批超过记录区容量直接拒批（kLimitExceeded，零 WAL 副作用、
+        // 批整体回滚、不毒化）。
         uint64_t batch_wal_bytes =
             storage::WalRing::RecordBytes(4) + storage::WalRing::RecordBytes(0);
         for (size_t i = 0; i < staged_n; ++i) batch_wal_bytes += StagedWalBytes(staged[i]);
@@ -1417,8 +1437,7 @@ Result<std::string> Engine::CreateSnapshot() {
     if (!guard.locked()) return Result<std::string>::Fail(guard.error());
 
     std::string snap_path;
-    const Err e = storage::CreateColdSnapshot(impl_->region.get(), impl_->ring.get(),
-                                              impl_->image_path, &snap_path);
+    const Err e = storage::CreateColdSnapshot(impl_->region.get(), impl_->image_path, &snap_path);
     if (!IsOk(e)) return Result<std::string>::Fail(e);
     return Result<std::string>::Ok(std::move(snap_path));
 }

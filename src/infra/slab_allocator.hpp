@@ -12,7 +12,8 @@ namespace rtdb {
 namespace infra {
 
 inline constexpr int kSlabClassCount = 12;               ///< 32B<<i 至 64KB 共 12 级
-/// 单次分配上限（最大级容量 64KB）；超过即 kUnsupported。
+/// 单次 Slab 分配上限（最大级容量 64KB）；超过即 kUnsupported。
+/// 更大的永久区（如 >64KB 的 WAL 环）使用 ReservePermanent。
 inline constexpr uint64_t kMaxAllocBytes = 32ull << (kSlabClassCount - 1);
 inline constexpr uint32_t kBlockHdrMagic = 0x4C424442u;  ///< "BDBL"
 
@@ -54,6 +55,17 @@ public:
 
     /// 归还块（自描述头部定级）；损坏头部返回 kInternal。
     Err Deallocate(uint64_t user_off) noexcept;
+
+    /// \brief 预留一段永久区（WAL 环等，映像生命周期内不归还）。
+    ///
+    /// 从 bump 尾部按 4KB 对齐切出并计入 carved_bytes，返回用户区偏移。
+    /// 与 Slab 分配的区别：不受 64KB 上限约束、不进空闲链、不可
+    /// Deallocate（写入越界 class 标记，Deallocate 返回 kInternal）。
+    /// 调用方须知：永久区之后的 Slab 分配从其后继续；该区本身不参与
+    /// compact/回收。
+    ///
+    /// \return 用户区偏移 / kInvalidArgument（size=0）/ kOutOfMemory
+    Result<uint64_t> ReservePermanent(uint64_t size) noexcept;
 
     bool OwnsOffset(uint64_t user_off) const noexcept;
 

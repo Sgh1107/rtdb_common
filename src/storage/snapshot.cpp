@@ -10,7 +10,6 @@
 
 #include "infra/failpoint.hpp"
 #include "infra/layout.hpp"
-#include "storage/wal_ring.hpp"
 
 namespace rtdb {
 namespace storage {
@@ -59,7 +58,7 @@ Err NeutralizeVolatileStateForCopy(const std::string& snap_path) noexcept {
 
 }  // namespace
 
-Err CreateColdSnapshot(ShmRegion* region, WalRing* ring, const std::string& image_path,
+Err CreateColdSnapshot(ShmRegion* region, const std::string& image_path,
                        std::string* out_snapshot_path) noexcept {
     if (region == nullptr || image_path.empty()) return Err::kInvalidArgument;
     layout::shm_SuperBlock* sb = region->super_block();
@@ -76,15 +75,11 @@ Err CreateColdSnapshot(ShmRegion* region, WalRing* ring, const std::string& imag
     const uint64_t committed = layout::AsAtomicU64(&sb->committed_seq)->load();
     AdvanceMonotonic(layout::AsAtomicU64(&sb->checkpoint_seq), committed);
     AdvanceMonotonic(layout::AsAtomicU64(&sb->flushed_seq), committed);
-    const uint64_t checkpoint = layout::AsAtomicU64(&sb->checkpoint_seq)->load();
 
-    // 3) 环回收：仅当全部已分配记录 seq ≤ checkpoint 时才可整体丢弃
-    //    （head_seq = 下一个待分配 seq；head_seq ≤ checkpoint + 1 ⇔ 环内
-    //    无一条记录的重放价值）。违例时保守保留（覆盖协议不变量仍成立：
-    //    tail_seq ≤ checkpoint + 1）。
-    if (ring != nullptr && ring->next_seq() <= checkpoint + 1) {
-        ring->DropAllRetained();
-    }
+    // 3) 不主动清空 WAL 环（P0-5）：checkpoint 前移只改变“可回收”边界，
+    //    保留水位（tail_seq）留给后续写满时的 ReclaimForRecord 按需推进。
+    //    这样在线订阅游标不会仅因抓快照而溢出；覆盖协议不变量
+    //    tail_seq ≤ checkpoint + 1 仍恒成立（tail 只会更小）。
 
     // 头部（checkpoint/flushed 水位）回写，保证随后拷贝到的副本自洽。
     fe = region->Flush();

@@ -37,6 +37,9 @@ struct Config {
     std::string listen_host = "127.0.0.1";  ///< 默认仅回环（安全默认）
     uint16_t listen_port = 5599;
     uint64_t initial_size_mb = 256;
+    /// WAL 环容量（KB；0 = 引擎默认 64KB）。仅新建映像时生效；允许
+    /// 64~65536（64KB~64MB），见 Options::wal_ring_bytes。
+    uint32_t wal_ring_kb = 0;
     FsyncPolicy fsync = FsyncPolicy::PerSecond;
     std::string auth_salt;             ///< 口令盐（部署共享）
     std::vector<UserEntry> users;      ///< 空 = 拒绝全部 AUTH（501）

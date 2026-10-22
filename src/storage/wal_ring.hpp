@@ -35,9 +35,20 @@
 ///  - 剩余空间 ≥ 60B 但容不下当前记录时写一条 kOpPad 填充记录（占满至
 ///    区尾），随后从头继续；扫描方按 total_len 跳过 pad；
 ///  - **覆盖前先落盘**（D1）：环空间不足时由调用方（Engine 写路径）强制
-///    组刷全映像、推进 checkpoint_seq 后调用 `DropAllRetained()` 丢弃全部
-///    保留记录——保证任意时刻 (checkpoint_seq, committed_seq] 重放区间
-///    在环内完整可用。
+///    组刷全映像、推进 checkpoint_seq，再调用 `ReclaimForRecord()` **按需**
+///    丢弃最老且 seq ≤ checkpoint 的记录，直到能容纳新记录——保证任意时刻
+///    (checkpoint_seq, committed_seq] 重放区间在环内完整可用，同时尽量保留
+///    最新后缀供订阅游标继续增量读取（P0-5 保留水位，见下方 tail_seq 语义）。
+///
+/// 保留水位（P0-5）：
+///  - `tail_seq` 即保留水位：< tail_seq 的变更已被回收，订阅游标
+///    `position + 1 < tail_seq` 时 ScanRange 返回 kCursorOverflow，调用方
+///    须整表重取后 ResetTo（M3 既有口径：重复允许、不漏投）。
+///  - 回收只发生在容量压力下，且每次只推进到“刚好够写”的位置；checkpoint
+///    只决定哪些记录**可**回收（≤ checkpoint），不直接决定水位。冷快照同理：
+///    只推进 checkpoint，不主动清空环，因此不会无故把在线订阅者打成溢出。
+///  - 环容量在创建时由 SuperBlock.wal_ring_bytes 定格（见 CreateOrAttach
+///    的 requested_bytes）；创建后不可在线改容，换容量需新建映像。
 ///
 /// 毒化语义（D2）：追加失败/校验失败后置 poisoned，引擎此后拒绝一切写
 /// （kPoisoned），读不受影响。毒化标志持久化于环头，跨进程/重启可见。
@@ -65,10 +76,13 @@ class Catalog;
 /// 环头魔数（"RTDBWAL1"）。
 inline constexpr uint64_t kWalRingMagic = 0x5254444257414C31ULL;
 
-/// 新建环的 Slab 块容量（含 64B 环头；恰为 slab 最大级 64KB）。
+/// 新建环的默认 Slab 块容量（含 64B 环头；恰为 slab 最大级 64KB）。
 inline constexpr uint64_t kDefaultWalRingBytes = 64 * 1024;
-/// 记录区最小容量（创建校验）。
+/// 记录区最小容量（创建/附着校验）。
 inline constexpr uint64_t kMinWalAreaBytes = 4096;
+/// 环容量硬上限（含环头；防止配置笔误把整个映像吃掉）。超过 64KB 的环
+/// 由分配器走“永久区预留”（见 SlabShmAllocator::ReservePermanent）。
+inline constexpr uint64_t kMaxWalRingBytes = 64ull * 1024 * 1024;
 
 /// 记录线格式常量。
 inline constexpr uint32_t kWalRecHdrBytes = 56;     ///< 定长头
@@ -133,6 +147,10 @@ struct shm_WalRingHeader {
 static_assert(sizeof(shm_WalRingHeader) == 64, "环头必须恰好 64 字节");
 static_assert(std::is_standard_layout<shm_WalRingHeader>::value, "环头必须是标准布局");
 
+/// 环容量下限（含环头；记录区 ≥ kMinWalAreaBytes）。
+inline constexpr uint64_t kMinWalRingBytes =
+    sizeof(shm_WalRingHeader) + kMinWalAreaBytes;
+
 // ---- 共享内存运行时字段的原子视角 helper（C++17 无 atomic_ref，reinterpret_cast
 //      到等宽 atomic 的惯用法；与 layout::AsAtomicU64 同款）。----
 static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t), "需要无锁 32 位原子支持");
@@ -171,10 +189,18 @@ public:
     /// 分配并初始化（写回 SuperBlock 与 layout CRC）。`out_created` 返回
     /// 是否为新创建。附着校验：魔数、tail_seq ≤ checkpoint_seq + 1
     /// （覆盖协议不变量）、seq/位置自洽；违例返回 kCorruption。
+    ///
+    /// `requested_bytes` 仅在新建时生效（0 = kDefaultWalRingBytes）：
+    ///  - < kMinWalRingBytes → kInvalidArgument；
+    ///  - > kMaxWalRingBytes → kLimitExceeded；
+    ///  - ≤ 64KB 走 Slab 分配，> 64KB 走永久区预留（ReservePermanent）；
+    ///  - 实际容量写入 SuperBlock.wal_ring_bytes，附着时以该字段为准，
+    ///    调用方传入的 requested_bytes 被忽略（既有映像不因配置变化改容）。
     static Result<std::unique_ptr<WalRing>> CreateOrAttach(void* base_addr,
                                                            infra::SlabShmAllocator* alloc,
                                                            layout::shm_SuperBlock* sb,
-                                                           bool* out_created = nullptr);
+                                                           bool* out_created = nullptr,
+                                                           uint64_t requested_bytes = 0);
 
     bool poisoned() const noexcept {
         return AsAtomicU32(&hdr_->poisoned)->load() != 0;
@@ -218,7 +244,26 @@ public:
     ///
     /// 前置条件（调用方保证）：checkpoint_seq ≥ 全部保留记录的 seq，
     /// 即被丢弃记录已全部应用且落盘，重放不再需要它们。
+    ///
+    /// 仅用于测试/维护路径；覆盖协议（写路径）使用 `ReclaimForRecord`
+    /// 按需回收，保留最新后缀供订阅游标继续读取（P0-5）。
     void DropAllRetained() noexcept;
+
+    /// \brief 按需回收最老记录，直到能容纳一条 rec_bytes 的记录（P0-5）。
+    ///
+    /// 调用方须持根锁，并保证 **seq ≤ safe_through_seq 的记录已全部落盘**
+    /// （Engine 覆盖路径 = 先 FlushNow + 推进 checkpoint_seq，再调用本方法）。
+    /// 回收顺序：从 tail 起逐条推进；kOpPad 无 seq，可直接回收；普通记录
+    /// 仅当 seq ≤ safe_through_seq 时才推进 tail_seq。不会越过 safe 水位，
+    /// 因此不会丢弃尚未 flush 的重放数据。
+    ///
+    /// 与 `DropAllRetained` 的差异：只丢到“刚好够写”，保留尽可能新的历史；
+    /// 订阅游标若仍落在保留窗口内（position + 1 ≥ tail_seq）可继续增量读取，
+    /// 否则由 ScanRange 返回 kCursorOverflow 触发整表重取（既有 M2/M3 口径）。
+    ///
+    /// \return kOk（已可写）/ kLimitExceeded（记录大于区容量，或可回收
+    ///         记录已耗尽仍不够）/ kCorruption（保留段框架/seq 不自洽）
+    Err ReclaimForRecord(uint64_t rec_bytes, uint64_t safe_through_seq) noexcept;
 
     /// \brief 恢复期回绕写头（**仅** ReplayWal 单线程恢复路径调用：不得持
     /// 根锁、不得有并发写者/扫描者）。

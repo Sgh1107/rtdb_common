@@ -108,6 +108,11 @@ Result<Config> ParseConfigText(std::string_view text) {
             if (!ParseU64(val, &v) || v == 0 || v > 4096)
                 return Result<Config>::Fail(Err::kInvalidArgument);
             cfg.initial_size_mb = v;
+        } else if (key == "wal_ring_kb") {
+            uint64_t v = 0;
+            if (!ParseU64(val, &v) || (v != 0 && (v < 64 || v > 65536)))
+                return Result<Config>::Fail(Err::kInvalidArgument);
+            cfg.wal_ring_kb = static_cast<uint32_t>(v);
         } else if (key == "fsync") {
             if (!ParseFsync(val, &cfg.fsync)) return Result<Config>::Fail(Err::kInvalidArgument);
         } else if (key == "auth_salt") {

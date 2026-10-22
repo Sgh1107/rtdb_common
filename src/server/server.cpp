@@ -878,6 +878,7 @@ Err Server::Start(const Config& cfg) {
     o.path = im.cfg.path;
     o.initial_size_bytes = im.cfg.initial_size_mb << 20;
     o.wal_fsync = im.cfg.fsync;
+    o.wal_ring_bytes = static_cast<uint64_t>(im.cfg.wal_ring_kb) << 10;
     o.role = Role::Standalone;  // D7：rtdbd 单进程写者（主备仲裁归 M4）
     auto eng = Engine::Open(o);
     if (!eng.IsOk()) {

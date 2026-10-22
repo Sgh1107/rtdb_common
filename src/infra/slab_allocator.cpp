@@ -102,7 +102,7 @@ Err SlabShmAllocator::Deallocate(uint64_t user_off) noexcept {
     if (!OwnsOffset(user_off)) return Err::kInvalidArgument;
     auto* hdr = static_cast<BlockHeader*>(OffsetToPtr(user_off - kHdrBytes));
     if (hdr->magic != kBlockHdrMagic || hdr->class_idx >= kSlabClassCount)
-        return Err::kInternal;  // 双重释放或越界写破坏了头部
+        return Err::kInternal;  // 双重释放/越界写/永久区（不可回收）
     if (hdr->span == 0 || hdr->span > ctl_->carved_bytes)
         return Err::kInternal;  // 非法跨度同样视为损坏
 
@@ -112,6 +112,24 @@ Err SlabShmAllocator::Deallocate(uint64_t user_off) noexcept {
     *static_cast<uint64_t*>(OffsetToPtr(user_off)) = ctl_->free_heads[hdr->class_idx];
     ctl_->free_heads[hdr->class_idx] = user_off;
     return Err::kOk;
+}
+
+Result<uint64_t> SlabShmAllocator::ReservePermanent(uint64_t size) noexcept {
+    if (size == 0) return Result<uint64_t>::Fail(Err::kInvalidArgument);
+    // 页对齐用户区：与共享内存映射/页刷新的粒度一致，减少跨页碎块。
+    const uint64_t off = AlignUp64(ctl_->bump + kHdrBytes, 4096);
+    if (off > ctl_->data_end || size > ctl_->data_end - off)
+        return Result<uint64_t>::Fail(Err::kOutOfMemory);
+    const uint64_t span = off + size - ctl_->bump;
+    ctl_->bump = off + size;
+    ctl_->carved_bytes += span;
+
+    // class_idx 越界 = 永久区标记：Deallocate 一律 kInternal（不支持回收）。
+    auto* hdr = static_cast<BlockHeader*>(OffsetToPtr(off - kHdrBytes));
+    hdr->class_idx = static_cast<uint32_t>(kSlabClassCount);
+    hdr->magic = kBlockHdrMagic;
+    hdr->span = span;
+    return Result<uint64_t>::Ok(off);
 }
 
 bool SlabShmAllocator::OwnsOffset(uint64_t user_off) const noexcept {
