@@ -176,14 +176,101 @@ TEST_F(EngineCrudTest, UniqueKeyUpdateAndDeleteReuse) {
                   .Error(),
               Err::kInvalidArgument);
 
-    // 删除 → 不可见；再次删除 → kNotFound；主键可复用（新行槽）
+    // 删除 → 不可见；再次删除 → kNotFound；行槽复用（P0-3）
     ASSERT_TRUE(engine->DeleteByKey(table, ColumnValue::Int(10)).IsOk());
     EXPECT_EQ(engine->GetByKey(table, ColumnValue::Int(10)).Error(), Err::kNotFound);
     EXPECT_EQ(engine->DeleteByKey(table, ColumnValue::Int(10)).Error(), Err::kNotFound);
     auto reinsert = engine->Insert(table, MakeRichRow(10, 9.0, 9, true, "again", "Z"));
     ASSERT_TRUE(reinsert.IsOk());
-    EXPECT_EQ(reinsert.Value(), 1u);  // 新行槽（M1 不复用槽位）
+    EXPECT_EQ(reinsert.Value(), 0u);  // 复用刚删除的墓碑槽位 0
     EXPECT_EQ(engine->GetByKey(table, ColumnValue::Int(10)).Value()[4].as_bytes(), "again");
+}
+
+TEST_F(EngineCrudTest, ScanLimitedPagesWithoutRescanningTail) {
+    auto open_res = rtdb::Engine::Open(MakeOpts());
+    ASSERT_TRUE(open_res.IsOk());
+    auto engine = open_res.TakeValue();
+    const TableHandle table = engine->CreateTable(MakeRichDef("paged", 64)).TakeValue();
+    for (int64_t i = 1; i <= 10; ++i) {
+        ASSERT_TRUE(engine
+                        ->Insert(table, MakeRichRow(i, 0, static_cast<int32_t>(i), false, "n", ""))
+                        .IsOk());
+    }
+
+    // 每页 3 行：3/3/3/1，页间以末行主键（开区间）续扫。
+    int64_t expect_id = 1;
+    ColumnValue lo = ColumnValue::Null();
+    bool has_lo = false;
+    for (int page = 0; page < 4; ++page) {
+        rtdb::Engine::KeyRange range;
+        if (has_lo) {
+            range.lo = lo;
+            range.lo_inclusive = false;
+        }
+        bool more = false;
+        auto res = engine->ScanLimited(table, range, 3, &more);
+        ASSERT_TRUE(res.IsOk());
+        const auto& rows = res.Value();
+        const size_t expect_n = page < 3 ? 3u : 1u;
+        ASSERT_EQ(rows.size(), expect_n) << "page " << page;
+        for (const auto& row : rows) {
+            ASSERT_FALSE(row.empty());
+            EXPECT_EQ(row[0].as_int(), expect_id++);
+        }
+        EXPECT_EQ(more, page < 3) << "page " << page;
+        if (!rows.empty()) {
+            lo = rows.back()[0];
+            has_lo = true;
+        }
+    }
+    EXPECT_EQ(expect_id, 11);
+}
+
+TEST_F(EngineCrudTest, RowSlotReuseSurvivesChurnAndReplay) {
+    {
+        auto open_res = rtdb::Engine::Open(MakeOpts());
+        ASSERT_TRUE(open_res.IsOk());
+        auto engine = open_res.TakeValue();
+        const TableHandle table = engine->CreateTable(MakeRichDef("reuse", 4)).TakeValue();
+
+        for (int64_t i = 1; i <= 4; ++i) {
+            ASSERT_TRUE(engine
+                            ->Insert(table, MakeRichRow(i, 0.0, static_cast<int32_t>(i), false,
+                                                        "v" + std::to_string(i), ""))
+                            .IsOk());
+        }
+        // row_cap 已满且无墓碑：拒绝（仍是硬上限）。
+        EXPECT_EQ(engine->Insert(table, MakeRichRow(9, 0, 0, false, "", "")).Error(),
+                  Err::kOutOfMemory);
+
+        // 删除两行释放槽位 1/2；随后的插入必须复用它们而不是再耗尽 row_cap。
+        ASSERT_TRUE(engine->DeleteByKey(table, ColumnValue::Int(2)).IsOk());
+        ASSERT_TRUE(engine->DeleteByKey(table, ColumnValue::Int(3)).IsOk());
+        auto r5 = engine->Insert(table, MakeRichRow(5, 0, 0, false, "v5", ""));
+        ASSERT_TRUE(r5.IsOk());
+        auto r6 = engine->Insert(table, MakeRichRow(6, 0, 0, false, "v6", ""));
+        ASSERT_TRUE(r6.IsOk());
+        EXPECT_EQ(r5.Value(), 1u);  // 墓碑槽位复用
+        EXPECT_EQ(r6.Value(), 2u);
+        EXPECT_EQ(engine->GetByKey(table, ColumnValue::Int(5)).Value()[4].as_bytes(), "v5");
+        EXPECT_EQ(engine->GetByKey(table, ColumnValue::Int(2)).Error(), Err::kNotFound);
+    }
+
+    // 重开：WAL 重放期间复用槽位的版本号单调递增，旧记录不得覆盖新行。
+    auto reopen = rtdb::Engine::Open(MakeOpts());
+    ASSERT_TRUE(reopen.IsOk()) << rtdb::ErrorMessage(reopen.Error());
+    auto engine = reopen.TakeValue();
+    auto table_res = engine->OpenTable("reuse");
+    ASSERT_TRUE(table_res.IsOk());
+    const TableHandle table = table_res.Value();
+
+    for (int64_t id : {1, 4, 5, 6}) {
+        auto got = engine->GetByKey(table, ColumnValue::Int(id));
+        ASSERT_TRUE(got.IsOk()) << "id=" << id;
+        EXPECT_EQ(got.Value()[4].as_bytes(), "v" + std::to_string(id)) << "id=" << id;
+    }
+    EXPECT_EQ(engine->GetByKey(table, ColumnValue::Int(2)).Error(), Err::kNotFound);
+    EXPECT_EQ(engine->GetByKey(table, ColumnValue::Int(3)).Error(), Err::kNotFound);
 }
 
 TEST_F(EngineCrudTest, CrudSurvivesReopen) {
@@ -353,10 +440,79 @@ TEST_F(TableStoreDirectTest, PhysicalRegionsAndInvariants) {
     // 删除：墓碑置位、索引摘键、变长块全部回收。
     ASSERT_EQ(store->Remove(ColumnValue::Int(5)), Err::kOk);
     EXPECT_EQ(store->live_rows(), 0u);
-    EXPECT_EQ(store->used_rows(), 1u);  // 行槽保留（M1 不复用）
+    EXPECT_EQ(store->used_rows(), 1u);  // 高水位保持（槽位可被后续插入复用）
     EXPECT_EQ(PoolUsed(desc), 0u);
     EXPECT_EQ(store->Validate(), Err::kOk);
     EXPECT_EQ(store->Get(ColumnValue::Int(5)).Error(), Err::kNotFound);
+}
+
+TEST_F(TableStoreDirectTest, SecondaryIndexRebuildReclaimsOldNodes) {
+    auto desc_res = catalog_->CreateTable(MakeRichDef("sec_rebuild", 64));
+    ASSERT_TRUE(desc_res.IsOk()) << rtdb::ErrorMessage(desc_res.Error());
+    auto store =
+        rtdb::storage::TableStore::Attach(mem_, alloc_.get(), desc_res.Value()).TakeValue();
+
+    rtdb::SecondaryIndexDef idx;
+    idx.name = "by_count";
+    idx.column_index = 2;  // count（非唯一）
+    idx.unique = false;
+    ASSERT_EQ(store->CreateSecondaryIndex(idx), Err::kOk);
+    for (int64_t i = 0; i < 32; ++i) {
+        ASSERT_EQ(store->Insert(MakeRichRow(i, 0, static_cast<int32_t>(i), false, "x", ""),
+                                nullptr),
+                  Err::kOk);
+    }
+
+    const uint64_t used_before = alloc_->used_bytes();
+    ASSERT_EQ(store->RebuildSecondaryIndexes(), Err::kOk);
+    const uint64_t used_first = alloc_->used_bytes();
+    // 重建后索引规模不变；旧树节点必须已归还（P0-4），不会累计增长。
+    EXPECT_LE(used_first, used_before);
+    for (int i = 0; i < 4; ++i) ASSERT_EQ(store->RebuildSecondaryIndexes(), Err::kOk);
+    // 反复重建不得累计增长：旧树节点全部回收、复用块账本回补后应收敛稳定。
+    EXPECT_LE(alloc_->used_bytes(), used_first);
+    EXPECT_LE(alloc_->used_bytes(), used_before);
+    EXPECT_EQ(store->Validate(), Err::kOk);
+}
+
+TEST_F(TableStoreDirectTest, FailedInsertOnReusedSlotRestoresTombstone) {
+    auto desc_res = catalog_->CreateTable(MakeRichDef("reuse_fail", 8));
+    ASSERT_TRUE(desc_res.IsOk()) << rtdb::ErrorMessage(desc_res.Error());
+    auto store =
+        rtdb::storage::TableStore::Attach(mem_, alloc_.get(), desc_res.Value()).TakeValue();
+
+    uint64_t row_no = 99;
+    ASSERT_EQ(store->Insert(MakeRichRow(1, 0, 1, false, "a", ""), &row_no), Err::kOk);
+    ASSERT_EQ(row_no, 0u);
+    ASSERT_EQ(store->Remove(ColumnValue::Int(1)), Err::kOk);
+    ASSERT_EQ(store->live_rows(), 0u);
+
+    // 复用槽 0 的插入在索引发布点失败：ApplyStaged 内部已清墓碑并清零行。
+    rtdb::failpoint::Arm("wal.index.insert", rtdb::failpoint::Mode::kError);
+    rtdb::storage::StagedRowOp st;
+    ASSERT_EQ(store->StageInsert(MakeRichRow(2, 0, 2, false, "b", ""), &st), Err::kOk);
+    EXPECT_EQ(st.row_no, 0u);  // 墓碑槽复用
+    EXPECT_EQ(store->ApplyStaged(&st), Err::kOutOfMemory);
+    store->ReleaseStaged(&st);
+    rtdb::failpoint::ClearAll();
+
+    // 回滚必须恢复墓碑：空槽不可见、不计入 live，且不破坏不变量。
+    EXPECT_EQ(store->live_rows(), 0u);
+    EXPECT_EQ(store->Validate(), Err::kOk);
+    auto has2 = store->Contains(ColumnValue::Int(2));
+    ASSERT_TRUE(has2.IsOk());
+    EXPECT_FALSE(has2.Value());
+
+    // 墓碑恢复后同一槽位仍可复用。
+    rtdb::storage::StagedRowOp st2;
+    ASSERT_EQ(store->StageInsert(MakeRichRow(3, 0, 3, false, "c", ""), &st2), Err::kOk);
+    EXPECT_EQ(st2.row_no, 0u);
+    ASSERT_EQ(store->ApplyStaged(&st2), Err::kOk);
+    EXPECT_EQ(store->live_rows(), 1u);
+    auto got = store->Get(ColumnValue::Int(3));
+    ASSERT_TRUE(got.IsOk());
+    EXPECT_EQ(got.Value()[4].as_bytes(), "c");
+    EXPECT_EQ(store->Validate(), Err::kOk);
 }
 
 TEST_F(TableStoreDirectTest, UnsupportedPrimaryKeyRejectedAtCreate) {

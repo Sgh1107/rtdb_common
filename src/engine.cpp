@@ -657,8 +657,12 @@ Result<uint64_t> Engine::Insert(const TableHandle& table, const std::vector<Colu
 // ---- M2：upsert 便利面（docs/04 §3 `tbl.Upsert(Row)`，docs/10 §2-M2-D1）----
 // 语义：存在则按所给列**合并**覆盖（未提供列保持原值），不存在则插入
 // （未提供列按 schema 填充：nullable → NULL；非空且无默认值 →
-// kInvalidArgument）。合并路径为"读-改-写"非原子（Standalone 单写者
-// 语义下等价；并发写者以最后一次覆盖为准，记录在案）。
+// kInvalidArgument）。
+//
+// 原子性（P0-1 修复）：存在性判定、当前行读取、合并、WAL 与发布全部在
+// **同一个根锁临界区**内完成。原实现分别调用 ContainsKey/GetByKey/
+// UpdateByKey（各自取锁），两个会话并发改同一主键的不同列时会互相覆盖
+// （丢更新）。合并路径现在对同一主键等价于一次行级事务。
 Result<uint64_t> Engine::Upsert(const TableHandle& table, const Row& row) {
     if (!impl_ || !impl_->catalog) return Result<uint64_t>::Fail(Err::kUnsupported);
     if (!table.IsValid()) return Result<uint64_t>::Fail(Err::kInvalidArgument);
@@ -667,75 +671,112 @@ Result<uint64_t> Engine::Upsert(const TableHandle& table, const Row& row) {
         return Result<uint64_t>::Fail(Err::kPoisoned);
     if (row.empty()) return Result<uint64_t>::Fail(Err::kInvalidArgument);
 
-    auto store_res = impl_->StoreFor(table.desc_off(), table.table_id());
-    if (!store_res.IsOk()) return Result<uint64_t>::Fail(store_res.Error());
-    const storage::shm_TableDescriptor* desc = store_res.Value()->descriptor();
-    const uint32_t visible = table.visible_column_count();
+    uint64_t commit_seq = 0;
+    Result<uint64_t> res = Result<uint64_t>::Fail(Err::kInternal);
+    {
+        infra::ShmRootMutexGuard guard(impl_->region->root_mutex(), kEngineLockTimeoutMs);
+        if (!guard.locked()) return Result<uint64_t>::Fail(guard.error());
+        if (impl_->ring == nullptr || impl_->ring->poisoned())
+            return Result<uint64_t>::Fail(Err::kPoisoned);
 
-    // ---- 可见列元数据（名 / 可空 / 默认值；init 列 + ext 列）----
-    std::vector<ColInfo> meta;
-    const Err meta_err =
-        CollectColumnInfo(impl_->region->base_address(), desc, visible, &meta);
-    if (!IsOk(meta_err)) return Result<uint64_t>::Fail(meta_err);
+        // 描述符解析与元数据收集必须在根锁内：与 DropTable/AlterTable 互斥，
+        // 避免在锁外持有裸描述符指针（P0-2 同类问题）。
+        auto store_res = impl_->StoreFor(table.desc_off(), table.table_id());
+        if (!store_res.IsOk()) return Result<uint64_t>::Fail(store_res.Error());
+        storage::TableStore* store = store_res.Value();
+        const storage::shm_TableDescriptor* desc = store->descriptor();
+        const uint32_t visible = table.visible_column_count();
 
-    // ---- Row 校验：列名须在可见集内、不得重名、主键列（列 0）必给 ----
-    std::vector<const ColumnValue*> provided(visible, nullptr);
-    for (const auto& kv : row) {
-        uint32_t idx = visible;
-        for (uint32_t i = 0; i < visible; ++i) {
-            if (kv.first == meta[i].name) {
-                idx = i;
-                break;
+        std::vector<ColInfo> meta;
+        const Err meta_err =
+            CollectColumnInfo(impl_->region->base_address(), desc, visible, &meta);
+        if (!IsOk(meta_err)) return Result<uint64_t>::Fail(meta_err);
+
+        // ---- Row 校验：列名须在可见集内、不得重名、主键列（列 0）必给 ----
+        std::vector<const ColumnValue*> provided(visible, nullptr);
+        for (const auto& kv : row) {
+            uint32_t idx = visible;
+            for (uint32_t i = 0; i < visible; ++i) {
+                if (kv.first == meta[i].name) {
+                    idx = i;
+                    break;
+                }
             }
+            if (idx == visible || provided[idx] != nullptr)
+                return Result<uint64_t>::Fail(Err::kInvalidArgument);
+            provided[idx] = &kv.second;
         }
-        if (idx == visible || provided[idx] != nullptr)
-            return Result<uint64_t>::Fail(Err::kInvalidArgument);
-        provided[idx] = &kv.second;
-    }
-    if (provided[0] == nullptr) return Result<uint64_t>::Fail(Err::kInvalidArgument);
-    const ColumnValue& pk = *provided[0];
+        if (provided[0] == nullptr) return Result<uint64_t>::Fail(Err::kInvalidArgument);
+        const ColumnValue& pk = *provided[0];
 
-    // ---- 存在性分流 ----
-    auto exists_res = ContainsKey(table, pk);
-    if (!exists_res.IsOk()) return Result<uint64_t>::Fail(exists_res.Error());
+        // ---- 存在性分流（锁内）----
+        auto exists_res = store->Contains(pk);
+        if (!exists_res.IsOk()) return Result<uint64_t>::Fail(exists_res.Error());
+        const bool exists = exists_res.Value();
 
-    std::vector<ColumnValue> full(visible);
-    if (exists_res.Value()) {
-        // 合并：现存行 + 所给列覆盖
-        auto cur_res = GetByKey(table, pk);
-        if (!cur_res.IsOk()) return Result<uint64_t>::Fail(cur_res.Error());
-        const std::vector<ColumnValue>& cur = cur_res.Value();
-        if (cur.size() != visible) return Result<uint64_t>::Fail(Err::kCorruption);
-        for (uint32_t i = 0; i < visible; ++i) full[i] = provided[i] != nullptr ? *provided[i] : cur[i];
-        uint64_t row_no = 0;
-        const Result<void> ures = UpdateByKey(table, pk, full, &row_no);
-        if (!ures.IsOk()) return Result<uint64_t>::Fail(ures.Error());
-        return Result<uint64_t>::Ok(row_no);
-    }
-
-    // 插入：缺列按 schema 填充（ext 列默认值经 EncodeExtDefault 的逆解码）
-    for (uint32_t i = 0; i < visible; ++i) {
-        if (provided[i] != nullptr) {
-            full[i] = *provided[i];
-            continue;
-        }
-        if (i < desc->col_count) {
-            if (meta[i].nullable) {
-                full[i] = ColumnValue::Null();
-            } else {
-                return Result<uint64_t>::Fail(Err::kInvalidArgument);  // 非空列无默认值可填
-            }
-            continue;
-        }
-        if (meta[i].has_default) {
-            full[i] = DecodeExtDefault(meta[i]);
-        } else if (meta[i].nullable) {
-            full[i] = ColumnValue::Null();
+        std::vector<ColumnValue> full(visible);
+        if (exists) {
+            // 合并：现存行 + 所给列覆盖（锁内读，保证读到的就是本次覆盖的基线）。
+            auto cur_res = store->Get(pk);
+            if (!cur_res.IsOk()) return Result<uint64_t>::Fail(cur_res.Error());
+            std::vector<ColumnValue> cur = cur_res.TakeValue();
+            if (cur.size() < visible) return Result<uint64_t>::Fail(Err::kCorruption);
+            if (cur.size() > visible)
+                cur.erase(cur.begin() + static_cast<std::ptrdiff_t>(visible), cur.end());
+            for (uint32_t i = 0; i < visible; ++i)
+                full[i] = provided[i] != nullptr ? *provided[i] : cur[i];
         } else {
-            return Result<uint64_t>::Fail(Err::kInvalidArgument);
+            // 插入：缺列按 schema 填充（ext 列默认值经 EncodeExtDefault 的逆解码）
+            for (uint32_t i = 0; i < visible; ++i) {
+                if (provided[i] != nullptr) {
+                    full[i] = *provided[i];
+                    continue;
+                }
+                if (i < desc->col_count) {
+                    if (meta[i].nullable) {
+                        full[i] = ColumnValue::Null();
+                    } else {
+                        return Result<uint64_t>::Fail(Err::kInvalidArgument);
+                    }
+                    continue;
+                }
+                if (meta[i].has_default) {
+                    full[i] = DecodeExtDefault(meta[i]);
+                } else if (meta[i].nullable) {
+                    full[i] = ColumnValue::Null();
+                } else {
+                    return Result<uint64_t>::Fail(Err::kInvalidArgument);
+                }
+            }
+            failpoint::CrashPoint("wal.insert.before");
+        }
+
+        storage::StagedRowOp st;
+        bool staged = false;
+        Err err = exists ? store->StageUpdate(pk, full, &st) : store->StageInsert(full, &st);
+        if (IsOk(err)) {
+            staged = true;
+            err = impl_->WalAppendRowOp(store, st, &commit_seq);
+            if (IsOk(err)) {
+                err = store->ApplyStaged(&st);
+                if (!IsOk(err)) impl_->Poison();
+            }
+        }
+        if (!IsOk(err)) {
+            if (staged) store->ReleaseStaged(&st);
+            res = Result<uint64_t>::Fail(err);
+        } else {
+            failpoint::CrashPoint("wal.commit.before");
+            impl_->MarkCommitted(commit_seq);
+            res = Result<uint64_t>::Ok(st.row_no);
         }
     }
-    return Insert(table, full);
+    // flush 在根锁之外流水线化（组提交聚合，docs/08 §2-D2）。
+    if (res.IsOk() && impl_->commit != nullptr && commit_seq != 0) {
+        const Err fe = impl_->commit->OnCommit(commit_seq);
+        if (!IsOk(fe)) impl_->Poison();
+    }
+    return res;
 }
 
 // ---- M2-W2：列式块原子 upsert（docs/03 §2.3，docs/10 §2-M2-D2）----
@@ -764,51 +805,54 @@ Result<uint64_t> Engine::UpsertBatch(const RecordBlockView& block) {
         }
     }
 
-    // ---- 解析表（按名）与列映射 ----
-    Result<uint64_t> desc_res = impl_->catalog->OpenTable(block.table_name);
-    if (!desc_res.IsOk()) return Result<uint64_t>::Fail(desc_res.Error());
-    const uint64_t desc_off = desc_res.Value();
-    const storage::shm_TableDescriptor* desc = impl_->catalog->Descriptor(desc_off);
-    if (desc == nullptr) return Result<uint64_t>::Fail(Err::kCorruption);
-    if (desc->state != static_cast<uint32_t>(storage::TableState::kActive))
-        return Result<uint64_t>::Fail(Err::kTableNotFound);
-
-    const uint32_t total_cols = desc->col_count + desc->ext_col_count;
-    if (total_cols == 0) return Result<uint64_t>::Fail(Err::kCorruption);
-    std::vector<ColInfo> meta;
-    const Err meta_err =
-        CollectColumnInfo(impl_->region->base_address(), desc, total_cols, &meta);
-    if (!IsOk(meta_err)) return Result<uint64_t>::Fail(meta_err);
-
-    std::vector<int32_t> src(total_cols, -1);  // schema 列 → block 列下标
-    for (uint32_t c = 0; c < total_cols; ++c) {
-        for (size_t b = 0; b < block.columns.size(); ++b) {
-            if (block.columns[b].name == meta[c].name) {
-                if (!PayloadTypeCompatible(block.columns[b].type, meta[c].type))
-                    return Result<uint64_t>::Fail(Err::kInvalidArgument);
-                src[c] = static_cast<int32_t>(b);
-                break;
-            }
-        }
-    }
-    for (size_t b = 0; b < block.columns.size(); ++b) {  // 块内未知列名
-        bool mapped = false;
-        for (uint32_t c = 0; c < total_cols; ++c) {
-            if (src[c] == static_cast<int32_t>(b)) {
-                mapped = true;
-                break;
-            }
-        }
-        if (!mapped) return Result<uint64_t>::Fail(Err::kInvalidArgument);
-    }
-
     uint64_t commit_seq = 0;
     Result<uint64_t> res = Result<uint64_t>::Fail(Err::kInternal);
     {
+        // P0-2 修复：描述符解析、扩展列链遍历与列映射全部在根锁内完成。
+        // 原实现先在锁外取 `desc` 裸指针再进锁，与 DropTable/AlterTable
+        // 并发时可能读到墓碑或已摘除的扩展列区域。
         infra::ShmRootMutexGuard guard(impl_->region->root_mutex(), kEngineLockTimeoutMs);
         if (!guard.locked()) return Result<uint64_t>::Fail(guard.error());
         if (impl_->ring == nullptr || impl_->ring->poisoned())
             return Result<uint64_t>::Fail(Err::kPoisoned);
+
+        // ---- 解析表（按名）与列映射 ----
+        Result<uint64_t> desc_res = impl_->catalog->OpenTable(block.table_name);
+        if (!desc_res.IsOk()) return Result<uint64_t>::Fail(desc_res.Error());
+        const uint64_t desc_off = desc_res.Value();
+        const storage::shm_TableDescriptor* desc = impl_->catalog->Descriptor(desc_off);
+        if (desc == nullptr) return Result<uint64_t>::Fail(Err::kCorruption);
+        if (desc->state != static_cast<uint32_t>(storage::TableState::kActive))
+            return Result<uint64_t>::Fail(Err::kTableNotFound);
+
+        const uint32_t total_cols = desc->col_count + desc->ext_col_count;
+        if (total_cols == 0) return Result<uint64_t>::Fail(Err::kCorruption);
+        std::vector<ColInfo> meta;
+        const Err meta_err =
+            CollectColumnInfo(impl_->region->base_address(), desc, total_cols, &meta);
+        if (!IsOk(meta_err)) return Result<uint64_t>::Fail(meta_err);
+
+        std::vector<int32_t> src(total_cols, -1);  // schema 列 → block 列下标
+        for (uint32_t c = 0; c < total_cols; ++c) {
+            for (size_t b = 0; b < block.columns.size(); ++b) {
+                if (block.columns[b].name == meta[c].name) {
+                    if (!PayloadTypeCompatible(block.columns[b].type, meta[c].type))
+                        return Result<uint64_t>::Fail(Err::kInvalidArgument);
+                    src[c] = static_cast<int32_t>(b);
+                    break;
+                }
+            }
+        }
+        for (size_t b = 0; b < block.columns.size(); ++b) {  // 块内未知列名
+            bool mapped = false;
+            for (uint32_t c = 0; c < total_cols; ++c) {
+                if (src[c] == static_cast<int32_t>(b)) {
+                    mapped = true;
+                    break;
+                }
+            }
+            if (!mapped) return Result<uint64_t>::Fail(Err::kInvalidArgument);
+        }
 
         auto store_res = impl_->StoreFor(desc_off, static_cast<int64_t>(desc->table_id));
         if (!store_res.IsOk()) return Result<uint64_t>::Fail(store_res.Error());
@@ -1098,6 +1142,14 @@ Result<bool> Engine::ContainsKey(const TableHandle& table, const ColumnValue& ke
 
 Result<std::vector<std::vector<ColumnValue>>> Engine::Scan(const TableHandle& table,
                                                            const KeyRange& range) {
+    return ScanLimited(table, range, static_cast<size_t>(UINT64_MAX), nullptr);
+}
+
+Result<std::vector<std::vector<ColumnValue>>> Engine::ScanLimited(const TableHandle& table,
+                                                                  const KeyRange& range,
+                                                                  size_t max_rows,
+                                                                  bool* out_more) {
+    if (out_more != nullptr) *out_more = false;
     if (!impl_ || !impl_->catalog) return Result<std::vector<std::vector<ColumnValue>>>::Fail(
                                                Err::kUnsupported);
     if (!table.IsValid())
@@ -1116,9 +1168,10 @@ Result<std::vector<std::vector<ColumnValue>>> Engine::Scan(const TableHandle& ta
     if (!store_res.IsOk()) return Result<std::vector<std::vector<ColumnValue>>>::Fail(
                                        store_res.Error());
 
-    auto res = store_res.Value()->Scan(range.lo.is_null() ? nullptr : &range.lo,
-                                       range.lo_inclusive, range.hi.is_null() ? nullptr : &range.hi,
-                                       range.hi_inclusive);
+    auto res = store_res.Value()->ScanLimited(
+        range.lo.is_null() ? nullptr : &range.lo, range.lo_inclusive,
+        range.hi.is_null() ? nullptr : &range.hi, range.hi_inclusive,
+        static_cast<uint64_t>(max_rows), out_more);
     if (!res.IsOk()) return Result<std::vector<std::vector<ColumnValue>>>::Fail(res.Error());
 
     // 旧句柄列截断（同 GetByKey：加列只追加，前缀即旧 schema 视图）。

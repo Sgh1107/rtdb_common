@@ -73,6 +73,11 @@ Result<uint64_t> SlabShmAllocator::Allocate(uint64_t size) noexcept {
         user_off = ctl_->free_heads[cls];
         const uint64_t* cell = static_cast<const uint64_t*>(OffsetToPtr(user_off));
         ctl_->free_heads[cls] = *cell;
+        // 账本回补：Deallocate 时已从 carved_bytes 扣除本块跨度，复用必须
+        // 加回，否则反复 分配→释放→分配 会把活跃字节数单调压低（P0-4
+        // 回归：二级索引重建后 used_bytes 每轮错误下降）。
+        const auto* reused = static_cast<const BlockHeader*>(OffsetToPtr(user_off - kHdrBytes));
+        ctl_->carved_bytes += reused->span;
     } else {
         // 无空闲则从 bump 线性切分：用户区落在级尺寸边界上，
         // 前置头部空间不破坏用户对齐；真实跨度（含间隙）入账。

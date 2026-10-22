@@ -198,6 +198,15 @@ public:
     /// \brief 全表扫描（`Scan` 的无界便捷形式）。
     Result<std::vector<std::vector<ColumnValue>>> ScanAll(const TableHandle& table);
 
+    /// \brief 有上限的范围扫描（分页用；语义同 `Scan`）。
+    ///
+    /// 最多返回 `max_rows` 行；`*out_more` 表示区间内仍有未读取行。
+    /// 服务端 SCAN_PAGE 以"上一页末行主键（开区间）"续扫，单页成本
+    /// O(log N + page_rows)，避免原实现每页重扫剩余全表的 O(N²)。
+    Result<std::vector<std::vector<ColumnValue>>> ScanLimited(const TableHandle& table,
+                                                              const KeyRange& range,
+                                                              size_t max_rows, bool* out_more);
+
     // ------------------ 原子批量（M1-W4）------------------
     /// \brief 原子批量操作单元（`ExecuteBatch` 入参）。
     ///

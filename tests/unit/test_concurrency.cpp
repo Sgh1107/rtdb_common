@@ -122,4 +122,57 @@ TEST_F(EngineConcurrencyTest, ConcurrentFirstAccessOfStores) {
     }
 }
 
+/// P0-1 回归：并发 Upsert 的读-改-写必须原子。
+///
+/// 两个写者各自只提供一列（a / b），反复 upsert 同一主键。合并必须基于
+/// 锁内的最新行值：任一写者都不能用陈旧快照覆盖另一列的更新。修复前
+/// （存在性判定/读/写分别取锁）可观测到丢失更新。
+TEST_F(EngineConcurrencyTest, ConcurrentUpsertMergesWithoutLostUpdate) {
+    auto open = rtdb::Engine::Open(Opts());
+    ASSERT_TRUE(open.IsOk()) << rtdb::ErrorMessage(open.Error());
+    auto eng = open.TakeValue();
+
+    TableDef def;
+    def.name = "merge";
+    def.row_cap = 16;
+    def.columns.push_back({"id", DataType::kInt64, 0, false, false});
+    def.columns.push_back({"a", DataType::kInt64, 0, true, false});
+    def.columns.push_back({"b", DataType::kInt64, 0, true, false});
+    auto table_res = eng->CreateTable(def);
+    ASSERT_TRUE(table_res.IsOk());
+    const TableHandle table = table_res.Value();
+    ASSERT_TRUE(eng->Insert(table, {ColumnValue::Int(1), ColumnValue::Int(0),
+                                    ColumnValue::Int(0)})
+                    .IsOk());
+
+    std::atomic<int> errors{0};
+    std::thread ta([&] {
+        for (int i = 0; i < 200; ++i) {
+            auto r = eng->Upsert(table, {{"id", ColumnValue::Int(1)},
+                                         {"a", ColumnValue::Int(i + 1)}});
+            if (!r.IsOk()) ++errors;
+        }
+    });
+    std::thread tb([&] {
+        for (int i = 0; i < 200; ++i) {
+            auto r = eng->Upsert(table, {{"id", ColumnValue::Int(1)},
+                                         {"b", ColumnValue::Int(i + 1)}});
+            if (!r.IsOk()) ++errors;
+        }
+    });
+    ta.join();
+    tb.join();
+    EXPECT_EQ(errors.load(), 0);
+
+    auto got = eng->GetByKey(table, ColumnValue::Int(1));
+    ASSERT_TRUE(got.IsOk());
+    ASSERT_EQ(got.Value().size(), 3u);
+    EXPECT_GT(got.Value()[1].as_int(), 0);
+    EXPECT_GT(got.Value()[2].as_int(), 0);
+    // 行只应有一条（合并而非重复插入）。
+    auto scan = eng->ScanAll(table);
+    ASSERT_TRUE(scan.IsOk());
+    EXPECT_EQ(scan.Value().size(), 1u);
+}
+
 }  // namespace

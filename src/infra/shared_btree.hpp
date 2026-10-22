@@ -80,6 +80,22 @@ public:
         slot_->count = 0;
     }
 
+    /// \brief 释放全树节点并清空锚点（调用方须持根锁，且无并发读者）。
+    ///
+    /// 二级索引全量重建前调用：原实现 Reset 仅置根 0，旧节点永久不可达，
+    /// 每次 Open 重建都泄漏整棵树（映像持续增长）。这里按后序回收节点，
+    /// 使重建后的索引占用回到"当前数据规模"。
+    ///
+    /// 返回 kReadOnlyHandle（无分配器）时不改变锚点；深度异常按损坏处理，
+    /// 停止回收并清空锚点（宁可泄漏不越界）。
+    Err Destroy() noexcept {
+        if (alloc_ == nullptr) return Err::kReadOnlyHandle;
+        if (slot_->root_off != 0) FreeSubtree(slot_->root_off, 0);
+        slot_->root_off = 0;
+        slot_->count = 0;
+        return Err::kOk;
+    }
+
     /// 调试/测试：遍历全树校验结构不变量（层级单调、节点内严格递增、
     /// 容量上界、叶链完整、跨叶有序）。
     Err Validate(uint64_t* visited_nodes) const noexcept;
@@ -287,6 +303,16 @@ private:
     }
     const NodeHeader* Node(uint64_t off) const noexcept { return PtrOf<NodeHeader>(off); }
     NodeHeader* MutHeader(uint64_t off) const noexcept { return PtrOf<NodeHeader>(off); }
+
+    /// 后序回收子树（Destroy 专用；depth 防御树高异常）。
+    void FreeSubtree(uint64_t off, int depth) noexcept {
+        if (off == 0 || depth > 64) return;
+        const NodeHeader* n = Node(off);
+        if (n->leaf == 0) {
+            for (int i = 0; i <= n->count; ++i) FreeSubtree(ChildAt(off, i), depth + 1);
+        }
+        (void)alloc_->Deallocate(off);
+    }
     static int CapOf(const NodeHeader* n) noexcept { return n->leaf != 0 ? kCapLeaf : kCapInt; }
 
     /// 第 i 个槽的起始字节（内部=child0 之后第 i-1 槽？此处 i 从 0 计：

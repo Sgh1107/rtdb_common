@@ -586,6 +586,23 @@ ColumnValue TableStore::DecodeWalKey(const uint8_t* key8) const noexcept {
 
 // ------------------ WAL 先行协议：暂存（docs/08 §2-D2）------------------
 
+bool TableStore::FindFreeSlot(uint64_t* out) noexcept {
+    if (out == nullptr || desc_ == nullptr) return false;
+    const uint32_t used = desc_->row_count;
+    if (used == 0) return false;
+    if (free_scan_hint_ >= used) free_scan_hint_ = 0;
+    for (uint32_t n = 0; n < used; ++n) {
+        uint32_t i = free_scan_hint_ + n;
+        if (i >= used) i -= used;
+        if (!IsTombstoned(i)) continue;
+        if (staged_slots_.find(i) != staged_slots_.end()) continue;  // 同批已占用
+        *out = i;
+        free_scan_hint_ = (i + 1 < used) ? i + 1 : 0;
+        return true;
+    }
+    return false;
+}
+
 Err TableStore::StageInsert(const std::vector<ColumnValue>& row, StagedRowOp* out) noexcept {
     if (alloc_ == nullptr) return Err::kReadOnlyHandle;
     if (out == nullptr) return Err::kInvalidArgument;
@@ -603,12 +620,23 @@ Err TableStore::StageInsert(const std::vector<ColumnValue>& row, StagedRowOp* ou
     const Err uerr = CheckSecUnique(row, 0, false);
     if (!IsOk(uerr)) return uerr;
 
-    const uint64_t row_no = desc_->row_count;
-    if (row_no >= desc_->row_cap) return Err::kOutOfMemory;  // M1：行槽不复用
+    // 行槽分配（P0-3 修复）：优先复用墓碑槽位；否则追加高水位槽。
+    // 复用不改变 row_count；版本号必须在旧值上单调递增（否则 WAL 重放
+    // 按 row_ver 判重会跳过新插入，导致重放后行内容错位）。
+    uint64_t row_no = 0;
+    const bool reused = FindFreeSlot(&row_no);
+    if (!reused) {
+        row_no = desc_->row_count;
+        if (row_no >= desc_->row_cap) return Err::kOutOfMemory;
+    }
 
     out->kind = StagedRowOp::Kind::kInsert;
     out->row_no = row_no;
-    out->row_ver = 2;  // 首次发布：0 → 1(写入中) → 2(稳定)
+    // 版本号单调：新槽 0 → 2；复用槽在上一次生命周期版本上 +2（保持偶数）。
+    uint64_t base_ver = *VersionSlot(row_no);
+    if ((base_ver & 1u) != 0) ++base_ver;  // 残留奇数（崩溃写入中）先归偶
+    out->row_ver = base_ver + 2;
+    out->slot_reused = reused;
     out->old_rec.clear();
     out->allocated_vars.clear();
     out->wal_written = false;
@@ -619,7 +647,8 @@ Err TableStore::StageInsert(const std::vector<ColumnValue>& row, StagedRowOp* ou
         out->allocated_vars.clear();
         return build;
     }
-    desc_->row_count++;  // 行槽保留（应用失败由 ReleaseStaged 回退）
+    if (!reused) desc_->row_count++;  // 行槽保留（应用失败由 ReleaseStaged 回退）
+    staged_slots_.insert(row_no);
     return Err::kOk;
 }
 
@@ -729,6 +758,7 @@ Err TableStore::ApplyStaged(StagedRowOp* st) noexcept {
             // 空闲块（P0-2），且重放幂等跳过无法修复。
             st->published = true;
             st->allocated_vars.clear();  // 变长块所有权转移至行数据
+            staged_slots_.erase(st->row_no);  // 槽位已转为存活，不再可复用
             // 二级索引维护（W5-d）：主键发布后按整行当前状态建键；键含
             // row_no，同值多行自然并存（非唯一索引的自然形态）。失败上抛
             // 由调用方毒化——WAL 已先行，Open 重建自愈。
@@ -818,12 +848,22 @@ void TableStore::ReleaseStaged(StagedRowOp* st) noexcept {
         }
     }
     st->allocated_vars.clear();
-    // insert 行槽保留回退：仅当该槽未被已发布行接管（!published）且是最后
-    // 一次保留（LIFO）时严格成立；否则槽位作为"保留未用"遗留（不可达、
-    // 无害），随 M2 compact 收敛。published 情形若回退行槽，后续插入会
-    // 复用已发布行槽 → 键/数据错位（P0-2 的另一半）。
-    if (!st->published && st->kind == StagedRowOp::Kind::kInsert && desc_->row_count > 0 &&
-        st->row_no + 1 == desc_->row_count) {
+    // 插入占用的槽位登记总是清除（无论是否发布）。
+    if (st->kind == StagedRowOp::Kind::kInsert) staged_slots_.erase(st->row_no);
+    // 复用槽回滚：ApplyStaged 在发布点之前已清墓碑（SetTombstone(false)），
+    // 索引发布失败时行数据清零、版本归零。若不恢复墓碑，该槽既不在主键索引
+    // 中、也不再可复用，且破坏"空槽必墓碑 + committed_row_count == live"
+    // 不变量。WAL 已写的情形由重放重新物化该行（毒化后重启收敛）。
+    if (!st->published && st->slot_reused && st->kind == StagedRowOp::Kind::kInsert) {
+        SetTombstone(st->row_no, true);
+    }
+    // insert 行槽保留回退：仅当该槽未被已发布行接管（!published）、是
+    // 本进程追加的高水位槽（非复用墓碑槽）且是最后一次保留（LIFO）时
+    // 严格成立；否则槽位作为"保留未用"遗留（不可达、无害），随 compact
+    // 收敛。published 情形若回退行槽，后续插入会复用已发布行槽 →
+    // 键/数据错位（P0-2 的另一半）。
+    if (!st->published && !st->slot_reused && st->kind == StagedRowOp::Kind::kInsert &&
+        desc_->row_count > 0 && st->row_no + 1 == desc_->row_count) {
         desc_->row_count--;
     }
     st->rec.clear();
@@ -1158,9 +1198,10 @@ Err TableStore::RebuildSecondaryIndexes() noexcept {
     if (alloc_ == nullptr) return Err::kReadOnlyHandle;
     for (size_t i = 0; i < sec_meta_.size(); ++i) {
         SecIndexTree* tree = sec_trees_[i].get();
-        // 就地清空（根置零）：各进程缓存的树实例按同一 Slot 绑定，不可
-        // 更换锚点指针；旧节点不可达，待 M2 compact 回收。
-        tree->Reset();
+        // 先释放旧节点再重灌（P0-4）：Reset 仅断链会让每次 Open 泄漏整棵
+        // 旧索引树；Destroy 后序归还 slab 页，映像占用回到当前数据规模。
+        const Err de = tree->Destroy();
+        if (!IsOk(de)) return de;
         const Err e = PopulateSecondaryIndex(sec_meta_[i], tree);
         if (!IsOk(e)) return e;
     }
@@ -1258,6 +1299,12 @@ Result<std::vector<ColumnValue>> TableStore::Get(const ColumnValue& key) const n
 Result<std::vector<std::vector<ColumnValue>>> TableStore::Scan(const ColumnValue* lo, bool lo_incl,
                                                                const ColumnValue* hi,
                                                                bool hi_incl) const noexcept {
+    return ScanLimited(lo, lo_incl, hi, hi_incl, UINT64_MAX, nullptr);
+}
+
+Result<std::vector<std::vector<ColumnValue>>> TableStore::ScanLimited(
+    const ColumnValue* lo, bool lo_incl, const ColumnValue* hi, bool hi_incl, uint64_t max_rows,
+    bool* out_more) const noexcept {
     // 边界编码：nullptr = 无界 → 有序编码极值（包含性强制为闭）。
     char lo8[8];
     char hi8[8];
@@ -1277,8 +1324,13 @@ Result<std::vector<std::vector<ColumnValue>>> TableStore::Scan(const ColumnValue
     }
 
     std::vector<std::vector<ColumnValue>> out;
+    bool more = false;
     auto cur = index_->SeekRange(lo8, lo_incl, hi8, hi_incl);
     while (cur.Valid()) {
+        if (out.size() >= max_rows) {
+            more = true;  // 截断点仍有行：调用方续页
+            break;
+        }
         const uint64_t row_no = cur.Value();
         std::vector<ColumnValue> row;
         const Err e = ReadRow(row_no, &row);
@@ -1290,6 +1342,7 @@ Result<std::vector<std::vector<ColumnValue>>> TableStore::Scan(const ColumnValue
         // kNotFound/kTimeout：并发删除/更新中的行，缺席于本次近似扫描（M1）。
         cur.Next();
     }
+    if (out_more != nullptr) *out_more = more;
     return Result<std::vector<std::vector<ColumnValue>>>::Ok(std::move(out));
 }
 

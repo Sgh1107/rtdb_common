@@ -20,13 +20,16 @@
 ///    写入方先置奇数版本、改数据、再置偶数版本，读者最终复核保证不会采纳
 ///    半更新数据；变长内容即使被回收/复用，也会因版本不符被丢弃重读。
 ///
-/// M1 边界：行槽不复用（删除仅置墓碑，槽位回收归 compact）；主键限整数类
-/// 定长类型；单表行数据区受 `kMaxRowDataBytes` 约束（段目录化列 M2）。
+/// M1 边界：删除置墓碑，删除后的槽位由后续插入复用（P0-3；高水位
+/// `row_count` 不回落，槽位版本号跨生命周期单调递增以保 WAL 重放判重）；
+/// 主键限整数类定长类型；单表行数据区受 `kMaxRowDataBytes` 约束
+/// （段目录化列 M2）。
 
 #include <cstdint>
 #include <array>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "infra/shared_btree.hpp"
@@ -85,6 +88,8 @@ struct StagedRowOp {
     bool wal_written = false;
     /// 行数据/主键索引已发布（不可回滚）：ApplyStaged 内部在发布点置位。
     bool published = false;
+    /// 插入复用了墓碑槽位（P0-3）：ReleaseStaged 不得回退 row_count。
+    bool slot_reused = false;
 };
 
 /// \brief 单表行存储：格式化物理区 + 行级 CRUD + WAL 暂存/应用/重放。
@@ -136,6 +141,17 @@ public:
     Result<std::vector<std::vector<ColumnValue>>> Scan(const ColumnValue* lo, bool lo_incl,
                                                        const ColumnValue* hi,
                                                        bool hi_incl) const noexcept;
+
+    /// \brief 有上限的范围扫描（M4：分页 O(N²) 修复）。
+    ///
+    /// 与 `Scan` 同边界语义，但最多返回 `max_rows` 行；`*out_more` 表示
+    /// 区间内仍有未读取的行（保守判定：截断点处游标仍有效）。分页调用方
+    /// 以"上一页末行主键（开区间）"为下一页下界，单页成本 = O(log N +
+    /// page_rows)，而不是重扫剩余全表。
+    Result<std::vector<std::vector<ColumnValue>>> ScanLimited(const ColumnValue* lo, bool lo_incl,
+                                                              const ColumnValue* hi, bool hi_incl,
+                                                              uint64_t max_rows,
+                                                              bool* out_more) const noexcept;
 
     /// \brief 按主键整行覆盖更新（主键不可变更）。
     Err Update(const ColumnValue& key, const std::vector<ColumnValue>& row) noexcept;
@@ -272,6 +288,12 @@ private:
     /// 墓碑返回 kNotFound；重试耗尽返回 kTimeout（并发更新中）。
     Err ReadRow(uint64_t row_no, std::vector<ColumnValue>* out) const noexcept;
 
+    /// \brief 查找可复用的墓碑槽位（P0-3；扫描起点按上次命中推进）。
+    ///
+    /// 仅在根锁内调用：`staged_slots_` 记录本进程当前暂存中的槽位，
+    /// 防止同一批内两行复用同一槽位（暂存期槽位仍为墓碑态）。
+    bool FindFreeSlot(uint64_t* out) noexcept;
+
     // ------------------ 二级索引私有助手（W5-d）------------------
     /// 单索引的键条目（与 sec_meta_/sec_trees_ 平行对齐；present=false
     /// 表示该行此列值不出现在索引中——NULL/不可编码）。
@@ -318,6 +340,10 @@ private:
     /// 二级索引元数据（创建序）与树实例（平行；W5-d）。
     std::vector<shm_SecIdxMeta*> sec_meta_;
     std::vector<std::unique_ptr<SecIndexTree>> sec_trees_;
+    /// 本进程已暂存（尚未应用/释放）的插入槽位（P0-3 复用互斥）。
+    std::unordered_set<uint64_t> staged_slots_;
+    /// 墓碑槽位扫描起点（避免每次插入都从 0 扫描）。
+    uint32_t free_scan_hint_ = 0;
 };
 #if defined(_MSC_VER)
 #pragma warning(pop)
