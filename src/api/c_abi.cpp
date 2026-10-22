@@ -19,6 +19,11 @@
 #include <vector>
 
 #include "rtdb/rtdb.hpp"
+#include "rtdb/version.hpp"
+
+// ABI 版本单一真源校验（P2 修复）：两处宏曾分别为 1/2，导致按头文件
+// 判版的客户端与库实际符号集不一致。任何一侧漏改都在编译期暴露。
+static_assert(RTDB_ABI_VERSION == RTDB_ABI_VER, "RTDB_ABI_VERSION 与 RTDB_ABI_VER 必须一致");
 
 // ---- 不透明句柄的具体化（仅本 TU 可见）----
 struct rtdb_engine {
