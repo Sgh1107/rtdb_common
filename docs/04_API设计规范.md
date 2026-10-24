@@ -88,6 +88,11 @@ int32_t rtdb_abi_subscribe(void* h, const char* table_filter, uint64_t from_seq,
 /* … 错误码与枚举值与 C++ 侧一一对应，头文件单独发行 */
 ```
 
+> **现态（M3 起）**：`RTDB_ABI_VER = RTDB_ABI_VERSION = 2`（M3 追加订阅/会话
+> 符号族；v1 既有符号语义不变），`src/api/c_abi.cpp` 以 `static_assert` 校验
+> 两侧一致。**M4 不新增 C ABI 符号**（保持 v2 冻结；SQL 仅内嵌 C++ 面），
+> 详见 [docs/16 D6/D11](16_M4完善开发计划.md)。
+
 ## 5. 网络二进制协议 v1
 ```
 帧: [magic'RTDB'][ver u8][flags u8][session u32][func u16][payload_len u32][crc u32][payload]

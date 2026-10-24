@@ -30,13 +30,15 @@
 13. [M3 服务开发计划](docs/13_M3服务开发计划.md) —— rtdbd/协议/客户端/订阅周计划、D1~D8 决策与落地记录
 14. [M3 里程碑交付说明](docs/14_M3交付说明.md) —— M3 交付清单、出口标准对照、双机验收执行单与 CI/性能证据
 15. [M3 测试执行手册](docs/15_M3测试执行手册.md) —— 本机/双机/混沌/性能测试步骤、证据模板与排障
+16. [M4 完善开发计划](docs/16_M4完善开发计划.md) —— SQL 子集/Authz/PerfCounters/迁移工具/文档的 D1~D12 决策、W1~W4 周计划与 M3 收口清单
 
-## 当前状态（M0/M1/M2 已验收；M3 自动化面完成、双机待实测 · 2026-10-22）
+## 当前状态（M0/M1/M2 已验收；M3 自动化面完成、双机待实测；M4 计划已就绪 · 2026-10-24）
 
 platform/infra 全部组件、SharedBTree、Slab 分配器完成并通过 **M0 验收**（验收记录见 [docs/05 §3.1](docs/05_交付清单与里程碑计划.md)，里程碑交付说明见[docs/07](docs/07_M0里程碑交付说明.md)），里程碑标记 `m0`。
 **M1 引擎已验收关闭（2026-10-14，单测 113 用例）**：表目录（双 B+ 树 + 建删表事务）、行 CRUD（主键唯一索引 + 版本乐观读 + 墓碑删除）、WAL 组提交（影像内WalRing + 覆盖协议 + 三档 fsync + `ExecuteBatch` 原子批 + 崩溃恢复重放 +failpoint 注入）、冷快照、在线加列、范围扫描、二级索引框架——出口标准两条（kill -9 混沌 ×100 verify 100/100 PASS、CRUD 全链路单测绿）+ 覆盖率门禁（95.9%/91.0%/93.9%）+ bench 五项优于基线，四构建全绿零告警，证据见[docs/09](docs/09_M1交付说明.md)。
 **M2 接口已验收关闭（2026-10-17，单测 150 用例）**：NativeApi 收敛（伞头`rtdb/rtdb.hpp`、Options 对齐 docs/04、`TableDef` 扩展、`Row`/`TableHandle::Upsert`便利面、`Result` operator* 与 RTDB_CHECK/RTDB_ASSIGN_OR_MOVE）、**RecordBlock 列式批量**（`UpsertBatch` 三阶段原子块，8 列混合稳态 1.20~1.29M 行/s ≥1M 基线）、**C ABI v1 冻结**（`rtdb_cabi.h`，14 个 `rtdb_abi_` 符号，C99 demo + Python ctypes冒烟 20 项全过）——出口标准两条（《04》示例跑通、bench 嵌入达标）+ 覆盖率门禁（97.2%/89.9%/94.8%），四构建全绿零告警，证据见 [docs/11](docs/11_M2交付说明.md)。
-**M3 服务：自动化面完成（P0-5 后本机 248 用例；双机实测待执行）**：`rtdbd`（AUTH/会话 TTL/DDL/EXEC_BATCH/SCAN/SCAN_PAGE/SUBSCRIBE/FETCH_DELTA/优雅退出）、`rtdb_client`（请求面自动重连、订阅泵有序交付/续传/溢出重取、C ABI）、网络协议 v1（20B 帧头 + CRC）与 `bench_net`/进程级混沌用例。自动化面：历史 commit `3946c9c` **CI 五作业全绿**（[run 39110473803](https://github.com/Sgh1107/rtdb_common/actions/runs/39110473803)：双平台 + TSan + ASan/UBSan + 覆盖率 80% 门禁，全量 232/232）；P0/P1/P2 + P0-5 后本机 **248/248**（MSVC Release），混沌 ×20=40/40、回环吞吐 211k 行/s、本机订阅 P99=133.7µs，**CI 待最新提交复跑**。**M3 出口仅剩跨机两档实测**（双机 P99<50ms、千兆吞吐；执行单见 [docs/14 §5.1](docs/14_M3交付说明.md)），填数并复跑 CI 后打 `m3` tag；完整步骤见 [docs/15](docs/15_M3测试执行手册.md)。
+**M3 服务：自动化面完成（P0/P1/P0-5 加固后本机 248 用例；双机实测待执行）**：`rtdbd`（AUTH/会话 TTL/DDL/EXEC_BATCH/SCAN/SCAN_PAGE/SUBSCRIBE/FETCH_DELTA/优雅退出/握手与空闲超时/AUTH 退避）、`rtdb_client`（请求面自动重连、订阅泵有序交付/续传/溢出重取、C ABI）、网络协议 v1（20B 帧头 + CRC）与 `bench_net`/进程级混沌用例。自动化面：最新 commit `73504a7` **CI 五作业全绿**（[run 39734234285](https://github.com/Sgh1107/rtdb_common/actions/runs/39734234285)：双平台 + TSan + ASan/UBSan + 覆盖率 80% 门禁，全量 **248/248**）；P0-1~P0-5/P1-7/P1-8/P2 加固已落地（WAL 环容量可配 + 按需保留、行槽复用、二级索引重建回收、`ScanLimited` 分页 O(logN+page_rows)、C ABI v2），混沌 ×20=40/40、回环吞吐 211k 行/s、本机订阅 P99=133.7µs。**M3 出口仅剩跨机两档实测**（双机 P99<50ms、千兆吞吐；执行单见 [docs/14 §5.1](docs/14_M3交付说明.md)，步骤见 [docs/15](docs/15_M3测试执行手册.md)），填数后打 `m3` tag。
+**M4 完善计划已就绪（2026-10-24）**：SQL 单表子集、Authz（表级权限+审计）、PerfCounters（ADMIN/STATS + rtdbctl）、`migrate_from_psrtdb`、文档 C1~C5 的 D1~D12 决策与 W1~W4 周计划见 [docs/16](docs/16_M4完善开发计划.md)；M4 从 `m3` tag 基线启动。
 
 | 组件 | 位置 | 状态 |
 |---|---|---|
