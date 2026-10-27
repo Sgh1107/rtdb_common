@@ -61,6 +61,8 @@ const char* ErrorMessage(Err e) noexcept {
             return "authentication failed";
         case Err::kTokenExpired:
             return "session expired or invalid";
+        case Err::kPermissionDenied:
+            return "permission denied (no privilege for this table/operation)";
         default:
             break;
     }

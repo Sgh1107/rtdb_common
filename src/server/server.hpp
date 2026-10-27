@@ -44,7 +44,7 @@ public:
     /// 引擎句柄（生命周期 = Start..Stop；仅同进程测试/诊断用）。
     Engine* engine() noexcept;
 
-    /// 诊断计数（累计值，单调递增）。
+    /// 诊断计数（累计值，单调递增；M4 PerfCounters 的服务端门面）。
     struct Stats {
         uint64_t accepted = 0;        ///< 接受连接数（进入会话循环）
         uint64_t rejected_full = 0;   ///< 超会话上限拒绝数（404 应答后关闭）
@@ -53,6 +53,14 @@ public:
         uint64_t requests = 0;        ///< 已处理请求帧数
         uint64_t frame_errors = 0;    ///< 帧级违例（连接被关闭）
         uint64_t payload_errors = 0;  ///< 载荷级违例/业务错误应答数
+        // ---- M4（ADMIN/STATS 同源；docs/16 D3）----
+        uint64_t authz_denied = 0;        ///< 权限拒绝次数（审计）
+        uint64_t sessions_current = 0;    ///< 当前活跃会话数
+        uint64_t sessions_total = 0;      ///< 累计会话数
+        uint64_t handshake_timeouts = 0;  ///< 握手超时关闭数
+        uint64_t idle_timeouts = 0;       ///< 空闲超时关闭数
+        uint64_t auth_limit_closed = 0;   ///< AUTH 失败超限断连数
+        uint64_t admin_requests = 0;      ///< ADMIN/AUTHZ_ME 请求数
     };
     Stats stats() const noexcept;
 

@@ -29,6 +29,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -65,6 +66,39 @@ struct PingInfo {
     int64_t checkpoint_seq = -1;       ///< 检查点水位
     uint32_t session_ttl_ms = 0;       ///< 会话 TTL（毫秒）
 };
+
+#if defined(_MSC_VER)
+#pragma warning(push)
+// C4251: 公开聚合结构内含 STL 成员（与 Client 的 PImpl 策略一致；跨 DLL
+// 使用时要求同工具链/同 STL 版本，属既有客户端库 ABI 约定）。
+#pragma warning(disable : 4251)
+#endif
+
+/// 服务端监控计数快照（M4 ADMIN/STATS；docs/16 D3）。
+///
+/// key 为稳定指标名（`uptime_ms`/`requests`/`authz_denied`/`wal_*` 等，
+/// 口径见 C4 运维手册）。客户端按 `key` 取名，未知 key 保留 `unknown_<id>`
+/// 以便前向兼容（服务端 key 只增不改）。
+struct RTDB_CLIENT_API AdminStats {
+    std::map<std::string, uint64_t> values;
+
+    /// 取指标值；不存在返回 0（用 `Has` 区分"不存在"与"值为 0"）。
+    uint64_t Get(std::string_view key) const;
+    bool Has(std::string_view key) const;
+};
+
+/// 自身授权摘要（M4 AUTHZ_ME；docs/16 D2）。
+struct RTDB_CLIENT_API AuthzInfo {
+    std::string user;
+    bool admin = false;  ///< 管理面权限（隐含全部表/DDL 权限）
+    bool ddl = false;    ///< 建/删表、加列、二级索引
+    std::vector<std::string> read_tables;   ///< 表级读白名单（支持 `*`、`前缀*`）
+    std::vector<std::string> write_tables;  ///< 表级写白名单
+};
+
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 /// 表 schema 快照（DESCRIBE/扫描结果自描述面；列可空性与默认值不在
 /// 线格式内——M3 只交付名称/类型）。
@@ -130,6 +164,12 @@ public:
 
     /// 服务端活性/进度探询（读类；自动重连重发）。
     Result<PingInfo> Ping();
+
+    /// M4：服务端监控计数快照（读类；需 admin 权限，docs/16 D3）。
+    Result<AdminStats> GetServerStats();
+
+    /// M4：查询自身授权摘要（读类；任意已认证用户可调用，docs/16 D2）。
+    Result<AuthzInfo> GetAuthzInfo();
 
     /// 建表（写类）。
     Result<CreateTableInfo> CreateTable(const TableDef& def);

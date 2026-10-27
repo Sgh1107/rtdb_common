@@ -59,12 +59,44 @@ bool ParseFsync(std::string_view s, FsyncPolicy* out) noexcept {
     return false;
 }
 
-/// 解析 `user = <name> <64hex>` 一行。
+bool ValidTablePattern(std::string_view t) noexcept {
+    if (t.empty() || t.size() > 64) return false;
+    size_t n = t.size();
+    if (t[n - 1] == '*') --n;  // '*' 或 '前缀*'
+    for (size_t i = 0; i < n; ++i) {
+        const char c = t[i];
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+bool ParseTableList(std::string_view s, std::vector<std::string>* out) noexcept {
+    if (s.empty() || out == nullptr) return false;
+    size_t pos = 0;
+    for (;;) {
+        const size_t comma = s.find(',', pos);
+        const std::string_view one =
+            Trim(comma == std::string_view::npos ? s.substr(pos) : s.substr(pos, comma - pos));
+        if (!ValidTablePattern(one)) return false;
+        out->emplace_back(one);
+        if (comma == std::string_view::npos) break;
+        pos = comma + 1;
+    }
+    return true;
+}
+
+/// 解析 `user = <name> <64hex> [perm]` 一行（perm 为空 = M3 兼容 admin）。
 Err ParseUserLine(std::string_view value, UserEntry* out) {
     const size_t sp = value.find_first_of(" \t");
     if (sp == std::string_view::npos) return Err::kInvalidArgument;
     const std::string_view name = Trim(value.substr(0, sp));
-    const std::string_view hex = Trim(value.substr(sp + 1));
+    const std::string_view rest = Trim(value.substr(sp + 1));
+    const size_t sp2 = rest.find_first_of(" \t");
+    const std::string_view hex = Trim(sp2 == std::string_view::npos ? rest : rest.substr(0, sp2));
+    const std::string_view perm =
+        sp2 == std::string_view::npos ? std::string_view{} : Trim(rest.substr(sp2 + 1));
     if (name.empty() || name.size() > 64) return Err::kInvalidArgument;
     for (char c : name) {
         if (c == ' ' || c == '\t' || c == '=' || c == '#') return Err::kInvalidArgument;
@@ -72,10 +104,50 @@ Err ParseUserLine(std::string_view value, UserEntry* out) {
     out->name.assign(name);
     if (!infra::FromHex(hex, out->digest.data(), out->digest.size()))
         return Err::kInvalidArgument;
-    return Err::kOk;
+    return ParsePermissions(perm, &out->perms);
 }
 
 }  // namespace
+
+Err ParsePermissions(std::string_view spec, UserPerms* out) {
+    if (out == nullptr) return Err::kInvalidArgument;
+    *out = UserPerms{};
+    const std::string_view t = Trim(spec);
+    if (t.empty()) {  // M3 旧配置兼容：无权限规约 = admin
+        out->admin = true;
+        out->is_legacy = true;
+        return Err::kOk;
+    }
+    size_t pos = 0;
+    while (pos < t.size()) {
+        while (pos < t.size() && (t[pos] == ' ' || t[pos] == '\t')) ++pos;
+        if (pos >= t.size()) break;
+        size_t end = pos;
+        while (end < t.size() && t[end] != ' ' && t[end] != '\t') ++end;
+        const std::string_view tok = t.substr(pos, end - pos);
+        pos = end;
+        if (tok == "admin") {
+            out->admin = true;
+        } else if (tok == "ddl") {
+            out->ddl = true;
+        } else if (tok.size() > 3 && tok.substr(0, 3) == "rw:") {
+            if (!ParseTableList(tok.substr(3), &out->read_tables) ||
+                !ParseTableList(tok.substr(3), &out->write_tables))
+                return Err::kInvalidArgument;
+        } else if (tok.size() > 2 && tok.substr(0, 2) == "r:") {
+            if (!ParseTableList(tok.substr(2), &out->read_tables)) return Err::kInvalidArgument;
+        } else if (tok.size() > 2 && tok.substr(0, 2) == "w:") {
+            if (!ParseTableList(tok.substr(2), &out->write_tables)) return Err::kInvalidArgument;
+        } else {
+            return Err::kInvalidArgument;
+        }
+    }
+    // 权限规约存在但无任何有效项（例如仅空白）按非法处理，避免静默降权/提权。
+    if (!out->admin && !out->ddl && out->read_tables.empty() && out->write_tables.empty())
+        return Err::kInvalidArgument;
+    out->is_legacy = false;  // 显式声明：不再按 M3 admin 兼容
+    return Err::kOk;
+}
 
 Result<Config> ParseConfigText(std::string_view text) {
     Config cfg;

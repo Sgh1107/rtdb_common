@@ -643,6 +643,65 @@ std::string Client::last_error() const {
     return impl_->last_err;
 }
 
+namespace {
+
+/// STATS key → 稳定指标名（口径见 C4；未知 key 保留 unknown_<id> 前向兼容）。
+std::string StatsKeyName(uint16_t key) {
+    switch (key) {
+        case RTDB_STAT_UPTIME_MS:
+            return "uptime_ms";
+        case RTDB_STAT_ACCEPTED:
+            return "accepted";
+        case RTDB_STAT_REJECTED_FULL:
+            return "rejected_full";
+        case RTDB_STAT_AUTH_OK:
+            return "auth_ok";
+        case RTDB_STAT_AUTH_FAIL:
+            return "auth_fail";
+        case RTDB_STAT_REQUESTS:
+            return "requests";
+        case RTDB_STAT_FRAME_ERRORS:
+            return "frame_errors";
+        case RTDB_STAT_PAYLOAD_ERRORS:
+            return "payload_errors";
+        case RTDB_STAT_AUTHZ_DENIED:
+            return "authz_denied";
+        case RTDB_STAT_SESSIONS_CURRENT:
+            return "sessions_current";
+        case RTDB_STAT_SESSIONS_TOTAL:
+            return "sessions_total";
+        case RTDB_STAT_HANDSHAKE_TIMEOUTS:
+            return "handshake_timeouts";
+        case RTDB_STAT_IDLE_TIMEOUTS:
+            return "idle_timeouts";
+        case RTDB_STAT_AUTH_LIMIT_CLOSED:
+            return "auth_limit_closed";
+        case RTDB_STAT_ADMIN_REQUESTS:
+            return "admin_requests";
+        case RTDB_STAT_COMMITTED_SEQ:
+            return "committed_seq";
+        case RTDB_STAT_CHECKPOINT_SEQ:
+            return "checkpoint_seq";
+        case RTDB_STAT_WRITER_HEARTBEAT_NS:
+            return "writer_heartbeat_ns";
+        case RTDB_STAT_SESSION_TTL_MS:
+            return "session_ttl_ms";
+        default:
+            return "unknown_" + std::to_string(static_cast<unsigned>(key));
+    }
+}
+
+}  // namespace
+
+uint64_t AdminStats::Get(std::string_view key) const {
+    const auto it = values.find(std::string(key));
+    return it == values.end() ? 0 : it->second;
+}
+
+bool AdminStats::Has(std::string_view key) const {
+    return values.find(std::string(key)) != values.end();
+}
+
 Result<PingInfo> Client::Ping() {
     std::vector<uint8_t> out;
     const Err e = impl_->Request(RTDB_PF_PING, {}, Impl::Retry::kRead, &out);
@@ -655,6 +714,59 @@ Result<PingInfo> Client::Ping() {
     p.session_ttl_ms = r.U32();
     if (!r.Finish()) return Result<PingInfo>::Fail(Err::kProtocolError);
     return Result<PingInfo>::Ok(p);
+}
+
+Result<AdminStats> Client::GetServerStats() {
+    std::vector<uint8_t> body;
+    {
+        net::Writer w(&body);
+        w.U8(RTDB_ADMIN_STATS);
+    }
+    std::vector<uint8_t> out;
+    const Err e = impl_->Request(RTDB_PF_ADMIN, body, Impl::Retry::kRead, &out);
+    if (e != Err::kOk) return Result<AdminStats>::Fail(e);
+    net::Reader r(out.data(), out.size());
+    const uint16_t ver = r.U16();
+    const uint32_t n = r.U32();
+    if (!r.ok() || ver != RTDB_STATS_VERSION) return Result<AdminStats>::Fail(Err::kProtocolError);
+    AdminStats st;
+    for (uint32_t i = 0; i < n && r.ok(); ++i) {
+        const uint16_t key = r.U16();
+        const uint64_t val = r.U64();
+        if (!r.ok()) return Result<AdminStats>::Fail(Err::kProtocolError);
+        st.values[StatsKeyName(key)] = val;
+    }
+    if (!r.Finish()) return Result<AdminStats>::Fail(Err::kProtocolError);
+    return Result<AdminStats>::Ok(std::move(st));
+}
+
+Result<AuthzInfo> Client::GetAuthzInfo() {
+    std::vector<uint8_t> out;
+    const Err e = impl_->Request(RTDB_PF_AUTHZ_ME, {}, Impl::Retry::kRead, &out);
+    if (e != Err::kOk) return Result<AuthzInfo>::Fail(e);
+    net::Reader r(out.data(), out.size());
+    AuthzInfo info;
+    if (!r.Str(&info.user)) return Result<AuthzInfo>::Fail(Err::kProtocolError);
+    const uint8_t flags = r.U8();
+    if (!r.ok()) return Result<AuthzInfo>::Fail(Err::kProtocolError);
+    info.admin = (flags & RTDB_AUTHZ_FLAG_ADMIN) != 0;
+    info.ddl = (flags & RTDB_AUTHZ_FLAG_DDL) != 0;
+    const uint32_t n_r = r.U32();
+    if (!r.ok() || n_r > 4096) return Result<AuthzInfo>::Fail(Err::kProtocolError);
+    for (uint32_t i = 0; i < n_r; ++i) {
+        std::string t;
+        if (!r.Str(&t)) return Result<AuthzInfo>::Fail(Err::kProtocolError);
+        info.read_tables.push_back(std::move(t));
+    }
+    const uint32_t n_w = r.U32();
+    if (!r.ok() || n_w > 4096) return Result<AuthzInfo>::Fail(Err::kProtocolError);
+    for (uint32_t i = 0; i < n_w; ++i) {
+        std::string t;
+        if (!r.Str(&t)) return Result<AuthzInfo>::Fail(Err::kProtocolError);
+        info.write_tables.push_back(std::move(t));
+    }
+    if (!r.Finish()) return Result<AuthzInfo>::Fail(Err::kProtocolError);
+    return Result<AuthzInfo>::Ok(std::move(info));
 }
 
 Result<CreateTableInfo> Client::CreateTable(const TableDef& def) {

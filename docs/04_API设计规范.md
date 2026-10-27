@@ -99,6 +99,7 @@ int32_t rtdb_abi_subscribe(void* h, const char* table_filter, uint64_t from_seq,
 会话: AUTH(user,pass_sha256,salt) → token(有效期+滚动续期)
 功能号: AUTH=1 PING=2 DDL=10 EXEC_BATCH=11 SCAN=12 SCAN_PAGE=13
         SUBSCRIBE=20 FETCH_DELTA=21 ACK=22 UNREGISTER=23
+        ADMIN=40 AUTHZ_ME=41（M4 只增：STATS/AUTHZ_SHOW 与自身权限摘要）
 FETCH_DELTA 请求携带 (from_seq, max_bytes)；服务端按 ChangeLog 区间回放，
 包内附 last_seq 便于客户端推进游标。落后过深返回 ERR_CURSOR_OVERFLOW，
 客户端降级整表 SCAN+重置游标。
@@ -116,7 +117,19 @@ FETCH_DELTA 请求携带 (from_seq, max_bytes)；服务端按 ChangeLog 区间�
 > = 最后一条被编码变更的 seq（无变更时 = from；批标记 BEGIN/COMMIT 不产生
 > 事件 ⇒ 订阅交付水位可与 committed 相差若干记录，不能直接比齐）。会话：
 > AUTH 摘要 = SHA-256(配置盐 ‖ 口令)，token 带 TTL 与滚动续期；错误码
-> 以 `RTDB_E_*` 常量为准（101/102/107/303/400/401/402/403/404/501/502）。
+> 以 `RTDB_E_*` 常量为准（101/102/107/303/400/401/402/403/404/501/502；
+> M4 追加 503 = 权限拒绝）。
+>
+> **M4 as-built（2026-10-27，docs/16 D2/D3）**：新增 `ADMIN=40`（载荷首字节
+> 子操作：`1`=STATS、`2`=AUTHZ_SHOW）与 `AUTHZ_ME=41`（任意已认证用户）。
+> STATS 应答 = `[u16 ver=1][u32 n][(u16 key)(u64 value)]*`（键 1~19：
+> uptime/accepted/rejected_full/auth_ok/auth_fail/requests/frame_errors/
+> payload_errors/authz_denied/sessions_current/sessions_total/
+> handshake_timeouts/idle_timeouts/auth_limit_closed/admin_requests/
+> committed_seq/checkpoint_seq/writer_heartbeat_ns/session_ttl_ms）；
+> AUTHZ_ME/AUTHZ_SHOW 每用户 = `[Str user][u8 flags(bit0 admin,bit1 ddl)]
+> [u32 n_r][Str]*[u32 n_w][Str]*`。AUTH 响应不变；既有 func/payload 不改
+> （v1 只增不改），旧客户端连新服务端行为不变。
 
 ## 6. 命名与工程规范
 - 代码：Google 风格基线；公共头 `include/rtdb/*.hpp`；内部头不出库；

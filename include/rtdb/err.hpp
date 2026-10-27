@@ -53,11 +53,13 @@ enum class Err : int16_t {
     kProtocolError = 403,
     /// 服务端会话数达到上限，拒绝新连接（docs/13 §3-D3）。
     kTooManySessions = 404,
-    // ---- 5xx 权限（M3 认证最小面，docs/13 §3-D6）----
+    // ---- 5xx 权限（M3 认证最小面 + M4 Authz，docs/16 D2）----
     /// 认证失败（用户不存在或凭据不符）。
     kAuthFailed = 501,
     /// 会话无效/过期（须重新 AUTH）。
     kTokenExpired = 502,
+    /// 已认证但无操作权限（表级 r/w、DDL 或管理面；docs/16 D1/D2）。
+    kPermissionDenied = 503,
     // ---- 兜底 ----
     kInternal = 999,
 };

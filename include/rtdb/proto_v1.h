@@ -50,6 +50,39 @@
 #define RTDB_PF_FETCH_DELTA 21u
 #define RTDB_PF_ACK 22u
 #define RTDB_PF_UNREGISTER 23u
+/* M4 管理面（docs/16 D2/D3；只增不改）：
+ * ADMIN 载荷首字节 = 子操作；STATS 应答 = [u16 ver][u32 n][(u16 key)(u64 value)]*；
+ * AUTHZ_ME 应答 = [Str user][u8 flags][u32 n_r][Str]*[u32 n_w][Str]*。 */
+#define RTDB_PF_ADMIN 40u
+#define RTDB_PF_AUTHZ_ME 41u
+#define RTDB_ADMIN_STATS 1u
+#define RTDB_ADMIN_AUTHZ_SHOW 2u
+
+/* ---- AUTHZ 标志位（AUTHZ_ME/AUTHZ_SHOW）---- */
+#define RTDB_AUTHZ_FLAG_ADMIN 0x01u
+#define RTDB_AUTHZ_FLAG_DDL 0x02u
+
+/* ---- STATS 版本与键（u16 key；C4 文档逐项口径）---- */
+#define RTDB_STATS_VERSION 1u
+#define RTDB_STAT_UPTIME_MS 1u
+#define RTDB_STAT_ACCEPTED 2u
+#define RTDB_STAT_REJECTED_FULL 3u
+#define RTDB_STAT_AUTH_OK 4u
+#define RTDB_STAT_AUTH_FAIL 5u
+#define RTDB_STAT_REQUESTS 6u
+#define RTDB_STAT_FRAME_ERRORS 7u
+#define RTDB_STAT_PAYLOAD_ERRORS 8u
+#define RTDB_STAT_AUTHZ_DENIED 9u
+#define RTDB_STAT_SESSIONS_CURRENT 10u
+#define RTDB_STAT_SESSIONS_TOTAL 11u
+#define RTDB_STAT_HANDSHAKE_TIMEOUTS 12u
+#define RTDB_STAT_IDLE_TIMEOUTS 13u
+#define RTDB_STAT_AUTH_LIMIT_CLOSED 14u
+#define RTDB_STAT_ADMIN_REQUESTS 15u
+#define RTDB_STAT_COMMITTED_SEQ 16u
+#define RTDB_STAT_CHECKPOINT_SEQ 17u
+#define RTDB_STAT_WRITER_HEARTBEAT_NS 18u
+#define RTDB_STAT_SESSION_TTL_MS 19u
 
 /* ---- DDL 子操作（RTDB_PF_DDL 载荷首字节）---- */
 #define RTDB_DDL_CREATE_TABLE 1u
@@ -94,6 +127,7 @@
 #define RTDB_E_TOO_MANY_SESSIONS 404
 #define RTDB_E_AUTH_FAILED 501
 #define RTDB_E_TOKEN_EXPIRED 502
+#define RTDB_E_PERMISSION_DENIED 503
 
 /* ---- 连接默认值 ---- */
 #define RTDB_PROTO_DEFAULT_PORT 7878

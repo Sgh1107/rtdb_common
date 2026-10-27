@@ -24,11 +24,36 @@
 namespace rtdb {
 namespace server {
 
+/// 用户权限（M4 Authz，docs/16 D1）：
+///  - admin：管理面（ADMIN/STATS/AUTHZ_SHOW）+ 隐含全部 ddl/r/w；
+///  - ddl：建/删表、加列、二级索引；
+///  - read_tables / write_tables：表级读/写白名单，支持 `*` 与 `prefix*`。
+struct UserPerms {
+    bool admin = false;
+    bool ddl = false;
+    std::vector<std::string> read_tables;
+    std::vector<std::string> write_tables;
+    /// M3 旧配置/程序化构造未显式声明权限时保持 admin 兼容语义
+    /// （显式权限规约解析后置 false；见 ParsePermissions）。
+    bool is_legacy = true;
+};
+
 /// 内联用户表项。
 struct UserEntry {
     std::string name;
     std::array<uint8_t, infra::kSha256DigestBytes> digest{};
+    /// 空权限规约（M3 旧配置 `user = name digest`）解析为 admin，保持
+    /// M3 脚本/测试/双机演示兼容（docs/16 D1）。
+    UserPerms perms;
 };
+
+/// 解析权限规约（配置文件 `user = <name> <64hex> [perm]` 的 perm 部分，
+/// 以及 CLI `--user name=64hex#perm`）。语法：
+///   perm := token [(' '|'\t') token]*；token ∈
+///           `admin` | `ddl` | `r:<tables>` | `w:<tables>` | `rw:<tables>`
+///   <tables> := table[','table]*；table = 名称、`*` 或 `前缀*`
+/// 空输入 = 旧配置兼容（admin）。非法 token/空表名 → kInvalidArgument。
+Err ParsePermissions(std::string_view spec, UserPerms* out);
 
 /// rtdbd 运行配置。
 struct Config {

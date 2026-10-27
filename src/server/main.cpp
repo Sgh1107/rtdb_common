@@ -55,7 +55,9 @@ BOOL WINAPI ConsoleHandler(DWORD type) {
 void PrintUsage() {
     std::fprintf(stderr,
                  "用法：rtdbd --config <cfg> [--listen HOST:PORT] [--path IMG] [--instance NAME]\n"
-                 "             [--auth-salt SALT] [--user NAME=64HEX]... [--exit-after-ms N]\n"
+                 "             [--auth-salt SALT] [--user NAME=64HEX[#PERM]]... [--exit-after-ms N]\n"
+                 "      PERM = admin | ddl | r:<tables> | w:<tables> | rw:<tables>（空格分隔多项；\n"
+                 "             缺省 = M3 兼容 admin）\n"
                  "      rtdbd --hash-password PASSWORD [--salt SALT]\n");
 }
 
@@ -185,16 +187,29 @@ int main(int argc, char** argv) {
     if (!instance.empty()) cfg.instance = instance;
     if (auth_salt_set) cfg.auth_salt = auth_salt;
     for (const std::string& u : users) {
-        const size_t sep = u.find_first_of("=:");
+        // 语法：NAME=64HEX[#PERM]（'#' 后为权限规约，见 PrintUsage）。
+        std::string head = u;
+        std::string perm_spec;
+        const size_t hash = head.find('#');
+        if (hash != std::string::npos) {
+            perm_spec = head.substr(hash + 1);
+            head.resize(hash);
+        }
+        const size_t sep = head.find_first_of("=:");
         if (sep == std::string::npos || sep == 0) {
-            std::fprintf(stderr, "非法 --user（期望 NAME=64HEX）：%s\n", u.c_str());
+            std::fprintf(stderr, "非法 --user（期望 NAME=64HEX[#PERM]）：%s\n", u.c_str());
             return 2;
         }
         rtdb::server::UserEntry e;
-        e.name = u.substr(0, sep);
-        if (!rtdb::infra::FromHex(std::string_view(u).substr(sep + 1), e.digest.data(),
+        e.name = head.substr(0, sep);
+        if (!rtdb::infra::FromHex(std::string_view(head).substr(sep + 1), e.digest.data(),
                                   e.digest.size())) {
             std::fprintf(stderr, "非法 --user 摘要（须 64 位十六进制）：%s\n", u.c_str());
+            return 2;
+        }
+        const rtdb::Err pe = rtdb::server::ParsePermissions(perm_spec, &e.perms);
+        if (!rtdb::IsOk(pe)) {
+            std::fprintf(stderr, "非法 --user 权限规约：%s\n", u.c_str());
             return 2;
         }
         cfg.users.push_back(std::move(e));

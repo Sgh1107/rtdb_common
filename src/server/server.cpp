@@ -23,6 +23,8 @@
 #include "rtdb/column_value.hpp"
 #include "rtdb/proto_v1.h"
 #include "rtdb/table_def.hpp"
+#include "server/authz.hpp"
+#include "server/perf.hpp"
 
 namespace rtdb {
 namespace server {
@@ -75,6 +77,9 @@ struct SessionState {
     uint64_t last_acked_seq = 0;     ///< 客户端 ACK 水位（诊断账本）
     uint64_t next_page_id = 0;
     uint32_t auth_failures = 0;      ///< 本连接累计 AUTH 失败次数（P1-7 限速）
+    /// AUTH 成功绑定的用户（指向 Impl::cfg.users 元素；Start 后冻结，连接
+    /// 生命周期内有效）。未认证/旧会话重认证失败时保持原值。
+    const UserEntry* user = nullptr;
     std::unique_ptr<ChangeCursor> cursor;
     std::map<uint64_t, Page> pages;
 };
@@ -133,13 +138,10 @@ struct Server::Impl {
     std::mutex rng_mu;
     std::mt19937_64 rng;
 
-    std::atomic<uint64_t> stat_accepted{0};
-    std::atomic<uint64_t> stat_rejected_full{0};
-    std::atomic<uint64_t> stat_auth_ok{0};
-    std::atomic<uint64_t> stat_auth_fail{0};
-    std::atomic<uint64_t> stat_requests{0};
-    std::atomic<uint64_t> stat_frame_errors{0};
-    std::atomic<uint64_t> stat_payload_errors{0};
+    /// M4 PerfCounters：进程内原子计数（docs/16 D3），热路径无锁。
+    PerfCounters perf;
+    /// 进程运行起点（STATS uptime 口径）。
+    uint64_t start_ns = 0;
 
     Impl() {
         std::random_device rd;
@@ -173,7 +175,31 @@ struct Server::Impl {
         std::lock_guard<std::mutex> lk(conn_mu);
         if (live_threads > 0) --live_threads;
         if (is_session && live_sessions > 0) --live_sessions;
+        if (is_session) perf.sessions_current.fetch_sub(1, std::memory_order_relaxed);
         conn_cv.notify_all();
+    }
+
+    // ---- M4 Authz 权限门（docs/16 D2）----
+    /// 权限拒绝统一出口：审计计数 + kPermissionDenied（503）。
+    Err DenyAuthz() noexcept {
+        perf.authz_denied.fetch_add(1, std::memory_order_relaxed);
+        return Err::kPermissionDenied;
+    }
+    Err RequireRead(const SessionState& st, std::string_view table) noexcept {
+        if (st.user == nullptr) return Err::kTokenExpired;
+        return CanRead(*st.user, table) ? Err::kOk : DenyAuthz();
+    }
+    Err RequireWrite(const SessionState& st, std::string_view table) noexcept {
+        if (st.user == nullptr) return Err::kTokenExpired;
+        return CanWrite(*st.user, table) ? Err::kOk : DenyAuthz();
+    }
+    Err RequireDdl(const SessionState& st) noexcept {
+        if (st.user == nullptr) return Err::kTokenExpired;
+        return CanDdl(*st.user) ? Err::kOk : DenyAuthz();
+    }
+    Err RequireAdmin(const SessionState& st) noexcept {
+        if (st.user == nullptr) return Err::kTokenExpired;
+        return CanAdmin(*st.user) ? Err::kOk : DenyAuthz();
     }
 
     // ---- 表元数据 ----
@@ -196,13 +222,17 @@ struct Server::Impl {
     void RejectLoop(platform::TcpSocket sock);
 
     // ---- 请求分派 ----
+    /// AUTHZ 摘要编码（AUTHZ_ME/AUTHZ_SHOW 共用，docs/16 D3 布局）：
+    /// `[Str user][u8 flags][u32 n_r][Str]*[u32 n_w][Str]*`。
+    void EncodeAuthz(const UserEntry& user, net::Writer& w) const;
+
     Err Dispatch(SessionState& st, const net::FrameHeader& h, const uint8_t* payload,
                  size_t len, std::vector<uint8_t>* body);
     Err DoAuth(SessionState& st, net::Reader& r, std::vector<uint8_t>* body);
     Err DoPing(net::Reader& r, std::vector<uint8_t>* body);
-    Err DoDdl(net::Reader& r, std::vector<uint8_t>* body);
-    Err DoExecBatch(net::Reader& r, std::vector<uint8_t>* body);
-    Err DoScan(net::Reader& r, std::vector<uint8_t>* body);
+    Err DoDdl(SessionState& st, net::Reader& r, std::vector<uint8_t>* body);
+    Err DoExecBatch(SessionState& st, net::Reader& r, std::vector<uint8_t>* body);
+    Err DoScan(SessionState& st, net::Reader& r, std::vector<uint8_t>* body);
     Err DoScanPage(SessionState& st, net::Reader& r, std::vector<uint8_t>* body);
     Err FetchPageSlice(SessionState::Page& p, std::vector<std::vector<ColumnValue>>* rows,
                        bool* done);
@@ -210,6 +240,10 @@ struct Server::Impl {
     Err DoFetchDelta(SessionState& st, net::Reader& r, std::vector<uint8_t>* body);
     Err DoAck(SessionState& st, net::Reader& r);
     Err DoUnregister(SessionState& st, net::Reader& r);
+    /// M4 管理面（仅 admin）：STATS / AUTHZ_SHOW（docs/16 D3）。
+    Err DoAdmin(SessionState& st, net::Reader& r, std::vector<uint8_t>* body);
+    /// M4 自身权限查询（任意已认证用户）：不吃 admin 门。
+    Err DoAuthzMe(SessionState& st, net::Reader& r, std::vector<uint8_t>* body);
 };
 
 void Server::Impl::AcceptLoop() {
@@ -232,10 +266,12 @@ void Server::Impl::AcceptLoop() {
             if (!over) ++live_sessions;
         }
         if (over) {
-            stat_rejected_full++;
+            perf.rejected_full.fetch_add(1, std::memory_order_relaxed);
             std::thread(&Server::Impl::RejectLoop, this, std::move(sock)).detach();
         } else {
-            stat_accepted++;
+            perf.accepted.fetch_add(1, std::memory_order_relaxed);
+            perf.sessions_current.fetch_add(1, std::memory_order_relaxed);
+            perf.sessions_total.fetch_add(1, std::memory_order_relaxed);
             std::thread(&Server::Impl::SessionLoop, this, std::move(sock)).detach();
         }
     }
@@ -277,12 +313,12 @@ void Server::Impl::SessionLoop(platform::TcpSocket sock) {
         if (st.id == 0 && cfg.handshake_timeout_ms != 0 &&
             now - connected_ns >
                 static_cast<uint64_t>(cfg.handshake_timeout_ms) * 1000000ull) {
-            stat_frame_errors++;
+            perf.handshake_timeouts.fetch_add(1, std::memory_order_relaxed);
             break;
         }
         if (cfg.idle_timeout_ms != 0 &&
             now - last_rx_ns > static_cast<uint64_t>(cfg.idle_timeout_ms) * 1000000ull) {
-            stat_frame_errors++;
+            perf.idle_timeouts.fetch_add(1, std::memory_order_relaxed);
             break;
         }
 
@@ -291,26 +327,26 @@ void Server::Impl::SessionLoop(platform::TcpSocket sock) {
         const Err fe = net::ReadFrame(sock, cfg.max_payload_bytes, &h, &payload);
         if (fe == Err::kTimeout) continue;
         if (!IsOk(fe)) {
-            stat_frame_errors++;  // 帧级违例/EOF：流不可再信任，关闭连接
+            perf.frame_errors.fetch_add(1, std::memory_order_relaxed);  // 帧级违例/EOF
             break;
         }
         last_rx_ns = SteadyNowNs();
         if (h.flags != 0) {
-            stat_frame_errors++;  // 请求帧不得携带应答位
+            perf.frame_errors.fetch_add(1, std::memory_order_relaxed);  // 请求帧携带应答位
             break;
         }
 
-        stat_requests++;
+        perf.requests.fetch_add(1, std::memory_order_relaxed);
         body.clear();
         const Err re = Dispatch(st, h, payload.data(), payload.size(), &body);
-        if (!IsOk(re)) stat_payload_errors++;
+        if (!IsOk(re)) perf.payload_errors.fetch_add(1, std::memory_order_relaxed);
         bool close_after = false;
         uint64_t auth_delay_ms = 0;
         if (re == Err::kAuthFailed) {
             // P1-7：失败计数 + 线性退避，抬高在线暴力猜解成本；达到上限
             // 先回完本次 501 再断连（客户端需重新建连）。
             if (st.auth_failures >= cfg.max_auth_failures) {
-                stat_frame_errors++;
+                perf.auth_limit_closed.fetch_add(1, std::memory_order_relaxed);
                 close_after = true;
             } else {
                 uint64_t delay = static_cast<uint64_t>(cfg.auth_backoff_ms) * st.auth_failures;
@@ -403,11 +439,11 @@ Err Server::Impl::Dispatch(SessionState& st, const net::FrameHeader& h,
         case RTDB_PF_PING:
             return DoPing(r, body);
         case RTDB_PF_DDL:
-            return DoDdl(r, body);
+            return DoDdl(st, r, body);
         case RTDB_PF_EXEC_BATCH:
-            return DoExecBatch(r, body);
+            return DoExecBatch(st, r, body);
         case RTDB_PF_SCAN:
-            return DoScan(r, body);
+            return DoScan(st, r, body);
         case RTDB_PF_SCAN_PAGE:
             return DoScanPage(st, r, body);
         case RTDB_PF_SUBSCRIBE:
@@ -418,6 +454,10 @@ Err Server::Impl::Dispatch(SessionState& st, const net::FrameHeader& h,
             return DoAck(st, r);
         case RTDB_PF_UNREGISTER:
             return DoUnregister(st, r);
+        case RTDB_PF_ADMIN:
+            return DoAdmin(st, r, body);
+        case RTDB_PF_AUTHZ_ME:
+            return DoAuthzMe(st, r, body);
         default:
             return Err::kNotImplemented;  // 未知功能号：400，不断连
     }
@@ -444,15 +484,16 @@ Err Server::Impl::DoAuth(SessionState& st, net::Reader& r, std::vector<uint8_t>*
     const bool ok = infra::ConstantTimeEqual(
         expect, reinterpret_cast<const uint8_t*>(digest.data()), infra::kSha256DigestBytes);
     if (!ok) {
-        stat_auth_fail++;
+        perf.auth_fail.fetch_add(1, std::memory_order_relaxed);
         if (st.auth_failures < UINT32_MAX) ++st.auth_failures;
         return Err::kAuthFailed;  // 501：凭据错误（连接保留，可重试）
     }
 
-    stat_auth_ok++;
+    perf.auth_ok.fetch_add(1, std::memory_order_relaxed);
     st.auth_failures = 0;
     st.id = NextSessionId();
     st.last_active_ns = SteadyNowNs();
+    st.user = found;  // M4：权限随 AUTH 绑定到会话（cfg.users 生命周期内稳定）
     st.cursor.reset();  // 重新认证：旧订阅/分页随身份重建
     st.sub_id = 0;
     st.pages.clear();
@@ -473,7 +514,7 @@ Err Server::Impl::DoPing(net::Reader& r, std::vector<uint8_t>* body) {
     return Err::kOk;
 }
 
-Err Server::Impl::DoDdl(net::Reader& r, std::vector<uint8_t>* body) {
+Err Server::Impl::DoDdl(SessionState& st, net::Reader& r, std::vector<uint8_t>* body) {
     const uint8_t sub = r.U8();
     if (!r.ok()) return Err::kProtocolError;
 
@@ -481,6 +522,8 @@ Err Server::Impl::DoDdl(net::Reader& r, std::vector<uint8_t>* body) {
         auto def = net::ReadTableDef(r);
         if (!def.IsOk()) return def.Error();
         if (!r.Finish()) return Err::kProtocolError;
+        const Err pe = RequireDdl(st);
+        if (!IsOk(pe)) return pe;
         auto t = engine->CreateTable(def.Value().def);
         if (!t.IsOk()) return t.Error();
         const TableHandle& th = t.Value();
@@ -494,6 +537,8 @@ Err Server::Impl::DoDdl(net::Reader& r, std::vector<uint8_t>* body) {
         std::string name;
         if (!r.Str(&name)) return Err::kProtocolError;
         if (!r.Finish()) return Err::kProtocolError;
+        const Err pe = RequireDdl(st);
+        if (!IsOk(pe)) return pe;
         // Result<void>::Error() 的契约是 !IsOk()（Debug/ASan 下断言），不可对
         // 成功结果调用；此处显式判成功，语义与 Release（err_ == kOk）一致。
         const auto drop_res = engine->DropTable(name);
@@ -503,6 +548,9 @@ Err Server::Impl::DoDdl(net::Reader& r, std::vector<uint8_t>* body) {
         std::string name;
         if (!r.Str(&name)) return Err::kProtocolError;
         if (!r.Finish()) return Err::kProtocolError;
+        // 描述表 = 元数据读：读权限或 DDL 权限均可（docs/16 D2）。
+        if (st.user == nullptr) return Err::kTokenExpired;
+        if (!CanRead(*st.user, name) && !CanDdl(*st.user)) return DenyAuthz();
         TableHandle th;
         std::vector<ColumnDef> cols;
         const Err e = DescribeByName(name, &th, &cols);
@@ -516,7 +564,8 @@ Err Server::Impl::DoDdl(net::Reader& r, std::vector<uint8_t>* body) {
     return Err::kProtocolError;  // 未知子操作
 }
 
-Err Server::Impl::DoExecBatch(net::Reader& r, std::vector<uint8_t>* body) {
+Err Server::Impl::DoExecBatch(SessionState& st, net::Reader& r,
+                              std::vector<uint8_t>* body) {
     const uint8_t mode = r.U8();
     if (!r.ok()) return Err::kProtocolError;
 
@@ -536,6 +585,9 @@ Err Server::Impl::DoExecBatch(net::Reader& r, std::vector<uint8_t>* body) {
             const uint8_t op_type = r.U8();
             std::string table;
             if (!r.Str(&table)) return Err::kProtocolError;
+            // M4 Authz：写类批操作逐表校验写权限（批内任意表被拒 → 整批零副作用）。
+            const Err pe = RequireWrite(st, table);
+            if (!IsOk(pe)) return pe;
 
             auto it = cache.find(table);
             if (it == cache.end()) {
@@ -580,6 +632,9 @@ Err Server::Impl::DoExecBatch(net::Reader& r, std::vector<uint8_t>* body) {
         auto blk = net::ReadBlock(r);
         if (!blk.IsOk()) return blk.Error();
         if (!r.Finish()) return Err::kProtocolError;
+        // M4 Authz：块写按目标表校验写权限（docs/16 D2）。
+        const Err pe = RequireWrite(st, blk.Value().View().table_name);
+        if (!IsOk(pe)) return pe;
         const auto upsert_res = engine->UpsertBatch(blk.Value().View());
         if (!upsert_res.IsOk()) return upsert_res.Error();
         net::Writer w(body);
@@ -589,9 +644,13 @@ Err Server::Impl::DoExecBatch(net::Reader& r, std::vector<uint8_t>* body) {
     return Err::kProtocolError;  // 未知模式
 }
 
-Err Server::Impl::DoScan(net::Reader& r, std::vector<uint8_t>* body) {
+Err Server::Impl::DoScan(SessionState& st, net::Reader& r,
+                         std::vector<uint8_t>* body) {
     std::string table;
     if (!r.Str(&table)) return Err::kProtocolError;
+    // M4 Authz：表数据读需要表级读权限（admin 或 r 白名单）。
+    const Err pe = RequireRead(st, table);
+    if (!IsOk(pe)) return pe;
 
     Engine::KeyRange range;
     for (int side = 0; side < 2; ++side) {
@@ -661,6 +720,10 @@ Err Server::Impl::DoScanPage(SessionState& st, net::Reader& r, std::vector<uint8
         if (!r.Str(&table)) return Err::kProtocolError;
         const uint32_t page_rows = r.U32();
         if (!r.Finish()) return Err::kProtocolError;
+        // M4 Authz：分页扫描同样按表级读权限（FETCH/CLOSE 由会话内页句柄
+        // 保证与 OPEN 时的授权一致，不再重复校验）。
+        const Err pe = RequireRead(st, table);
+        if (!IsOk(pe)) return pe;
         if (page_rows == 0 || page_rows > kMaxPageRows) return Err::kInvalidArgument;
         if (st.pages.size() >= kMaxPagesPerSession) return Err::kLimitExceeded;
 
@@ -728,6 +791,18 @@ Err Server::Impl::DoSubscribe(SessionState& st, net::Reader& r, std::vector<uint
         names.push_back(std::move(s));
     }
     if (!r.Finish()) return Err::kProtocolError;
+
+    // M4 Authz：订阅要求对全部目标表有读权限（空列表 = 全部活跃表，要求
+    // admin；否则按表逐个校验，任一拒绝即整次订阅失败）。
+    if (names.empty()) {
+        const Err pe = RequireAdmin(st);
+        if (!IsOk(pe)) return pe;
+    } else {
+        for (const std::string& name : names) {
+            const Err pe = RequireRead(st, name);
+            if (!IsOk(pe)) return pe;
+        }
+    }
 
     auto cur = engine->Subscribe(names);
     if (!cur.IsOk()) return cur.Error();
@@ -845,6 +920,87 @@ Err Server::Impl::DoUnregister(SessionState& st, net::Reader& r) {
     return Err::kOk;
 }
 
+// ---- M4 管理面 / 权限摘要（docs/16 D2/D3）----
+
+void Server::Impl::EncodeAuthz(const UserEntry& user, net::Writer& w) const {
+    w.Str(user.name);
+    uint8_t flags = 0;
+    if (user.perms.admin) flags |= RTDB_AUTHZ_FLAG_ADMIN;
+    if (user.perms.ddl) flags |= RTDB_AUTHZ_FLAG_DDL;
+    w.U8(flags);
+    w.U32(static_cast<uint32_t>(user.perms.read_tables.size()));
+    for (const std::string& t : user.perms.read_tables) w.Str(t);
+    w.U32(static_cast<uint32_t>(user.perms.write_tables.size()));
+    for (const std::string& t : user.perms.write_tables) w.Str(t);
+}
+
+Err Server::Impl::DoAdmin(SessionState& st, net::Reader& r, std::vector<uint8_t>* body) {
+    const uint8_t sub = r.U8();
+    if (!r.ok()) return Err::kProtocolError;
+    const Err pe = RequireAdmin(st);
+    if (!IsOk(pe)) return pe;
+    perf.admin_requests.fetch_add(1, std::memory_order_relaxed);
+
+    if (sub == RTDB_ADMIN_STATS) {
+        if (!r.Finish()) return Err::kProtocolError;
+        const uint64_t uptime_ms =
+            start_ns == 0 ? 0 : (SteadyNowNs() - start_ns) / 1000000ull;
+        struct KV {
+            uint16_t key;
+            uint64_t value;
+        };
+        const std::array<KV, 19> kv{{
+            {RTDB_STAT_UPTIME_MS, uptime_ms},
+            {RTDB_STAT_ACCEPTED, perf.accepted.load()},
+            {RTDB_STAT_REJECTED_FULL, perf.rejected_full.load()},
+            {RTDB_STAT_AUTH_OK, perf.auth_ok.load()},
+            {RTDB_STAT_AUTH_FAIL, perf.auth_fail.load()},
+            {RTDB_STAT_REQUESTS, perf.requests.load()},
+            {RTDB_STAT_FRAME_ERRORS, perf.frame_errors.load()},
+            {RTDB_STAT_PAYLOAD_ERRORS, perf.payload_errors.load()},
+            {RTDB_STAT_AUTHZ_DENIED, perf.authz_denied.load()},
+            {RTDB_STAT_SESSIONS_CURRENT, perf.sessions_current.load()},
+            {RTDB_STAT_SESSIONS_TOTAL, perf.sessions_total.load()},
+            {RTDB_STAT_HANDSHAKE_TIMEOUTS, perf.handshake_timeouts.load()},
+            {RTDB_STAT_IDLE_TIMEOUTS, perf.idle_timeouts.load()},
+            {RTDB_STAT_AUTH_LIMIT_CLOSED, perf.auth_limit_closed.load()},
+            {RTDB_STAT_ADMIN_REQUESTS, perf.admin_requests.load()},
+            {RTDB_STAT_COMMITTED_SEQ, static_cast<uint64_t>(engine->CommittedSeq())},
+            {RTDB_STAT_CHECKPOINT_SEQ, static_cast<uint64_t>(engine->CheckpointSeq())},
+            {RTDB_STAT_WRITER_HEARTBEAT_NS,
+             static_cast<uint64_t>(engine->WriterHeartbeatNs())},
+            {RTDB_STAT_SESSION_TTL_MS, static_cast<uint64_t>(cfg.session_ttl_ms)},
+        }};
+        net::Writer w(body);
+        w.U16(RTDB_STATS_VERSION);
+        w.U32(static_cast<uint32_t>(kv.size()));
+        for (const KV& e : kv) {
+            w.U16(e.key);
+            w.U64(e.value);
+        }
+        return Err::kOk;
+    }
+
+    if (sub == RTDB_ADMIN_AUTHZ_SHOW) {
+        if (!r.Finish()) return Err::kProtocolError;
+        net::Writer w(body);
+        w.U32(static_cast<uint32_t>(cfg.users.size()));
+        for (const UserEntry& u : cfg.users) EncodeAuthz(u, w);
+        return Err::kOk;
+    }
+    return Err::kProtocolError;  // 未知管理子操作
+}
+
+Err Server::Impl::DoAuthzMe(SessionState& st, net::Reader& r,
+                            std::vector<uint8_t>* body) {
+    if (st.user == nullptr) return Err::kTokenExpired;
+    if (!r.Finish()) return Err::kProtocolError;
+    perf.admin_requests.fetch_add(1, std::memory_order_relaxed);
+    net::Writer w(body);
+    EncodeAuthz(*st.user, w);
+    return Err::kOk;
+}
+
 // ============================================================
 // Server 门面
 // ============================================================
@@ -899,6 +1055,7 @@ Err Server::Start(const Config& cfg) {
     im.engine->RefreshWriterHeartbeat();
 
     im.stop.store(false);
+    im.start_ns = SteadyNowNs();
     im.running = true;
     im.accept_thread = std::thread(&Server::Impl::AcceptLoop, &im);
     im.heartbeat_thread = std::thread(&Server::Impl::HeartbeatLoop, &im);
@@ -958,13 +1115,20 @@ Engine* Server::engine() noexcept { return impl_ != nullptr ? impl_->engine.get(
 Server::Stats Server::stats() const noexcept {
     Stats s;
     if (impl_ == nullptr) return s;
-    s.accepted = impl_->stat_accepted.load();
-    s.rejected_full = impl_->stat_rejected_full.load();
-    s.auth_ok = impl_->stat_auth_ok.load();
-    s.auth_fail = impl_->stat_auth_fail.load();
-    s.requests = impl_->stat_requests.load();
-    s.frame_errors = impl_->stat_frame_errors.load();
-    s.payload_errors = impl_->stat_payload_errors.load();
+    s.accepted = impl_->perf.accepted.load();
+    s.rejected_full = impl_->perf.rejected_full.load();
+    s.auth_ok = impl_->perf.auth_ok.load();
+    s.auth_fail = impl_->perf.auth_fail.load();
+    s.requests = impl_->perf.requests.load();
+    s.frame_errors = impl_->perf.frame_errors.load();
+    s.payload_errors = impl_->perf.payload_errors.load();
+    s.authz_denied = impl_->perf.authz_denied.load();
+    s.sessions_current = impl_->perf.sessions_current.load();
+    s.sessions_total = impl_->perf.sessions_total.load();
+    s.handshake_timeouts = impl_->perf.handshake_timeouts.load();
+    s.idle_timeouts = impl_->perf.idle_timeouts.load();
+    s.auth_limit_closed = impl_->perf.auth_limit_closed.load();
+    s.admin_requests = impl_->perf.admin_requests.load();
     return s;
 }
 

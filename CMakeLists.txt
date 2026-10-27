@@ -121,6 +121,7 @@ endif()
 # ---------------------------------------------------------------
 add_library(rtdbserver STATIC
   src/server/config.cpp
+  src/server/authz.cpp
   src/server/server.cpp
 )
 target_compile_features(rtdbserver PUBLIC cxx_std_17)
@@ -185,13 +186,30 @@ if(RTDB_BUILD_TESTS)
       BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
     add_library(GTest::gtest STATIC IMPORTED)
     add_library(GTest::gtest_main STATIC IMPORTED)
+    set(_gtest_lib "${RTDB_GTEST_ROOT}/lib/gtest.lib")
+    set(_gtest_main "${RTDB_GTEST_ROOT}/lib/gtest_main.lib")
+    set(_gtest_lib_dbg "${RTDB_GTEST_ROOT}/lib/gtestd.lib")
+    set(_gtest_main_dbg "${RTDB_GTEST_ROOT}/lib/gtest_maind.lib")
     set_target_properties(GTest::gtest PROPERTIES
       INTERFACE_INCLUDE_DIRECTORIES "${RTDB_GTEST_ROOT}/include"
-      IMPORTED_LOCATION "${RTDB_GTEST_ROOT}/lib/gtest.lib")
+      IMPORTED_LOCATION "${_gtest_lib}")
     set_target_properties(GTest::gtest_main PROPERTIES
       INTERFACE_INCLUDE_DIRECTORIES "${RTDB_GTEST_ROOT}/include"
       INTERFACE_LINK_LIBRARIES GTest::gtest
-      IMPORTED_LOCATION "${RTDB_GTEST_ROOT}/lib/gtest_main.lib")
+      IMPORTED_LOCATION "${_gtest_main}")
+    # 多配置（VS）离线构建：Debug 需要 MDd/IDL=2 的 gtest；若包内提供
+    # gtestd.lib/gtest_maind.lib 则按配置映射（否则 Debug 链接会因
+    # RuntimeLibrary/_ITERATOR_DEBUG_LEVEL 不匹配失败）。
+    if(EXISTS "${_gtest_lib_dbg}" AND EXISTS "${_gtest_main_dbg}")
+      set_target_properties(GTest::gtest PROPERTIES
+        IMPORTED_CONFIGURATIONS "Debug;Release"
+        IMPORTED_LOCATION_DEBUG "${_gtest_lib_dbg}"
+        IMPORTED_LOCATION_RELEASE "${_gtest_lib}")
+      set_target_properties(GTest::gtest_main PROPERTIES
+        IMPORTED_CONFIGURATIONS "Debug;Release"
+        IMPORTED_LOCATION_DEBUG "${_gtest_main_dbg}"
+        IMPORTED_LOCATION_RELEASE "${_gtest_main}")
+    endif()
   elseif(RTDB_FETCH_GTEST)
     include(FetchContent)
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
@@ -234,6 +252,7 @@ if(RTDB_BUILD_TESTS)
     tests/unit/test_net.cpp
     tests/unit/test_ipc_wait.cpp
     tests/unit/test_server.cpp
+    tests/unit/test_authz.cpp
     tests/unit/test_client.cpp
     tests/unit/test_chaos_net.cpp
   )
@@ -339,6 +358,14 @@ if(RTDB_BUILD_TOOLS)
     target_compile_options(bench_net PRIVATE /W4 /permissive- /utf-8)
   else()
     target_compile_options(bench_net PRIVATE -Wall -Wextra)
+  endif()
+  # M4：rtdbctl 运维 CLI（status/authz；后续 W2 加 ddl/import/export/subscribe）
+  add_executable(rtdbctl tools/rtdbctl/main.cpp)
+  target_link_libraries(rtdbctl PRIVATE rtdbclient)
+  if(MSVC)
+    target_compile_options(rtdbctl PRIVATE /W4 /permissive- /utf-8)
+  else()
+    target_compile_options(rtdbctl PRIVATE -Wall -Wextra)
   endif()
   # 输出留在默认目录（与 rtdbclient/rtdbd 同层）：Windows 下 DLL 与
   # 可执行同目录才可被 ctest 直接拉起（无需 PATH 注入）。
