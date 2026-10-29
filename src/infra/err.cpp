@@ -45,6 +45,8 @@ const char* ErrorMessage(Err e) noexcept {
             return "atomic batch aborted (no commit record)";
         case Err::kLimitExceeded:
             return "configured limit exceeded (tables / columns / indexes)";
+        case Err::kSqlSyntax:
+            return "SQL syntax error (unsupported subset returns kUnsupported)";
         // ---- 4xx ----
         case Err::kNotImplemented:
             return "not implemented yet";

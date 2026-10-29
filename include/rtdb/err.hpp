@@ -43,6 +43,8 @@ enum class Err : int16_t {
     kBatchAborted = 305,
     /// 超出 SuperBlock 配置上限（表数/列数/索引数）。
     kLimitExceeded = 306,
+    /// SQL 词法/语法错误（M4 内嵌单表子集；子集外语法用 kUnsupported）。
+    kSqlSyntax = 307,
     // ---- 4xx 服务端 ----
     kNotImplemented = 400,
     kNetworkError = 401,

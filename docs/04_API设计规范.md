@@ -93,6 +93,25 @@ int32_t rtdb_abi_subscribe(void* h, const char* table_filter, uint64_t from_seq,
 > 两侧一致。**M4 不新增 C ABI 符号**（保持 v2 冻结；SQL 仅内嵌 C++ 面），
 > 详见 [docs/16 D6/D11](16_M4完善开发计划.md)。
 
+## 4.1 内嵌 SQL 单表子集（M4；docs/16 D4~D7）
+
+- 头文件：`include/rtdb/sql.hpp`；入口
+  `rtdb::sql::Parse(std::string_view sql, sql::Statement* out, std::string* error)`。
+- 语法子集（v1 冻结）：SELECT/INSERT/UPDATE/DELETE + WHERE/ORDER BY/LIMIT/OFFSET
+  （详见 docs/16 D4）；子集外返回 `kUnsupported`，词法/语法错误返回
+  `kSqlSyntax = 307`；**不静默降级**。
+- 交付面：M4 仅**内嵌 C++**（不新增 C ABI 符号、不做网络 SQL）；执行器与
+  `RTDB_BUILD_SQL` 裁剪开关见 docs/16 D5/D7，W3 落地。
+- 示例：
+  ```cpp
+  rtdb::sql::Statement st;
+  std::string err;
+  const rtdb::Err e = rtdb::sql::Parse(
+      "SELECT id FROM meters WHERE id >= 10 AND name IS NOT NULL ORDER BY id LIMIT 5",
+      &st, &err);
+  if (e != rtdb::Err::kOk) { /* kUnsupported / kSqlSyntax + err */ }
+  ```
+
 ## 5. 网络二进制协议 v1
 ```
 帧: [magic'RTDB'][ver u8][flags u8][session u32][func u16][payload_len u32][crc u32][payload]

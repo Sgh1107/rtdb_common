@@ -9,6 +9,12 @@ if(RTDB_BUILD_TESTS AND NOT DEFINED RTDB_GTEST_READY)
 endif()
 option(RTDB_BUILD_EXAMPLES "Build examples" ON)
 option(RTDB_BUILD_TOOLS "Build tools (bench_net 等)" ON)
+# M4：内嵌 SQL 单表子集（docs/16 D4~D6）。OFF 时裁剪解析器（W3 起同开关
+# 同时裁剪执行器与 C ABI 追加面），用于极小化嵌入体积。
+option(RTDB_BUILD_SQL "Build embedded SQL subset (parser/exec)" ON)
+# M4：libFuzzer 目标（SQL 解析器/帧解码；docs/06/16）。仅 Clang/GCC 且
+# 显式开启时构建，不进默认 CI 门禁（夜间/手动作业）。
+option(RTDB_BUILD_FUZZER "Build libFuzzer targets (Clang/GCC, manual)" OFF)
 
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -51,6 +57,13 @@ else()
     src/platform/posix/shared_memory_file_posix.cpp
     src/platform/posix/platform_process_posix.cpp
     src/platform/posix/ipc_wait_posix.cpp
+  )
+endif()
+
+# M4：SQL 解析器（RTDB_BUILD_SQL=OFF 时从核心库裁剪；W3 执行器同开关）。
+if(RTDB_BUILD_SQL)
+  list(APPEND rtdb_core_sources
+    src/sql/parser.cpp
   )
 endif()
 
@@ -256,6 +269,9 @@ if(RTDB_BUILD_TESTS)
     tests/unit/test_client.cpp
     tests/unit/test_chaos_net.cpp
   )
+  if(RTDB_BUILD_SQL)
+    list(APPEND rtdb_test_sources tests/unit/test_sql.cpp)
+  endif()
   add_executable(rtdb_unit_tests ${rtdb_test_sources})
   target_link_libraries(rtdb_unit_tests PRIVATE rtdbcore rtdbnet rtdbserver rtdbclient GTest::gtest_main)
   # rtdbd 拉起烟测（test_server）：把可执行路径编进测试（生成器表达式，
@@ -378,6 +394,19 @@ if(RTDB_BUILD_TOOLS)
     set_tests_properties(BenchNetCi PROPERTIES RUN_SERIAL TRUE
       WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
   endif()
+endif()
+
+# ---------------------------------------------------------------
+# M4 libFuzzer 目标（默认不构建；Clang/GCC + -DRTDB_BUILD_FUZZER=ON）
+# ---------------------------------------------------------------
+if(RTDB_BUILD_FUZZER)
+  if(MSVC)
+    message(FATAL_ERROR "RTDB_BUILD_FUZZER 需要 Clang/GCC（libFuzzer）")
+  endif()
+  add_executable(fuzz_sql_parser tests/fuzzing/fuzz_sql_parser.cpp)
+  target_link_libraries(fuzz_sql_parser PRIVATE rtdbcore)
+  target_compile_options(fuzz_sql_parser PRIVATE -fsanitize=fuzzer,address -g -O1)
+  target_link_options(fuzz_sql_parser PRIVATE -fsanitize=fuzzer,address)
 endif()
 
 # ---------------------------------------------------------------
