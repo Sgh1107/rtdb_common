@@ -6,11 +6,14 @@
 /// 用法：
 ///   rtdbctl status [--json] [连接参数]
 ///   rtdbctl authz me [--json] [连接参数]
+///   rtdbctl authz show [--json] [连接参数]
+///   rtdbctl authz check <table> [r|w] [--json] [连接参数]
 ///   rtdbctl ddl describe <table> [--json] [连接参数]
 ///   rtdbctl ddl drop <table> [连接参数]
 ///   rtdbctl ddl create <table> --col <name:type[:nn|:null]>... [--row-cap N] [连接参数]
 ///
-/// 退出码：0 = 成功；1 = 请求/连接失败；2 = 用法错误。
+/// 退出码：0 = 成功 / authz check 有权限；1 = 请求/连接失败 / authz check
+/// 无权限（DENY）；2 = 用法错误。
 
 #include <cstdint>
 #include <cstdio>
@@ -42,6 +45,8 @@ void Usage() {
                  "用法：rtdbctl <command> [选项]\n"
                  "  status [--json]\n"
                  "  authz me [--json]\n"
+                 "  authz show [--json]\n"
+                 "  authz check <table> [r|w] [--json]\n"
                  "  ddl describe <table> [--json]\n"
                  "  ddl drop <table>\n"
                  "  ddl create <table> --col <name:type[:nn|:null]>... [--row-cap N]\n"
@@ -170,6 +175,110 @@ std::string JsonEscape(const std::string& s) {
     return out;
 }
 
+/// 表名白名单匹配（规则与 src/server/authz.cpp 的 TablePatternMatches 一致）：
+/// `*` 全匹配、`前缀*` 前缀匹配、其余精确匹配；空模板不匹配。
+bool TableMatches(const std::string& pattern, const std::string& table) {
+    if (pattern.empty()) return false;
+    if (pattern == "*") return true;
+    if (pattern.back() == '*') {
+        const std::string prefix = pattern.substr(0, pattern.size() - 1);
+        if (prefix.empty()) return true;
+        return table.size() >= prefix.size() &&
+               table.compare(0, prefix.size(), prefix) == 0;
+    }
+    return pattern == table;
+}
+
+bool ListAllows(const std::vector<std::string>& patterns, const std::string& table) {
+    for (const std::string& p : patterns) {
+        if (TableMatches(p, table)) return true;
+    }
+    return false;
+}
+
+/// authz show：打印全部用户的授权摘要（admin/ddl 标志 + r/w 白名单）。
+int PrintAuthzShow(rtdb::Client& cli, bool json) {
+    auto res = cli.GetAuthzShow();
+    if (!res.IsOk()) {
+        std::fprintf(stderr, "读取用户权限摘要失败：%s\n",
+                     rtdb::ErrorMessage(res.Error()));
+        return 1;
+    }
+    const std::vector<rtdb::AuthzInfo>& list = res.Value();
+    if (json) {
+        std::printf("[");
+        for (size_t i = 0; i < list.size(); ++i) {
+            const rtdb::AuthzInfo& ai = list[i];
+            std::printf("%s{\"user\":\"%s\",\"admin\":%s,\"ddl\":%s,"
+                        "\"legacy\":%s,\"read\":[",
+                        i == 0 ? "" : ",", JsonEscape(ai.user).c_str(),
+                        ai.admin ? "true" : "false", ai.ddl ? "true" : "false",
+                        ai.legacy ? "true" : "false");
+            for (size_t j = 0; j < ai.read_tables.size(); ++j) {
+                std::printf("%s\"%s\"", j == 0 ? "" : ",",
+                            JsonEscape(ai.read_tables[j]).c_str());
+            }
+            std::printf("],\"write\":[");
+            for (size_t j = 0; j < ai.write_tables.size(); ++j) {
+                std::printf("%s\"%s\"", j == 0 ? "" : ",",
+                            JsonEscape(ai.write_tables[j]).c_str());
+            }
+            std::printf("]}");
+        }
+        std::printf("]\n");
+    } else {
+        for (size_t i = 0; i < list.size(); ++i) {
+            if (i > 0) std::printf("\n");
+            const rtdb::AuthzInfo& ai = list[i];
+            std::printf("user   = %s\n", ai.user.c_str());
+            std::printf("admin  = %s\n", ai.admin ? "true" : "false");
+            std::printf("ddl    = %s\n", ai.ddl ? "true" : "false");
+            std::printf("legacy = %s%s\n", ai.legacy ? "true" : "false",
+                        ai.legacy ? "  (M3 兼容用户，实际按 admin 放行)" : "");
+            std::printf("read   =");
+            for (const std::string& t : ai.read_tables) std::printf(" %s", t.c_str());
+            std::printf("\nwrite  =");
+            for (const std::string& t : ai.write_tables) std::printf(" %s", t.c_str());
+            std::printf("\n");
+        }
+    }
+    return 0;
+}
+
+/// authz check：按表判断当前用户是否具备 r/w 权限；admin 隐含全部。
+/// 退出码 0 = PASS（有权限）、1 = DENY（无权限）或请求失败、2 = 用法错误。
+int AuthzCheck(rtdb::Client& cli, const std::string& table,
+               const std::string& mode, bool json) {
+    auto info = cli.GetAuthzInfo();
+    if (!info.IsOk()) {
+        std::fprintf(stderr, "读取权限摘要失败：%s\n",
+                     rtdb::ErrorMessage(info.Error()));
+        return 1;
+    }
+    const rtdb::AuthzInfo& ai = info.Value();
+    // admin 隐含全部表/DDL 权限（docs/16 D1）；legacy（M3 兼容空规约）
+    // 在服务端同样按 admin 放行，但白名单为空，须显式视作全权限，
+    // 否则 `rtdbctl authz check` 会对 M3 默认用户误报 DENY。
+    // 其余按 read/write 白名单逐项匹配，规则同服务端 TablePatternMatches。
+    bool allowed = ai.admin || ai.legacy;
+    if (!allowed) {
+        const std::vector<std::string>& list =
+            (mode == "w") ? ai.write_tables : ai.read_tables;
+        allowed = ListAllows(list, table);
+    }
+    if (json) {
+        std::printf("{\"result\":\"%s\",\"user\":\"%s\",\"table\":\"%s\","
+                    "\"mode\":\"%s\"}\n",
+                    allowed ? "PASS" : "DENY", JsonEscape(ai.user).c_str(),
+                    JsonEscape(table).c_str(), mode.c_str());
+    } else {
+        std::printf("%s user=%s table=%s mode=%s\n",
+                    allowed ? "PASS" : "DENY", ai.user.c_str(), table.c_str(),
+                    mode.c_str());
+    }
+    return allowed ? 0 : 1;
+}
+
 int PrintStats(rtdb::Client& cli, bool json) {
     auto st = cli.GetServerStats();
     if (!st.IsOk()) {
@@ -205,9 +314,9 @@ int PrintAuthz(rtdb::Client& cli, bool json) {
     }
     const rtdb::AuthzInfo& ai = info.Value();
     if (json) {
-        std::printf("{\"user\":\"%s\",\"admin\":%s,\"ddl\":%s,\"read\":[",
+        std::printf("{\"user\":\"%s\",\"admin\":%s,\"ddl\":%s,\"legacy\":%s,\"read\":[",
                     JsonEscape(ai.user).c_str(), ai.admin ? "true" : "false",
-                    ai.ddl ? "true" : "false");
+                    ai.ddl ? "true" : "false", ai.legacy ? "true" : "false");
         for (size_t i = 0; i < ai.read_tables.size(); ++i) {
             std::printf("%s\"%s\"", i == 0 ? "" : ",",
                         JsonEscape(ai.read_tables[i]).c_str());
@@ -222,6 +331,7 @@ int PrintAuthz(rtdb::Client& cli, bool json) {
         std::printf("user   = %s\n", ai.user.c_str());
         std::printf("admin  = %s\n", ai.admin ? "true" : "false");
         std::printf("ddl    = %s\n", ai.ddl ? "true" : "false");
+        std::printf("legacy = %s\n", ai.legacy ? "true" : "false");
         std::printf("read   =");
         for (const std::string& t : ai.read_tables) std::printf(" %s", t.c_str());
         std::printf("\nwrite  =");
@@ -371,11 +481,30 @@ int main(int argc, char** argv) {
         return PrintStats(*cli.Value(), args.json);
     }
     if (cmd == "authz") {
-        if (args.pos.size() < 2 || args.pos[1] != "me") {
+        if (args.pos.size() < 2) {
             Usage();
             return 2;
         }
-        return PrintAuthz(*cli.Value(), args.json);
+        const std::string& sub = args.pos[1];
+        if (sub == "me") return PrintAuthz(*cli.Value(), args.json);
+        if (sub == "show") return PrintAuthzShow(*cli.Value(), args.json);
+        if (sub == "check") {
+            if (args.pos.size() < 3) {
+                Usage();
+                return 2;
+            }
+            std::string mode = "r";  // 省略时默认检查读权限
+            if (args.pos.size() >= 4) {
+                mode = Lower(args.pos[3]);
+                if (mode != "r" && mode != "w") {
+                    Usage();
+                    return 2;
+                }
+            }
+            return AuthzCheck(*cli.Value(), args.pos[2], mode, args.json);
+        }
+        Usage();
+        return 2;
     }
     if (cmd == "ddl") {
         if (args.pos.size() < 3) {

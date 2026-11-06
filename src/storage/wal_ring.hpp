@@ -214,6 +214,9 @@ public:
     /// \brief 记录区容量（不含 64B 环头；批前预留/容量诊断用）。
     uint64_t area_bytes() const noexcept { return area_bytes_; }
 
+    /// \brief 当前环内有效记录占用字节（M4-W2 PerfCounters 只读面）。
+    uint64_t backlog_bytes() const noexcept { return PendingBytes(); }
+
     /// \brief 记录占用的总字节数（含头部/CRC/8 对齐填充）。
     static uint64_t RecordBytes(uint32_t payload_len) noexcept;
 

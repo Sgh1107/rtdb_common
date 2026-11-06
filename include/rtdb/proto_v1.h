@@ -61,6 +61,10 @@
 /* ---- AUTHZ 标志位（AUTHZ_ME/AUTHZ_SHOW）---- */
 #define RTDB_AUTHZ_FLAG_ADMIN 0x01u
 #define RTDB_AUTHZ_FLAG_DDL 0x02u
+/* M4-W2：无权限规约的 M3 兼容用户（默认 admin）。线格式只增该位，
+ * AUTHZ_ME/AUTHZ_SHOW 的客户端据此把"白名单为空"正确解释为全权限，
+ * 避免运维 CLI 误报 DENY（docs/16 D1 向后兼容）。 */
+#define RTDB_AUTHZ_FLAG_LEGACY 0x04u
 
 /* ---- STATS 版本与键（u16 key；C4 文档逐项口径）---- */
 #define RTDB_STATS_VERSION 1u
@@ -83,6 +87,24 @@
 #define RTDB_STAT_CHECKPOINT_SEQ 17u
 #define RTDB_STAT_WRITER_HEARTBEAT_NS 18u
 #define RTDB_STAT_SESSION_TTL_MS 19u
+/* M4-W2 引擎侧指标（docs/16 D3；只增不改，追加在 19 之后）。
+ * 值由 Engine::Metrics() 实时快照提供，不进服务端 PerfCounters。 */
+#define RTDB_STAT_WRITES_TOTAL 20u
+#define RTDB_STAT_BATCH_OPS 21u
+#define RTDB_STAT_WAL_APPENDED_BYTES 22u
+#define RTDB_STAT_WAL_APPENDED_RECORDS 23u
+#define RTDB_STAT_WAL_BACKLOG_BYTES 24u
+#define RTDB_STAT_WAL_RECLAIM_COUNT 25u
+#define RTDB_STAT_WAL_RECLAIM_RECORDS 26u
+#define RTDB_STAT_WAL_RETAINED_SEQ 27u
+#define RTDB_STAT_SLOT_REUSE_COUNT 28u
+#define RTDB_STAT_FLUSH_COUNT 29u
+#define RTDB_STAT_FLUSH_US_TOTAL 30u
+#define RTDB_STAT_SCAN_CALLS 31u
+#define RTDB_STAT_SCAN_ROWS 32u
+#define RTDB_STAT_SCAN_LIMITED_TRUNCATED 33u
+#define RTDB_STAT_SUB_DELIVERIES 34u
+#define RTDB_STAT_SUB_OVERFLOWS 35u
 
 /* ---- DDL 子操作（RTDB_PF_DDL 载荷首字节）---- */
 #define RTDB_DDL_CREATE_TABLE 1u

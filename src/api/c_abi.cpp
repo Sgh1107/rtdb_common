@@ -11,6 +11,7 @@
 
 #include "rtdb/rtdb_cabi.h"
 
+#include <cassert>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -28,10 +29,18 @@ static_assert(RTDB_ABI_VERSION == RTDB_ABI_VER, "RTDB_ABI_VERSION 与 RTDB_ABI_V
 // ---- 不透明句柄的具体化（仅本 TU 可见）----
 struct rtdb_engine {
     rtdb::Engine* engine;
+#ifndef NDEBUG
+    // debug 期未关闭表句柄计数：rtdb_abi_close 前须归零（P2-2）。
+    int live_tables = 0;
+#endif
 };
 
 struct rtdb_table {
     rtdb::TableHandle handle;
+#ifndef NDEBUG
+    // debug 期回指所属引擎，供 close_table 递减 live_tables。
+    rtdb_engine* owner = nullptr;
+#endif
 };
 
 struct rtdb_cursor {
@@ -146,6 +155,10 @@ int32_t rtdb_abi_open(const char* instance, const char* path, uint32_t role, uin
 
 void rtdb_abi_close(rtdb_engine* engine) {
     if (engine == nullptr) return;
+#ifndef NDEBUG
+    // P2-2：关闭引擎前所有表句柄必须已关闭（契约见 rtdb_cabi.h）。
+    assert(engine->live_tables == 0 && "rtdb_abi_close: 仍有未关闭的 rtdb_table 句柄");
+#endif
     delete engine->engine;
     delete engine;
 }
@@ -182,6 +195,10 @@ int32_t rtdb_abi_create_table(rtdb_engine* engine, const char* name, const rtdb_
         auto* t = new (std::nothrow) rtdb_table;
         if (t == nullptr) return RTDB_ERR_OUT_OF_MEMORY;
         t->handle = res.TakeValue();
+#ifndef NDEBUG
+        t->owner = engine;
+        ++engine->live_tables;
+#endif
         *out = t;
         return RTDB_OK;
     } catch (...) {
@@ -199,6 +216,10 @@ int32_t rtdb_abi_open_table(rtdb_engine* engine, const char* name, rtdb_table** 
         auto* t = new (std::nothrow) rtdb_table;
         if (t == nullptr) return RTDB_ERR_OUT_OF_MEMORY;
         t->handle = res.TakeValue();
+#ifndef NDEBUG
+        t->owner = engine;
+        ++engine->live_tables;
+#endif
         *out = t;
         return RTDB_OK;
     } catch (...) {
@@ -217,7 +238,12 @@ int32_t rtdb_abi_drop_table(rtdb_engine* engine, const char* name) {
     }
 }
 
-void rtdb_abi_close_table(rtdb_table* table) { delete table; }
+void rtdb_abi_close_table(rtdb_table* table) {
+#ifndef NDEBUG
+    if (table != nullptr && table->owner != nullptr) --table->owner->live_tables;
+#endif
+    delete table;
+}
 
 int32_t rtdb_abi_insert(rtdb_engine* engine, rtdb_table* table, const rtdb_value* vals,
                         size_t nvals, uint64_t* out_row_no) {

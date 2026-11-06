@@ -17,8 +17,11 @@
 ///
 /// 子集外语法（JOIN/子查询/聚合/GROUP BY/HAVING/UNION/函数/多语句等）由
 /// `Parse` 明确返回 `kUnsupported`，不静默降级；词法/语法错误返回
-/// `kSqlSyntax`（307）。解析器为零三方依赖的手写递归下降；本头文件不含
-/// 执行语义（W3 执行器基于本 AST）。
+/// `kSqlSyntax`（307）。解析器与执行器均为零三方依赖（M4-W2/W3）。
+///
+/// 执行语义（docs/16 D5）：单语句原子、不提供跨语句事务；SELECT 优先
+/// 主键下推并分页读取，UPDATE/DELETE 按 WHERE 收集主键后整批原子执行；
+/// `SELECT col AS x` 的别名只被接受、不进入结果列名（D4 冻结子集）。
 
 #include <cstdint>
 #include <optional>
@@ -29,8 +32,12 @@
 #include "rtdb/api_macro.hpp"
 #include "rtdb/column_value.hpp"
 #include "rtdb/err.hpp"
+#include "rtdb/result.hpp"
 
 namespace rtdb {
+
+class Engine;
+
 namespace sql {
 
 /// 语句类型。
@@ -123,6 +130,48 @@ struct Statement {
 /// \return kOk / kSqlSyntax（词法或语法错误）/ kUnsupported（子集外语法）/
 ///         kInvalidArgument（sql 或 out 为空）。
 RTDB_API Err Parse(std::string_view sql, Statement* out, std::string* error = nullptr);
+
+/// SELECT 结果集的列元数据（名 + 声明类型）。
+struct SqlColumnMeta {
+    std::string name;
+    DataType type = DataType::kInt64;
+};
+
+/// \brief 单条语句执行结果（docs/16 D5）。
+///
+/// SELECT 填充 `columns`/`rows`；INSERT/UPDATE/DELETE 填充
+/// `affected_rows`。`last_seq` 为语句执行后的 committed_seq（SELECT
+/// 为执行时快照，不推进序号），失败时无意义。
+struct SqlResult {
+    StatementType statement = StatementType::kSelect;
+    std::vector<SqlColumnMeta> columns;
+    std::vector<std::vector<ColumnValue>> rows;
+    uint64_t affected_rows = 0;
+    int64_t last_seq = -1;
+};
+
+/// \brief 执行预算（docs/16 D5 `RTDB_SQL_MAX_ROWS`）。
+///
+/// `max_rows` 同时约束 SELECT 物化行数与 UPDATE/DELETE 的目标行数：
+/// 语句触及行数超过预算即返回 `kLimitExceeded`，避免一次性物化全表。
+/// 0 表示使用默认预算（100000）。
+struct ExecuteOptions {
+    uint64_t max_rows = 100000;
+};
+
+/// \brief 默认最大行数（`RTDB_SQL_MAX_ROWS` 的 C++ 常量面）。
+RTDB_API uint64_t DefaultMaxRows() noexcept;
+
+/// \brief 解析并执行单条 SQL 语句。
+///
+/// 等价于 `Engine::ExecuteSql`，供不直接持有引擎类型的调用点使用。
+/// \param engine  目标引擎（须为写侧或读侧已挂载实例）
+/// \param sql     单条语句文本
+/// \param options 执行预算
+/// \param error   可选：失败时的简短说明（解析/语义诊断，人读）
+RTDB_API Result<SqlResult> Execute(Engine& engine, std::string_view sql,
+                                   const ExecuteOptions& options = ExecuteOptions{},
+                                   std::string* error = nullptr);
 
 /// 语句类型名称（诊断/日志）。
 RTDB_API const char* StatementTypeName(StatementType type) noexcept;

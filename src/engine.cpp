@@ -1,5 +1,6 @@
 #include "rtdb/engine.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <mutex>
@@ -29,6 +30,31 @@ namespace {
 /// 引擎内部临界区加锁超时（毫秒）：根锁持有者崩溃时由死亡恢复在
 /// 一次活性探测内完成，正常路径远快于此值。
 inline constexpr uint32_t kEngineLockTimeoutMs = 5000;
+
+/// M4-W2 引擎侧运行计数（docs/16 D3）。
+///
+/// host 内存原子计数，不写共享内存、不改 SuperBlock 布局，热路径一次
+/// relaxed fetch_add、无锁无分配。水位类（wal_retained_seq /
+/// wal_backlog_bytes）与 flush 计时由 Engine::Metrics() 取样时实时读，
+/// 不与这里重复累计。
+struct EngineMetricAtomics {
+    std::atomic<uint64_t> writes_total{0};
+    std::atomic<uint64_t> batch_ops{0};
+    std::atomic<uint64_t> wal_appended_bytes{0};
+    std::atomic<uint64_t> wal_appended_records{0};
+    std::atomic<uint64_t> wal_reclaim_count{0};
+    std::atomic<uint64_t> wal_reclaim_records{0};
+    std::atomic<uint64_t> slot_reuse_count{0};
+    std::atomic<uint64_t> scan_calls{0};
+    std::atomic<uint64_t> scan_rows{0};
+    std::atomic<uint64_t> scan_limited_truncated{0};
+    std::atomic<uint64_t> sub_deliveries{0};
+    std::atomic<uint64_t> sub_overflows{0};
+};
+
+inline void Bump(std::atomic<uint64_t>& counter, uint64_t by = 1) noexcept {
+    counter.fetch_add(by, std::memory_order_relaxed);
+}
 
 /// 表列元数据（init 列 + ext 列统一视图；M2 Upsert/UpsertBatch 共用）。
 struct ColInfo {
@@ -141,6 +167,9 @@ struct Engine::Impl {
     /// 由 ReserveBatchWal 置位、批 WAL 段结束时复位；仅在根锁内读写。
     bool batch_in_progress = false;
 
+    /// M4-W2 引擎侧运行计数（host 原子；ChangeCursor 经 friend 直取）。
+    EngineMetricAtomics metrics;
+
     // ---- M2-W2 列式批复用缓冲（UpsertBatch 专用）----
     // 根锁内串行使用（并发 UpsertBatch 由根锁串行化），容量随高水位
     // 保留：跨批次复用 StagedRowOp 的 rec/old_rec 缓冲与行值 vector，
@@ -181,10 +210,13 @@ struct Engine::Impl {
     /// \brief 提交标记：推进全局 committed_seq（写侧串行，单调）。
     /// 同时唤醒全部订阅等待者（futex/WaitOnAddress 等待其低 32 位字；
     /// 无等待者时无副作用，docs/13 §3-D4）。
-    void MarkCommitted(uint64_t seq) noexcept {
+    void MarkCommitted(uint64_t seq, uint64_t rows = 1, bool is_batch = false) noexcept {
         auto* sb = region->super_block();
         layout::AsAtomicU64(&sb->committed_seq)->store(seq);
         platform::WakeAll32(reinterpret_cast<uint32_t*>(&sb->committed_seq));
+        // M4-W2：所有写路径提交成功都经此收口，统一累计行写与批次数。
+        Bump(metrics.writes_total, rows);
+        if (is_batch) Bump(metrics.batch_ops);
     }
 
     /// \brief 行宽校验（W5-b）：insert/update 的列值数须等于句柄可见
@@ -240,6 +272,7 @@ struct Engine::Impl {
     Err EnsureRingSpace(uint64_t rec_bytes) noexcept {
         if (ring->HasRoomFor(rec_bytes)) return Err::kOk;
         if (batch_in_progress) return Err::kLimitExceeded;
+        const uint64_t oldest_before = ring->oldest_seq();
         uint64_t covered = 0;
         const Err fe = commit->FlushNow(&covered);
         if (!IsOk(fe)) return fe;
@@ -255,6 +288,11 @@ struct Engine::Impl {
             if (re != Err::kLimitExceeded) Poison();
             return re;
         }
+        // M4-W2：一次按需腾环 + 实际回收的记录条数（P0-5 保留水位口径）。
+        Bump(metrics.wal_reclaim_count);
+        const uint64_t oldest_after = ring->oldest_seq();
+        if (oldest_after > oldest_before)
+            Bump(metrics.wal_reclaim_records, oldest_after - oldest_before);
         return Err::kOk;
     }
 
@@ -293,6 +331,10 @@ struct Engine::Impl {
             return e;
         }
         const Err ae = ring->AppendMark(op, payload, payload_len, out_seq);
+        if (IsOk(ae)) {
+            Bump(metrics.wal_appended_records);
+            Bump(metrics.wal_appended_bytes, storage::WalRing::RecordBytes(payload_len));
+        }
         if (!IsOk(ae) && ae != Err::kLimitExceeded) Poison();
         return ae;
     }
@@ -339,7 +381,15 @@ struct Engine::Impl {
         const storage::shm_TableDescriptor* desc = store->descriptor();
         const Err ae = ring->Append(op, static_cast<int64_t>(desc->table_id), st.row_no,
                                     st.row_ver, payload, payload_len, out_seq);
-        if (IsOk(ae)) st.wal_written = true;  // A2 所有权转移点（记录已入环）
+        if (IsOk(ae)) {
+            st.wal_written = true;  // A2 所有权转移点（记录已入环）
+            Bump(metrics.wal_appended_records);
+            Bump(metrics.wal_appended_bytes, storage::WalRing::RecordBytes(payload_len));
+            // 行槽复用只记 insert（P0-3）；WAL 已入环，此后由重放收敛，
+            // 极端失败回滚下计数可能略偏，快照语义允许轻微不一致。
+            if (st.kind == storage::StagedRowOp::Kind::kInsert && st.slot_reused)
+                Bump(metrics.slot_reuse_count);
+        }
         if (!IsOk(ae) && ae != Err::kLimitExceeded) Poison();
         return ae;
     }
@@ -473,6 +523,34 @@ int64_t Engine::SessionCount() const noexcept {
     // 多挂载者），此处必须走同一原子视角：plain 读与 atomic 写混用即
     // C++ 数据竞争（TSan 报点；与 FlushedSeq/CheckpointSeq 同款写法）。
     return impl_ ? layout::AsAtomicI64(&impl_->region->super_block()->session_count)->load() : -1;
+}
+
+EngineMetrics Engine::Metrics() const noexcept {
+    EngineMetrics m;
+    if (!impl_) return m;
+    const EngineMetricAtomics& a = impl_->metrics;
+    m.writes_total = a.writes_total.load(std::memory_order_relaxed);
+    m.batch_ops = a.batch_ops.load(std::memory_order_relaxed);
+    m.wal_appended_bytes = a.wal_appended_bytes.load(std::memory_order_relaxed);
+    m.wal_appended_records = a.wal_appended_records.load(std::memory_order_relaxed);
+    m.wal_reclaim_count = a.wal_reclaim_count.load(std::memory_order_relaxed);
+    m.wal_reclaim_records = a.wal_reclaim_records.load(std::memory_order_relaxed);
+    m.slot_reuse_count = a.slot_reuse_count.load(std::memory_order_relaxed);
+    m.scan_calls = a.scan_calls.load(std::memory_order_relaxed);
+    m.scan_rows = a.scan_rows.load(std::memory_order_relaxed);
+    m.scan_limited_truncated = a.scan_limited_truncated.load(std::memory_order_relaxed);
+    m.sub_deliveries = a.sub_deliveries.load(std::memory_order_relaxed);
+    m.sub_overflows = a.sub_overflows.load(std::memory_order_relaxed);
+    // 水位与 flush 计时为实时值（不落 host 计数，避免双重口径）。
+    if (impl_->ring) {
+        m.wal_retained_seq = impl_->ring->oldest_seq();
+        m.wal_backlog_bytes = impl_->ring->backlog_bytes();
+    }
+    if (impl_->commit) {
+        m.flush_count = impl_->commit->flush_count();
+        m.flush_us_total = impl_->commit->flush_us_total();
+    }
+    return m;
 }
 
 TableHandle Engine::MakeHandle(int64_t table_id, const char* name, uint32_t layout_version,
@@ -1003,7 +1081,7 @@ Result<uint64_t> Engine::UpsertBatch(const RecordBlockView& block) {
 
         if (IsOk(phase_err)) {
             failpoint::CrashPoint("wal.commit.before");
-            impl_->MarkCommitted(commit_seq);
+            impl_->MarkCommitted(commit_seq, static_cast<uint64_t>(block.row_count));
             res = Result<uint64_t>::Ok(commit_seq);
         } else {
             // 回滚未应用的暂存（已应用项 allocated_vars 已清空，跳过）。
@@ -1201,6 +1279,10 @@ Result<std::vector<std::vector<ColumnValue>>> Engine::ScanLimited(const TableHan
         if (row.size() > visible)
             row.erase(row.begin() + static_cast<std::ptrdiff_t>(visible), row.end());
     }
+    // M4-W2：扫描次数/行数/分页截断次数（Scan 与 ScanAll 亦经此收口）。
+    Bump(impl_->metrics.scan_calls);
+    Bump(impl_->metrics.scan_rows, rows.size());
+    if (out_more != nullptr && *out_more) Bump(impl_->metrics.scan_limited_truncated);
     return Result<std::vector<std::vector<ColumnValue>>>::Ok(std::move(rows));
 }
 
@@ -1323,7 +1405,7 @@ Result<void> Engine::ExecuteBatch(const std::vector<Engine::BatchOp>& ops) {
 
         if (IsOk(phase_err)) {
             failpoint::CrashPoint("wal.commit.before");
-            impl_->MarkCommitted(commit_seq);
+            impl_->MarkCommitted(commit_seq, static_cast<uint64_t>(ops.size()), true);
             res = Result<void>::Ok();
         } else {
             // 回滚未应用的暂存（应用失败项的数据页已由 ApplyStaged 回滚；
@@ -1651,11 +1733,15 @@ Result<ChangeBatch> ChangeCursor::Next(uint32_t timeout_ms) {
             }
             if (overflow) {
                 // 起点已被回收：调用方须全量重取后 ResetTo。
+                Bump(eng->metrics.sub_overflows);  // M4-W2 订阅溢出计数
                 return Result<ChangeBatch>::Fail(Err::kCursorOverflow);
             }
             impl_->position = last;
             batch.last_seq = last;
-            if (!batch.events.empty()) return Result<ChangeBatch>::Ok(std::move(batch));
+            if (!batch.events.empty()) {
+                Bump(eng->metrics.sub_deliveries, batch.events.size());
+                return Result<ChangeBatch>::Ok(std::move(batch));
+            }
             continue;  // 无匹配事件：复查是否有新提交
         }
 

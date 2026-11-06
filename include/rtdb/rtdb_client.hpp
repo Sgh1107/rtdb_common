@@ -92,6 +92,9 @@ struct RTDB_CLIENT_API AuthzInfo {
     std::string user;
     bool admin = false;  ///< 管理面权限（隐含全部表/DDL 权限）
     bool ddl = false;    ///< 建/删表、加列、二级索引
+    /// M3 兼容用户（无权限规约）：服务端按 admin 放行，白名单为空。
+    /// 判定权限时须视作全权限，否则运维面会误报 DENY（docs/16 D1）。
+    bool legacy = false;
     std::vector<std::string> read_tables;   ///< 表级读白名单（支持 `*`、`前缀*`）
     std::vector<std::string> write_tables;  ///< 表级写白名单
 };
@@ -170,6 +173,10 @@ public:
 
     /// M4：查询自身授权摘要（读类；任意已认证用户可调用，docs/16 D2）。
     Result<AuthzInfo> GetAuthzInfo();
+
+    /// M4：查询全部用户的授权摘要（读类；需 admin 权限，docs/16 D3）。
+    /// 非 admin 返回 kPermissionDenied；应答为 AUTHZ_SHOW 的多条记录。
+    Result<std::vector<AuthzInfo>> GetAuthzShow();
 
     /// 建表（写类）。
     Result<CreateTableInfo> CreateTable(const TableDef& def);

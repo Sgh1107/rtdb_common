@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -58,6 +59,13 @@ uint64_t SteadyNowNs() noexcept {
             std::chrono::steady_clock::now().time_since_epoch())
             .count());
 }
+
+/// M4 --log-denied 审计上下文：服务采用"每连接一线程"（SessionLoop），
+/// 请求在该线程内串行分派，故 thread_local 天然按线程隔离、无数据竞争。
+/// func 由 Dispatch 在每次分派前统一写入（覆盖全部拒绝路径）；user/table
+/// 由权限门在拒绝时显式传入 DenyAuthz，避免跨请求残留。默认（log_denied
+/// = false）时 Dispatch 不写、权限门不打印，零额外开销。
+thread_local uint16_t g_authz_func = 0;
 
 /// 会话状态（连接私有；会话模型单线程使用）。
 struct SessionState {
@@ -180,26 +188,40 @@ struct Server::Impl {
     }
 
     // ---- M4 Authz 权限门（docs/16 D2）----
-    /// 权限拒绝统一出口：审计计数 + kPermissionDenied（503）。
-    Err DenyAuthz() noexcept {
+    /// 权限拒绝统一出口：审计计数 + （可选）审计日志 + kPermissionDenied（503）。
+    /// user/table 由调用方显式传入，func 取 Dispatch 写入的 thread_local
+    /// 请求上下文；默认关闭时整个打印分支不执行。
+    Err DenyAuthz(const char* user, std::string_view table) noexcept {
         perf.authz_denied.fetch_add(1, std::memory_order_relaxed);
+        if (cfg.log_denied) {
+            // 纯 DDL/Admin 门无表名，打印 "-"；%.*s 用显式长度，不要求
+            // table 以 '\0' 结尾，也不复制字符串（拒绝路径零分配）。
+            const std::string_view tv = table.empty() ? std::string_view("-") : table;
+            std::fprintf(stderr, "[authz] user=%s func=%u table=%.*s\n", user,
+                         static_cast<unsigned>(g_authz_func),
+                         static_cast<int>(tv.size()), tv.data());
+        }
         return Err::kPermissionDenied;
     }
     Err RequireRead(const SessionState& st, std::string_view table) noexcept {
         if (st.user == nullptr) return Err::kTokenExpired;
-        return CanRead(*st.user, table) ? Err::kOk : DenyAuthz();
+        if (!CanRead(*st.user, table)) return DenyAuthz(st.user->name.c_str(), table);
+        return Err::kOk;
     }
     Err RequireWrite(const SessionState& st, std::string_view table) noexcept {
         if (st.user == nullptr) return Err::kTokenExpired;
-        return CanWrite(*st.user, table) ? Err::kOk : DenyAuthz();
+        if (!CanWrite(*st.user, table)) return DenyAuthz(st.user->name.c_str(), table);
+        return Err::kOk;
     }
     Err RequireDdl(const SessionState& st) noexcept {
         if (st.user == nullptr) return Err::kTokenExpired;
-        return CanDdl(*st.user) ? Err::kOk : DenyAuthz();
+        if (!CanDdl(*st.user)) return DenyAuthz(st.user->name.c_str(), {});
+        return Err::kOk;
     }
     Err RequireAdmin(const SessionState& st) noexcept {
         if (st.user == nullptr) return Err::kTokenExpired;
-        return CanAdmin(*st.user) ? Err::kOk : DenyAuthz();
+        if (!CanAdmin(*st.user)) return DenyAuthz(st.user->name.c_str(), {});
+        return Err::kOk;
     }
 
     // ---- 表元数据 ----
@@ -419,6 +441,7 @@ Err Server::Impl::Dispatch(SessionState& st, const net::FrameHeader& h,
                            const uint8_t* payload, size_t len,
                            std::vector<uint8_t>* body) {
     net::Reader r(payload, len);
+    if (cfg.log_denied) g_authz_func = h.func;  // --log-denied：记录本次请求功能号
 
     if (h.func == RTDB_PF_AUTH) return DoAuth(st, r, body);
 
@@ -550,7 +573,8 @@ Err Server::Impl::DoDdl(SessionState& st, net::Reader& r, std::vector<uint8_t>* 
         if (!r.Finish()) return Err::kProtocolError;
         // 描述表 = 元数据读：读权限或 DDL 权限均可（docs/16 D2）。
         if (st.user == nullptr) return Err::kTokenExpired;
-        if (!CanRead(*st.user, name) && !CanDdl(*st.user)) return DenyAuthz();
+        if (!CanRead(*st.user, name) && !CanDdl(*st.user))
+            return DenyAuthz(st.user->name.c_str(), name);
         TableHandle th;
         std::vector<ColumnDef> cols;
         const Err e = DescribeByName(name, &th, &cols);
@@ -927,6 +951,9 @@ void Server::Impl::EncodeAuthz(const UserEntry& user, net::Writer& w) const {
     uint8_t flags = 0;
     if (user.perms.admin) flags |= RTDB_AUTHZ_FLAG_ADMIN;
     if (user.perms.ddl) flags |= RTDB_AUTHZ_FLAG_DDL;
+    // M3 兼容用户（空规约）在权限门上按 admin 放行，但白名单为空；
+    // 显式带上 legacy 位，客户端才能还原真实语义（docs/16 D1）。
+    if (user.perms.is_legacy) flags |= RTDB_AUTHZ_FLAG_LEGACY;
     w.U8(flags);
     w.U32(static_cast<uint32_t>(user.perms.read_tables.size()));
     for (const std::string& t : user.perms.read_tables) w.Str(t);
@@ -945,11 +972,13 @@ Err Server::Impl::DoAdmin(SessionState& st, net::Reader& r, std::vector<uint8_t>
         if (!r.Finish()) return Err::kProtocolError;
         const uint64_t uptime_ms =
             start_ns == 0 ? 0 : (SteadyNowNs() - start_ns) / 1000000ull;
+        // M4-W2 引擎侧指标一次取样（Metrics() 无锁无分配，避免逐字段重复调用）。
+        const auto em = engine->Metrics();
         struct KV {
             uint16_t key;
             uint64_t value;
         };
-        const std::array<KV, 19> kv{{
+        const std::array<KV, 35> kv{{
             {RTDB_STAT_UPTIME_MS, uptime_ms},
             {RTDB_STAT_ACCEPTED, perf.accepted.load()},
             {RTDB_STAT_REJECTED_FULL, perf.rejected_full.load()},
@@ -970,6 +999,24 @@ Err Server::Impl::DoAdmin(SessionState& st, net::Reader& r, std::vector<uint8_t>
             {RTDB_STAT_WRITER_HEARTBEAT_NS,
              static_cast<uint64_t>(engine->WriterHeartbeatNs())},
             {RTDB_STAT_SESSION_TTL_MS, static_cast<uint64_t>(cfg.session_ttl_ms)},
+            // M4-W2 引擎侧指标（20~35，值取自一次性快照 em）。
+            {RTDB_STAT_WRITES_TOTAL, static_cast<uint64_t>(em.writes_total)},
+            {RTDB_STAT_BATCH_OPS, static_cast<uint64_t>(em.batch_ops)},
+            {RTDB_STAT_WAL_APPENDED_BYTES, static_cast<uint64_t>(em.wal_appended_bytes)},
+            {RTDB_STAT_WAL_APPENDED_RECORDS, static_cast<uint64_t>(em.wal_appended_records)},
+            {RTDB_STAT_WAL_BACKLOG_BYTES, static_cast<uint64_t>(em.wal_backlog_bytes)},
+            {RTDB_STAT_WAL_RECLAIM_COUNT, static_cast<uint64_t>(em.wal_reclaim_count)},
+            {RTDB_STAT_WAL_RECLAIM_RECORDS, static_cast<uint64_t>(em.wal_reclaim_records)},
+            {RTDB_STAT_WAL_RETAINED_SEQ, static_cast<uint64_t>(em.wal_retained_seq)},
+            {RTDB_STAT_SLOT_REUSE_COUNT, static_cast<uint64_t>(em.slot_reuse_count)},
+            {RTDB_STAT_FLUSH_COUNT, static_cast<uint64_t>(em.flush_count)},
+            {RTDB_STAT_FLUSH_US_TOTAL, static_cast<uint64_t>(em.flush_us_total)},
+            {RTDB_STAT_SCAN_CALLS, static_cast<uint64_t>(em.scan_calls)},
+            {RTDB_STAT_SCAN_ROWS, static_cast<uint64_t>(em.scan_rows)},
+            {RTDB_STAT_SCAN_LIMITED_TRUNCATED,
+             static_cast<uint64_t>(em.scan_limited_truncated)},
+            {RTDB_STAT_SUB_DELIVERIES, static_cast<uint64_t>(em.sub_deliveries)},
+            {RTDB_STAT_SUB_OVERFLOWS, static_cast<uint64_t>(em.sub_overflows)},
         }};
         net::Writer w(body);
         w.U16(RTDB_STATS_VERSION);

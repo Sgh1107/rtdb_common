@@ -26,8 +26,10 @@ inline std::unordered_map<std::string, Mode>& Map() {
 }
 
 /// 跨平台读环境变量为 std::string（MSVC 下避开 getenv 的 C4996 弃用告警）。
+/// MinGW 虽定义 _WIN32，但其 CRT 不导出 _dupenv_s（链接期报
+/// `__imp__dupenv_s` 未定义），故与 POSIX 一样走 std::getenv。
 inline std::string GetEnvCopy(const char* name) {
-#if defined(_WIN32)
+#if defined(_WIN32) && !defined(__MINGW32__)
     char* buf = nullptr;
     size_t len = 0;
     if (::_dupenv_s(&buf, &len, name) != 0 || buf == nullptr) return std::string();

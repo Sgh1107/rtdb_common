@@ -14,6 +14,7 @@
 #include "rtdb/options.hpp"
 #include "rtdb/record_block.hpp"
 #include "rtdb/result.hpp"
+#include "rtdb/sql.hpp"
 #include "rtdb/table_def.hpp"
 #include "rtdb/table_handle.hpp"
 
@@ -23,6 +24,31 @@ namespace infra {
 class SlabShmAllocator;
 class ShmRootMutex;
 }  // namespace infra
+
+/// \brief 引擎侧运行指标只读快照（M4-W2，docs/16 D3）。
+///
+/// 全部为进程内 host 原子计数（不写共享内存、不改 SuperBlock 布局），
+/// 由 `Engine::Metrics()` 一次性取样；快照内各字段允许轻微不一致。
+/// 水位类字段（wal_retained_seq / wal_backlog_bytes）在取样时从 WAL 环
+/// 实时读取；flush 计时来自组提交协调器。C4 运维手册逐项定义口径。
+struct EngineMetrics {
+    uint64_t writes_total = 0;             ///< 成功提交的行写操作累计（insert/update/delete）
+    uint64_t batch_ops = 0;                ///< 成功提交的原子批次数
+    uint64_t wal_appended_bytes = 0;       ///< WAL 记录累计占用字节（含头部/CRC/对齐）
+    uint64_t wal_appended_records = 0;     ///< WAL 记录累计条数（含批标记）
+    uint64_t wal_backlog_bytes = 0;        ///< 当前环内有效记录占用字节（实时）
+    uint64_t wal_reclaim_count = 0;        ///< 触发按需腾环的次数
+    uint64_t wal_reclaim_records = 0;      ///< 按需腾环回收的记录条数
+    uint64_t wal_retained_seq = 0;         ///< 最老保留记录 seq（实时）
+    uint64_t slot_reuse_count = 0;         ///< 复用墓碑行槽的次数
+    uint64_t flush_count = 0;              ///< 全映像 flush 次数
+    uint64_t flush_us_total = 0;           ///< 全映像 flush 累计耗时（微秒）
+    uint64_t scan_calls = 0;               ///< Scan/ScanLimited 调用次数
+    uint64_t scan_rows = 0;                ///< 扫描返回行数累计
+    uint64_t scan_limited_truncated = 0;   ///< ScanLimited 因 max_rows 截断次数
+    uint64_t sub_deliveries = 0;           ///< 订阅游标交付的变更条数
+    uint64_t sub_overflows = 0;            ///< 订阅游标溢出（kCursorOverflow）次数
+};
 
 #if defined(_MSC_VER)
 #pragma warning(push)
@@ -87,6 +113,12 @@ public:
     /// 本映像被打开过的累计次数（每次成功 Open 递增一次）。
     /// 用作跨进程活性/持久化的最小可见证据。
     int64_t SessionCount() const noexcept;
+
+    /// \brief 引擎侧运行指标只读快照（M4-W2；未挂载实例返回全零）。
+    ///
+    /// 无锁、无分配、不取根锁：原子计数 relaxed 取样 + WAL 环水位实时读。
+    /// 供 rtdbd 的 ADMIN/STATS 与运维诊断使用（docs/16 D3）。
+    EngineMetrics Metrics() const noexcept;
 
     // ------------------ 表目录（M1-W2）------------------
     /// \brief 建立新表。
@@ -269,6 +301,24 @@ public:
 
     /// \brief 写者心跳时间戳（Unix 纳秒；0 = 未刷新过/Reader）。
     int64_t WriterHeartbeatNs() const noexcept;
+
+    // ------------------ 内嵌 SQL（M4-W3，docs/16 D5/D6/D7）------------------
+#if defined(RTDB_HAS_SQL)
+    /// \brief 执行单条 SQL 语句（内嵌 C++ API；网络 SQL 面不做）。
+    ///
+    /// 解析 → 执行全在调用线程内完成；单语句原子（多行 INSERT/UPDATE/
+    /// DELETE 走一次 `ExecuteBatch`，失败零副作用）。子集外语法返回
+    /// `kUnsupported`，词法/语法错误返回 `kSqlSyntax`，语义错误（未知列、
+    /// 类型不匹配、超预算等）返回 `kInvalidArgument`/`kLimitExceeded`。
+    /// \param sql    单条语句文本
+    /// \param error  可选：失败时的简短说明（解析/语义诊断，人读）
+    Result<sql::SqlResult> ExecuteSql(std::string_view sql, std::string* error = nullptr);
+
+    /// \brief 同上，带执行预算（默认 `max_rows = 100000`）。
+    Result<sql::SqlResult> ExecuteSql(std::string_view sql,
+                                      const sql::ExecuteOptions& options,
+                                      std::string* error = nullptr);
+#endif
 
     // ------------------ 冷快照（M1-W5，docs/03 §3.2/§3.3）------------------
     /// \brief 执行冷快照：停写（根锁）→ 全映像 flush → checkpoint_seq

@@ -60,10 +60,12 @@ else()
   )
 endif()
 
-# M4：SQL 解析器（RTDB_BUILD_SQL=OFF 时从核心库裁剪；W3 执行器同开关）。
+# M4：SQL 解析器 + 执行器（RTDB_BUILD_SQL=OFF 时从核心库整体裁剪；
+# W3 起 Engine::ExecuteSql 也随该开关裁剪，见 RTDB_HAS_SQL）。
 if(RTDB_BUILD_SQL)
   list(APPEND rtdb_core_sources
     src/sql/parser.cpp
+    src/sql/exec.cpp
   )
 endif()
 
@@ -79,6 +81,11 @@ target_include_directories(rtdbcore
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+# M4-W3：SQL 内嵌 API 的条件导出。PUBLIC 使链接 rtdbcore 的测试/示例/
+# 服务端一并看到 Engine::ExecuteSql；OFF 构建下该声明整体消失（D7）。
+if(RTDB_BUILD_SQL)
+  target_compile_definitions(rtdbcore PUBLIC RTDB_HAS_SQL=1)
+endif()
 if(MSVC)
   target_compile_options(rtdbcore PRIVATE /W4 /permissive- /utf-8)
 else()
@@ -270,7 +277,10 @@ if(RTDB_BUILD_TESTS)
     tests/unit/test_chaos_net.cpp
   )
   if(RTDB_BUILD_SQL)
-    list(APPEND rtdb_test_sources tests/unit/test_sql.cpp)
+    list(APPEND rtdb_test_sources
+      tests/unit/test_sql.cpp
+      tests/unit/test_sql_exec.cpp
+    )
   endif()
   add_executable(rtdb_unit_tests ${rtdb_test_sources})
   target_link_libraries(rtdb_unit_tests PRIVATE rtdbcore rtdbnet rtdbserver rtdbclient GTest::gtest_main)

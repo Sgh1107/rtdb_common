@@ -82,6 +82,7 @@ struct Config {
     uint32_t max_payload_bytes = 4u << 20;        ///< 帧载荷上限（4 MiB）
     uint32_t heartbeat_ms = 1000;                 ///< 写者心跳周期
     bool snapshot_on_exit = false;                ///< 优雅退出时抓冷快照
+    bool log_denied = false;                      ///< 权限拒绝审计日志（stderr，默认关闭）
     uint32_t max_delta_bytes = 1u << 20;          ///< FETCH_DELTA 响应体上限
     uint32_t delta_max_timeout_ms = 25000;        ///< FETCH_DELTA 长轮询上限
 };

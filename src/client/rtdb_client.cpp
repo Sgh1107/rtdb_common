@@ -645,6 +645,34 @@ std::string Client::last_error() const {
 
 namespace {
 
+/// AUTHZ_ME / AUTHZ_SHOW 共用的单条授权摘要解码（docs/16 D2/D3 布局）：
+/// `[Str user][u8 flags][u32 n_r][Str]*[u32 n_w][Str]*`。不调用
+/// r.Finish()——多条记录连续排列时由调用方在读完所有记录后统一校验。
+Result<AuthzInfo> ParseAuthzInfo(net::Reader& r) {
+    AuthzInfo info;
+    if (!r.Str(&info.user)) return Result<AuthzInfo>::Fail(Err::kProtocolError);
+    const uint8_t flags = r.U8();
+    if (!r.ok()) return Result<AuthzInfo>::Fail(Err::kProtocolError);
+    info.admin = (flags & RTDB_AUTHZ_FLAG_ADMIN) != 0;
+    info.ddl = (flags & RTDB_AUTHZ_FLAG_DDL) != 0;
+    info.legacy = (flags & RTDB_AUTHZ_FLAG_LEGACY) != 0;
+    const uint32_t n_r = r.U32();
+    if (!r.ok() || n_r > 4096) return Result<AuthzInfo>::Fail(Err::kProtocolError);
+    for (uint32_t i = 0; i < n_r; ++i) {
+        std::string t;
+        if (!r.Str(&t)) return Result<AuthzInfo>::Fail(Err::kProtocolError);
+        info.read_tables.push_back(std::move(t));
+    }
+    const uint32_t n_w = r.U32();
+    if (!r.ok() || n_w > 4096) return Result<AuthzInfo>::Fail(Err::kProtocolError);
+    for (uint32_t i = 0; i < n_w; ++i) {
+        std::string t;
+        if (!r.Str(&t)) return Result<AuthzInfo>::Fail(Err::kProtocolError);
+        info.write_tables.push_back(std::move(t));
+    }
+    return Result<AuthzInfo>::Ok(std::move(info));
+}
+
 /// STATS key → 稳定指标名（口径见 C4；未知 key 保留 unknown_<id> 前向兼容）。
 std::string StatsKeyName(uint16_t key) {
     switch (key) {
@@ -686,6 +714,38 @@ std::string StatsKeyName(uint16_t key) {
             return "writer_heartbeat_ns";
         case RTDB_STAT_SESSION_TTL_MS:
             return "session_ttl_ms";
+        case RTDB_STAT_WRITES_TOTAL:
+            return "writes_total";
+        case RTDB_STAT_BATCH_OPS:
+            return "batch_ops";
+        case RTDB_STAT_WAL_APPENDED_BYTES:
+            return "wal_appended_bytes";
+        case RTDB_STAT_WAL_APPENDED_RECORDS:
+            return "wal_appended_records";
+        case RTDB_STAT_WAL_BACKLOG_BYTES:
+            return "wal_backlog_bytes";
+        case RTDB_STAT_WAL_RECLAIM_COUNT:
+            return "wal_reclaim_count";
+        case RTDB_STAT_WAL_RECLAIM_RECORDS:
+            return "wal_reclaim_records";
+        case RTDB_STAT_WAL_RETAINED_SEQ:
+            return "wal_retained_seq";
+        case RTDB_STAT_SLOT_REUSE_COUNT:
+            return "slot_reuse_count";
+        case RTDB_STAT_FLUSH_COUNT:
+            return "flush_count";
+        case RTDB_STAT_FLUSH_US_TOTAL:
+            return "flush_us_total";
+        case RTDB_STAT_SCAN_CALLS:
+            return "scan_calls";
+        case RTDB_STAT_SCAN_ROWS:
+            return "scan_rows";
+        case RTDB_STAT_SCAN_LIMITED_TRUNCATED:
+            return "scan_limited_truncated";
+        case RTDB_STAT_SUB_DELIVERIES:
+            return "sub_deliveries";
+        case RTDB_STAT_SUB_OVERFLOWS:
+            return "sub_overflows";
         default:
             return "unknown_" + std::to_string(static_cast<unsigned>(key));
     }
@@ -745,28 +805,35 @@ Result<AuthzInfo> Client::GetAuthzInfo() {
     const Err e = impl_->Request(RTDB_PF_AUTHZ_ME, {}, Impl::Retry::kRead, &out);
     if (e != Err::kOk) return Result<AuthzInfo>::Fail(e);
     net::Reader r(out.data(), out.size());
-    AuthzInfo info;
-    if (!r.Str(&info.user)) return Result<AuthzInfo>::Fail(Err::kProtocolError);
-    const uint8_t flags = r.U8();
-    if (!r.ok()) return Result<AuthzInfo>::Fail(Err::kProtocolError);
-    info.admin = (flags & RTDB_AUTHZ_FLAG_ADMIN) != 0;
-    info.ddl = (flags & RTDB_AUTHZ_FLAG_DDL) != 0;
-    const uint32_t n_r = r.U32();
-    if (!r.ok() || n_r > 4096) return Result<AuthzInfo>::Fail(Err::kProtocolError);
-    for (uint32_t i = 0; i < n_r; ++i) {
-        std::string t;
-        if (!r.Str(&t)) return Result<AuthzInfo>::Fail(Err::kProtocolError);
-        info.read_tables.push_back(std::move(t));
-    }
-    const uint32_t n_w = r.U32();
-    if (!r.ok() || n_w > 4096) return Result<AuthzInfo>::Fail(Err::kProtocolError);
-    for (uint32_t i = 0; i < n_w; ++i) {
-        std::string t;
-        if (!r.Str(&t)) return Result<AuthzInfo>::Fail(Err::kProtocolError);
-        info.write_tables.push_back(std::move(t));
-    }
+    auto info = ParseAuthzInfo(r);
+    if (!info.IsOk()) return info;
     if (!r.Finish()) return Result<AuthzInfo>::Fail(Err::kProtocolError);
-    return Result<AuthzInfo>::Ok(std::move(info));
+    return info;
+}
+
+Result<std::vector<AuthzInfo>> Client::GetAuthzShow() {
+    std::vector<uint8_t> body;
+    {
+        net::Writer w(&body);
+        w.U8(RTDB_ADMIN_AUTHZ_SHOW);
+    }
+    std::vector<uint8_t> out;
+    const Err e = impl_->Request(RTDB_PF_ADMIN, body, Impl::Retry::kRead, &out);
+    if (e != Err::kOk) return Result<std::vector<AuthzInfo>>::Fail(e);
+    net::Reader r(out.data(), out.size());
+    const uint32_t n = r.U32();
+    if (!r.ok() || n > 4096) {
+        return Result<std::vector<AuthzInfo>>::Fail(Err::kProtocolError);
+    }
+    std::vector<AuthzInfo> list;
+    list.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        auto info = ParseAuthzInfo(r);
+        if (!info.IsOk()) return Result<std::vector<AuthzInfo>>::Fail(info.Error());
+        list.push_back(info.TakeValue());
+    }
+    if (!r.Finish()) return Result<std::vector<AuthzInfo>>::Fail(Err::kProtocolError);
+    return Result<std::vector<AuthzInfo>>::Ok(std::move(list));
 }
 
 Result<CreateTableInfo> Client::CreateTable(const TableDef& def) {

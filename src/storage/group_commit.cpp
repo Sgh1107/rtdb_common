@@ -30,7 +30,15 @@ Err GroupCommit::FlushNow(uint64_t* out_covered) noexcept {
     // 水位快照必须在 flush 发起之前读取：flush 只保证调用时已脏的页落盘，
     // 期间新提交的页不被承诺（只可能少记不可能多记）。
     const uint64_t target = AsAtomicU64(&sb_->committed_seq)->load();
+    const auto t0 = std::chrono::steady_clock::now();
     const Err e = region_->FlushAll();
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    // M4-W2：全映像 flush 的次数与耗时（含失败尝试；失败同样占用 IO）。
+    flush_count_.fetch_add(1, std::memory_order_relaxed);
+    if (us > 0) flush_us_total_.fetch_add(static_cast<uint64_t>(us),
+                                          std::memory_order_relaxed);
     if (IsOk(e)) {
         auto* fs = AsAtomicU64(&sb_->flushed_seq);
         uint64_t cur = fs->load();

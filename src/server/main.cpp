@@ -56,8 +56,10 @@ void PrintUsage() {
     std::fprintf(stderr,
                  "用法：rtdbd --config <cfg> [--listen HOST:PORT] [--path IMG] [--instance NAME]\n"
                  "             [--auth-salt SALT] [--user NAME=64HEX[#PERM]]... [--exit-after-ms N]\n"
+                 "             [--log-denied]\n"
                  "      PERM = admin | ddl | r:<tables> | w:<tables> | rw:<tables>（空格分隔多项；\n"
                  "             缺省 = M3 兼容 admin）\n"
+                 "      --log-denied：权限拒绝（503）按 user/func/table 记入 stderr 审计日志\n"
                  "      rtdbd --hash-password PASSWORD [--salt SALT]\n");
 }
 
@@ -84,6 +86,7 @@ int main(int argc, char** argv) {
     std::string hash_salt;
     bool hash_salt_set = false;
     bool hash_mode = false;
+    bool log_denied = false;          ///< --log-denied：权限拒绝审计日志
     uint32_t exit_after_ms = 0;
 
     auto take_value = [&](int* i, std::string* out) -> bool {
@@ -144,6 +147,8 @@ int main(int argc, char** argv) {
                 PrintUsage();
                 return 2;
             }
+        } else if (a == "--log-denied") {
+            log_denied = true;  // 无值布尔开关
         } else if (a == "--help" || a == "-h") {
             PrintUsage();
             return 0;
@@ -214,6 +219,7 @@ int main(int argc, char** argv) {
         }
         cfg.users.push_back(std::move(e));
     }
+    cfg.log_denied = log_denied;  // CLI 覆盖（置于其它覆盖之后）
     if (cfg.path.empty()) {
         std::fprintf(stderr, "缺少映像路径（--path 或配置文件 path=）\n");
         return 2;

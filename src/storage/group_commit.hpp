@@ -73,6 +73,15 @@ public:
 
     uint64_t flushed_seq() const noexcept;
 
+    /// \brief M4-W2 PerfCounters：全映像 flush 次数/累计耗时（微秒）。
+    /// host 原子计数，不持锁、不写共享内存；快照允许轻微不一致。
+    uint64_t flush_count() const noexcept {
+        return flush_count_.load(std::memory_order_relaxed);
+    }
+    uint64_t flush_us_total() const noexcept {
+        return flush_us_total_.load(std::memory_order_relaxed);
+    }
+
 private:
     void BackgroundLoop();
 
@@ -86,6 +95,8 @@ private:
     bool stop_ = false;        ///< 后台线程退出标记
     Err flush_error_ = Err::kOk;  ///< 最近一次 flush 失败码（等待者分发）
     uint64_t flushed_ = 0;     ///< 宿主侧水位镜像（≥ 才视为持久）
+    std::atomic<uint64_t> flush_count_{0};     ///< M4-W2：FlushNow 次数
+    std::atomic<uint64_t> flush_us_total_{0};  ///< M4-W2：FlushNow 累计微秒
     std::thread worker_;       ///< per_second 档后台线程（可能未启动）
 };
 #if defined(_MSC_VER)

@@ -132,11 +132,6 @@ Result<std::unique_ptr<ShmRegion>> ShmRegion::Open(const ShmRegionParams& p) {
         if (!IsOk(verr)) return Result<std::unique_ptr<ShmRegion>>::Fail(verr);
     }
 
-    // 会话计数只允许写侧角色推进（只读映射不可写）。
-    if (p.role != Role::Reader) {
-        AsAtomicI64(&sb->session_count)->fetch_add(1);
-    }
-
     // 挂载分配器 + 根互斥锁（Reader 只读映射不参与写侧元数据）。
     if (p.role != Role::Reader) {
         auto alloc_res =
@@ -148,6 +143,12 @@ Result<std::unique_ptr<ShmRegion>> ShmRegion::Open(const ShmRegionParams& p) {
                                                                 kRootMutexOffset);
         if (header_all_zero) infra::ShmRootMutex::InitState(ms);
         region->mutex_.reset(new infra::ShmRootMutex(ms));
+    }
+
+    // 会话计数只允许写侧角色推进（只读映射不可写）。下移到分配器挂载
+    // 成功之后：Attach 失败即返回，不应虚增计数（P2-3，docs/07:112）。
+    if (p.role != Role::Reader) {
+        AsAtomicI64(&sb->session_count)->fetch_add(1);
     }
 
     region->Flush();

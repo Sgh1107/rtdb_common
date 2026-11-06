@@ -14,7 +14,8 @@
  *  - 入参内存由调用方提供、函数内即刻消费（拷入映像或解码），
  *    不同步回写；出参结果由库内分配，须用对应 free 函数释放；
  *  - 句柄（rtdb_engine/rtdb_table）为不透明指针，只可由本库创建与释放；
- *    句柄不拥有引擎：rtdb_table 须先于 rtdb_engine 关闭。
+ *    句柄不拥有引擎：rtdb_table 须先于 rtdb_engine 关闭；
+ *    debug 构建会在 rtdb_abi_close 时断言仍有未关闭的表句柄（P2-2）。
  *
  * 与 docs/04 §4 草签的差异（已在 docs/10 §2-M2-D3 记录）：
  *  - rtdb_abi_open 增补 wal_fsync 档位参数（打开时确定组提交档位）；
