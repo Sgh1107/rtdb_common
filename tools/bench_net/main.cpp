@@ -37,6 +37,7 @@
 #include <thread>
 #include <vector>
 
+#include "platform/console.hpp"
 #include "rtdb/record_block.hpp"
 #include "rtdb/rtdb_client.hpp"
 #include "server/config.hpp"
@@ -247,6 +248,7 @@ int Fail(const char* what) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    rtdb::platform::UseUtf8Console();  // 中文 Windows 控制台：UTF-8 输出不乱码（docs/18 §6）
     Args a;
     if (!ParseArgs(argc, argv, &a)) return 2;
     if (a.ci) {

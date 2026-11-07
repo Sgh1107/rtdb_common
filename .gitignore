@@ -18,3 +18,6 @@ build_cov/
 build_cov2/
 build_gcc/
 .workbuddy/
+
+# 配置文件
+m3lab.cfg

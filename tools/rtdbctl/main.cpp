@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "platform/console.hpp"
 #include "rtdb/err.hpp"
 #include "rtdb/rtdb_client.hpp"
 #include "rtdb/table_def.hpp"
@@ -412,6 +413,7 @@ int DdlCreate(rtdb::Client& cli, const std::string& table, const Args& args) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    rtdb::platform::UseUtf8Console();  // 中文 Windows 控制台：UTF-8 输出不乱码（docs/18 §6）
     Args args;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];

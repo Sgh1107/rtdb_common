@@ -388,6 +388,8 @@ if(RTDB_BUILD_TOOLS)
   # M4：rtdbctl 运维 CLI（status/authz；后续 W2 加 ddl/import/export/subscribe）
   add_executable(rtdbctl tools/rtdbctl/main.cpp)
   target_link_libraries(rtdbctl PRIVATE rtdbclient)
+  # src 私有头（platform/console.hpp：Windows 控制台 UTF-8 输出，docs/18 §6）
+  target_include_directories(rtdbctl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   if(MSVC)
     target_compile_options(rtdbctl PRIVATE /W4 /permissive- /utf-8)
   else()

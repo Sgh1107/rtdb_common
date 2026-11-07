@@ -139,9 +139,13 @@ Err WalRing::WriteTailPadAndWrap() noexcept {
         hdr_buf[48] = kWalOpPad;
         uint8_t* dst = area_ + hdr_->head_pos;
         std::memcpy(dst, hdr_buf, kWalRecHdrBytes);
-        // 载荷区清零（确定性内容，CRC 可复算）。
+        // 载荷区清零（确定性内容，CRC 可复算）。pad 记录总长 = remaining，
+        // 其载荷长度 = remaining - kWalMinRecordBytes（kWalMinRecordBytes 已
+        // 含 56B 头 + 4B CRC），零填充必须恰为载荷长度：旧实现多减了一次
+        // kWalRecCrcBytes，remaining ∈ [60, 63] 时 size_t 下溢成巨大值 →
+        // memset 越界写崩溃（D2 双机实测 0xC0000005 / VCRUNTIME140）。
         std::memset(dst + kWalRecHdrBytes, 0,
-                    static_cast<size_t>(remaining - kWalMinRecordBytes - kWalRecCrcBytes));
+                    static_cast<size_t>(remaining - kWalMinRecordBytes));
         const uint32_t crc = Crc32(dst, static_cast<size_t>(remaining) - kWalRecCrcBytes);
         EncodeU32LE(dst + remaining - kWalRecCrcBytes, crc);
     }

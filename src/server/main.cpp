@@ -32,6 +32,7 @@
 #endif
 
 #include "infra/sha256.hpp"
+#include "platform/console.hpp"
 #include "rtdb/err.hpp"
 #include "server/config.hpp"
 #include "server/server.hpp"
@@ -75,6 +76,7 @@ bool ParseU32(const std::string& s, uint32_t* out) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    rtdb::platform::UseUtf8Console();  // 中文 Windows 控制台：UTF-8 输出不乱码（docs/18 §6）
     std::string config_path;
     std::string listen;
     std::string path;

@@ -21,6 +21,7 @@
 #include <thread>
 #include <vector>
 
+#include "platform/console.hpp"
 #include "rtdb/rtdb_client.hpp"
 #include "server/server.hpp"
 
@@ -362,6 +363,7 @@ int RunClient(const DemoArgs& a) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    rtdb::platform::UseUtf8Console();  // 中文 Windows 控制台：UTF-8 输出不乱码（docs/18 §6）
     DemoArgs a;
     if (!ParseArgs(argc, argv, &a)) return 1;
     std::signal(SIGINT, OnSignal);

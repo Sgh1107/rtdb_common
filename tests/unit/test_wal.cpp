@@ -214,6 +214,79 @@ TEST_F(WalRingTest, WrapPadAndSeqContinuity) {
     }
 }
 
+/// 回归（D2 双机实测 0xC0000005 / VCRUNTIME140）：尾垫片恰好剩
+/// kWalMinRecordBytes(=60) 字节时，旧实现把零填充长度算成
+/// `remaining - kWalMinRecordBytes - kWalRecCrcBytes`，remaining ∈ [60,63]
+/// 时 size_t 下溢成约 2^64 → memset 越界写直接崩溃。垫片总长 = remaining，
+/// 载荷 = remaining - 60，零填充必须恰为载荷长度。
+TEST_F(WalRingTest, TailPadExactMinRecordDoesNotUnderflow) {
+    // 记录区 4200 = 60×70：写 69 条最小记录后 head 距区尾恰好 60B。
+    storage::WalRing* ring =
+        MakeRegionAndRing(sizeof(storage::shm_WalRingHeader) + 4200);
+    ASSERT_NE(ring, nullptr);
+    ASSERT_EQ(ring->area_bytes(), 4200u);
+
+    uint64_t seq = 0;
+    for (int i = 0; i < 69; ++i) {
+        ASSERT_TRUE(IsOk(ring->Append(storage::kWalOpInsert, 1, static_cast<uint64_t>(i), 2,
+                                      nullptr, 0, &seq)));
+    }
+    EXPECT_EQ(seq, 69u);
+    ring->DropAllRetained();  // 逻辑空环：总量够，但 [head, area) 只剩 60B
+    ASSERT_TRUE(ring->HasRoomFor(storage::WalRing::RecordBytes(4)));
+
+    const uint8_t payload[4] = {0x11, 0x22, 0x33, 0x44};
+    ASSERT_TRUE(IsOk(ring->AppendMark(storage::kWalOpInsert, payload, 4, &seq)));
+    EXPECT_EQ(seq, 70u);
+
+    uint64_t last = 0;
+    const std::vector<Rec> recs = ScanAll(ring, &last);
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].seq, 70u);
+    EXPECT_EQ(recs[0].payload, std::vector<uint8_t>(payload, payload + 4));
+    EXPECT_EQ(last, 70u);
+}
+
+/// 回归：尾垫片载荷长度 > 0 时必须**完整**清零（docs/08 垫片“确定性内容，
+/// CRC 可复算”）。旧实现少清 4B（多减一次 CRC），pad 记录 CRC 会依赖环内
+/// 历史脏字节，重放/校验口径被历史内容污染。
+TEST_F(WalRingTest, TailPadPayloadFullyZeroed) {
+    // 记录区 4144 = 60×69 + 4：写 68 条最小记录后 head 距区尾 64B，
+    // 垫片载荷 = 64 - 60 = 4B（旧实现零填充长度 -4/0，残留脏字节）。
+    storage::WalRing* ring =
+        MakeRegionAndRing(sizeof(storage::shm_WalRingHeader) + 4144);
+    ASSERT_NE(ring, nullptr);
+    ASSERT_EQ(ring->area_bytes(), 4144u);
+
+    uint64_t seq = 0;
+    for (int i = 0; i < 68; ++i) {
+        ASSERT_TRUE(IsOk(ring->Append(storage::kWalOpInsert, 1, static_cast<uint64_t>(i), 2,
+                                      nullptr, 0, &seq)));
+    }
+    ring->DropAllRetained();
+    ASSERT_TRUE(ring->HasRoomFor(storage::WalRing::RecordBytes(8)));
+
+    // 垫片起点 = 68×60 = 4080，载荷位于头部 56B 之后；预置脏字节验证清零。
+    const uint64_t pad_off = 68 * storage::kWalMinRecordBytes;
+    uint8_t* area = AreaBytes();
+    for (uint32_t i = 0; i < storage::kWalRecCrcBytes; ++i)
+        area[pad_off + storage::kWalRecHdrBytes + i] = 0xEE;
+
+    const uint8_t payload[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    ASSERT_TRUE(IsOk(ring->AppendMark(storage::kWalOpInsert, payload, 8, &seq)));
+    EXPECT_EQ(seq, 69u);
+    for (uint32_t i = 0; i < storage::kWalRecCrcBytes; ++i) {
+        EXPECT_EQ(area[pad_off + storage::kWalRecHdrBytes + i], 0)
+            << "pad payload byte " << i << " 未清零";
+    }
+
+    uint64_t last = 0;
+    const std::vector<Rec> recs = ScanAll(ring, &last);
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].seq, 69u);
+    EXPECT_EQ(recs[0].payload, std::vector<uint8_t>(payload, payload + 8));
+}
+
 /// P0-3：尾垫片回绕的落位约束——记录既放不下 [head, area) 的剩余连续区，
 /// 回绕后又容身不了 [0, tail_pos) 时必须拒绝（kLimitExceeded），不得覆盖
 /// 环内既有数据（旧判据只看总量，此窗口静默覆盖 [tail_pos, head_pos)）。
