@@ -155,6 +155,22 @@ TEST_F(MigrateTest, UnknownSourceColumnIsRejected) {
     EXPECT_NE(err.find("unknown source column"), std::string::npos) << err;
 }
 
+TEST_F(MigrateTest, NonFirstPrimaryKeyIsRejected) {
+    // 引擎 M2 口径：主键恒为目标首列；mapping 若把 primary_key 指到别的列，
+    // 必须在零写入阶段明确拒绝，不能静默退回隐式列 0。
+    const std::string mapping = R"({"tables":[{"source":"meters","target":"meters",
+      "primary_key":"name",
+      "columns":[
+        {"source":"id","target":"id","type":"int64","nullable":false},
+        {"source":"val","target":"val","type":"float64","nullable":true},
+        {"source":"name","target":"name","type":"utf8","nullable":true}]}]})";
+    WriteSources(mapping);
+    std::string err;
+    mg::MigrationReport rep;
+    EXPECT_EQ(mg::Run(Params(), &rep, &err), rtdb::Err::kInvalidArgument);
+    EXPECT_NE(err.find("primary_key must be the first target column"), std::string::npos) << err;
+}
+
 TEST_F(MigrateTest, UnknownColumnTypeIsRejected) {
     const std::string mapping = R"({"tables":[{"source":"meters","target":"meters",
       "columns":[{"source":"id","target":"id","type":"uuid"}]}]})";

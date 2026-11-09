@@ -583,6 +583,16 @@ inline Err Run(const MigrateParams& p, MigrationReport* rep, std::string* err) {
             cd.nullable = cm.nullable;
             def.columns.push_back(std::move(cd));
         }
+        // 引擎 M2 口径：显式主键须解析到目标首列（catalog.cpp 校验列 0）。
+        // mapping 的 primary_key 此前只解析未生效，这里补上并给非首列明确报错，
+        // 避免"声明了主键却由引擎隐式取列 0"的静默偏差。
+        if (!tm.columns.empty() && tm.primary_key != tm.columns[0].dst) {
+            return Fail(err, Err::kInvalidArgument,
+                        "mapping: primary_key must be the first target column (engine M2): " +
+                            tm.primary_key);
+        }
+        if (!def.columns.empty())
+            def.primary_key.push_back(std::string_view(def.columns[0].name));
         auto created = eng->CreateTable(def);
         if (!created.IsOk())
             return Fail(err, created.Error(), "create table " + tm.dst + ": " +
@@ -640,8 +650,11 @@ inline Err Run(const MigrateParams& p, MigrationReport* rep, std::string* err) {
             }
             auto done = eng->ExecuteBatch(ops);
             if (!done.IsOk())
-                return Fail(err, done.Error(), "batch write " + tm.dst + ": " +
-                                                   std::string(ErrorMessage(done.Error())));
+                return Fail(err, done.Error(),
+                            "batch write " + tm.dst + ": " +
+                                std::string(ErrorMessage(done.Error())) +
+                                "；跨批无法全局原子，已成功写入 " + std::to_string(off) +
+                                " 行，目标映像保留供 export 核对/删除");
         }
 
         // 校验：全表重读 → 行数 / 主键集合校验和 / 抽样逐值比对。
@@ -661,6 +674,20 @@ inline Err Run(const MigrateParams& p, MigrationReport* rep, std::string* err) {
             sum *= 1099511628211ull;
         }
         tr.key_checksum = sum;
+        // 源侧主键集合算同一校验和并交叉比对：仅比对行数会漏掉"行数相同但
+        // 主键被改写/错位"的迁移错误。
+        std::vector<int64_t> src_keys;
+        src_keys.reserve(converted.size());
+        for (const auto& row : converted) if (!row.empty()) src_keys.push_back(row[0].as_int());
+        std::sort(src_keys.begin(), src_keys.end());
+        uint64_t src_sum = 1469598103934665603ull;
+        for (const int64_t k : src_keys) {
+            src_sum ^= static_cast<uint64_t>(k);
+            src_sum *= 1099511628211ull;
+        }
+        if (src_sum != tr.key_checksum)
+            return Fail(err, Err::kCorruption,
+                        "primary key checksum mismatch on table " + tm.dst);
         tr.samples = static_cast<uint32_t>(std::min<size_t>(5, rows.size()));
         for (size_t i = 0; i < tr.samples; ++i) {
             if (rows[i].size() != converted[i].size()) { tr.sample_ok = false; break; }
