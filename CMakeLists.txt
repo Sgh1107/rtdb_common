@@ -276,6 +276,12 @@ if(RTDB_BUILD_TESTS)
     tests/unit/test_client.cpp
     tests/unit/test_chaos_net.cpp
   )
+  # M4-W3 新增用例：文件落盘后自动纳入；并行开发中允许暂缺，避免配置期报错。
+  foreach(_m4_test test_migrate.cpp test_compat.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/${_m4_test}")
+      list(APPEND rtdb_test_sources "tests/unit/${_m4_test}")
+    endif()
+  endforeach()
   if(RTDB_BUILD_SQL)
     list(APPEND rtdb_test_sources
       tests/unit/test_sql.cpp
@@ -394,6 +400,19 @@ if(RTDB_BUILD_TOOLS)
     target_compile_options(rtdbctl PRIVATE /W4 /permissive- /utf-8)
   else()
     target_compile_options(rtdbctl PRIVATE -Wall -Wextra)
+  endif()
+  # M4-W3：老系统迁移工具（docs/16 D8）。只用本地引擎面，不依赖网络层；
+  # include src 是为 platform/console.hpp（Windows 控制台 UTF-8 输出）。
+  # EXISTS 守卫：并行开发中源文件尚未落盘时跳过该目标，落盘后自动纳入构建。
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/migrate_from_psrtdb/main.cpp")
+    add_executable(migrate_from_psrtdb tools/migrate_from_psrtdb/main.cpp)
+    target_link_libraries(migrate_from_psrtdb PRIVATE rtdbcore)
+    target_include_directories(migrate_from_psrtdb PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(MSVC)
+      target_compile_options(migrate_from_psrtdb PRIVATE /W4 /permissive- /utf-8)
+    else()
+      target_compile_options(migrate_from_psrtdb PRIVATE -Wall -Wextra)
+    endif()
   endif()
   # 输出留在默认目录（与 rtdbclient/rtdbd 同层）：Windows 下 DLL 与
   # 可执行同目录才可被 ctest 直接拉起（无需 PATH 注入）。
