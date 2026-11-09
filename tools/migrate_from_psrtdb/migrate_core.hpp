@@ -484,6 +484,8 @@ struct MigrationReport {
     std::string note;
 };
 
+inline std::string ReportJson(const MigrationReport& r);  ///< 定义见本文件末尾，供 Run 写报告复用
+
 inline bool SameValue(const ColumnValue& a, const ColumnValue& b) {
     if (a.is_null() || b.is_null()) return a.is_null() && b.is_null();
     const DataType t = a.type();
@@ -540,6 +542,9 @@ inline Err Run(const MigrateParams& p, MigrationReport* rep, std::string* err) {
         rep->elapsed_ms = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count());
+        // 报告落盘属于核心职责（CLI 与单测都直接调用 Run，行为必须一致）。
+        if (!p.report.empty() && !WriteFile(p.report, ReportJson(*rep) + "\n", err))
+            return Fail(err, Err::kIoError, "cannot write migration report");
         return Err::kOk;
     }
 
@@ -677,6 +682,8 @@ inline Err Run(const MigrateParams& p, MigrationReport* rep, std::string* err) {
     rep->elapsed_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count());
+    if (!p.report.empty() && !WriteFile(p.report, ReportJson(*rep) + "\n", err))
+        return Fail(err, Err::kIoError, "cannot write migration report");
     return Err::kOk;
 }
 

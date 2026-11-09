@@ -85,15 +85,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "迁移失败（%s）：%s\n", rtdb::ErrorMessage(e), err.c_str());
         return 1;
     }
-    const std::string json = mg::ReportJson(rep);
-    if (!p.report.empty()) {
-        if (!mg::WriteFile(p.report, json + "\n", &err)) {
-            std::fprintf(stderr, "写报告失败：%s\n", err.c_str());
-            return 1;
-        }
-        std::printf("报告已写入：%s\n", p.report.c_str());
+    // 报告写文件已由 mg::Run 完成（CLI 与单测共用同一路径）。
+    if (p.report.empty()) {
+        std::printf("%s\n", mg::ReportJson(rep).c_str());
     } else {
-        std::printf("%s\n", json.c_str());
+        std::printf("报告已写入：%s\n", p.report.c_str());
     }
     std::printf("%s：%llu 张表，耗时 %llu ms\n", p.dry_run ? "DRY-RUN OK" : "MIGRATION PASS",
                 static_cast<unsigned long long>(rep.tables.size()),
