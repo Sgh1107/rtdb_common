@@ -152,7 +152,10 @@
 #define RTDB_E_PERMISSION_DENIED 503
 
 /* ---- 连接默认值 ---- */
-#define RTDB_PROTO_DEFAULT_PORT 7878
+/* 与 src/server/config.hpp 的 Config::listen_port 对齐（2026-11-10 统一）。
+   原 7878 为历史协议字面量，仓内无任何引用；部署与执行单一直用 5599，
+   实际监听以配置/--listen 显式值为准。 */
+#define RTDB_PROTO_DEFAULT_PORT 5599
 
 /* ---- 线格式字段取值范围（防御性上限，服务端强制）---- */
 #define RTDB_PROTO_MAX_NAME_BYTES 1024u   /* 表名/列名 u16 前缀的语义上限 */

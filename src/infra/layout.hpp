@@ -66,7 +66,8 @@ struct shm_SuperBlock {
     /// 后台节流 flush 已推进到的 seq（per_second 档账本；always 档跟随
     /// committed_seq；断电丢失窗口 = (flushed_seq, committed_seq]）。
     uint64_t flushed_seq;
-    /// 主写者心跳（steady 纳秒时间戳；0 表示当前无活跃写者）。
+    /// 主写者心跳（Unix 纪元纳秒，system_clock 墙钟；跨进程可比，非 steady）。
+    /// 0 表示当前无活跃写者；写入见 Engine::RefreshWriterHeartbeat。
     uint64_t writer_heartbeat_ns;
     /// 成功 Open 的累计次数（会话计数器，活性观测用）。
     int64_t session_count;

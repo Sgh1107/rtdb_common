@@ -1806,8 +1806,12 @@ void Engine::RefreshWriterHeartbeat() noexcept {
     if (impl_ == nullptr || impl_->region == nullptr) return;
     if (impl_->region->allocator() == nullptr) return;  // Reader：只读映射不写
     auto* hb = layout::AsAtomicU64(&impl_->region->super_block()->writer_heartbeat_ns);
+    // 显式转纳秒：system_clock::duration 在 MSVC 为 100ns tick、libstdc++ 为 1ns，
+    // 直接 .count() 会让字段名 _ns 的语义在不同平台失效（docs/C3 §2.3）。
+    // 用墙钟而非 steady_clock：心跳需跨进程可比（主备活性判据），steady 仅进程内有效。
     const uint64_t now_ns = static_cast<uint64_t>(
-        std::chrono::system_clock::now().time_since_epoch().count());
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
     hb->store(now_ns, std::memory_order_release);
 }
 
